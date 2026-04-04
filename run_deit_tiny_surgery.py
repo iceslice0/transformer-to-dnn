@@ -94,7 +94,7 @@ def calibration_ln_and_softmax(
     x = ref.pos_drop(x)
     h0 = x
     y_ref0 = ref.blocks[0].norm1(h0)
-    rw0 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps).to(device)
+    rw0 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
     copy_ln_params_to_rewritten(rw0, ref.blocks[0].norm1)
     y_rw0 = rw0(h0)
     stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
@@ -104,20 +104,20 @@ def calibration_ln_and_softmax(
     n_ln = 0
     for blk in ref.blocks:
         n1 = blk.norm1(h)
-        rw = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps).to(device)
+        rw = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
         copy_ln_params_to_rewritten(rw, blk.norm1)
         mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
         n_ln += 1
         h = h + blk.attn(n1)
         n2 = blk.norm2(h)
-        rw2 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps).to(device)
+        rw2 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
         copy_ln_params_to_rewritten(rw2, blk.norm2)
         mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
         n_ln += 1
         h = h + blk.mlp(n2)
     h_pre = h
     h_out = ref.norm(h_pre)
-    rwf = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps).to(device)
+    rwf = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
     copy_ln_params_to_rewritten(rwf, ref.norm)
     mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
     n_ln += 1
@@ -155,7 +155,12 @@ def calibration_ln_and_softmax(
 
 
 def build_module_mapping(cfg: SurgeryRunConfig) -> Dict[str, str]:
-    ln = "nn.LayerNorm" if cfg.disable_layernorm_replacement else "RewrittenLayerNormAbsSign"
+    if cfg.disable_layernorm_replacement:
+        ln = "nn.LayerNorm"
+    elif cfg.allow_matmul:
+        ln = "RewrittenLayerNormAbsSign(rsqrt·mul)"
+    else:
+        ln = "RewrittenLayerNormAbsSign(log/exp)"
     if cfg.disable_attention_surgery:
         attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
     else:

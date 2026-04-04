@@ -978,8 +978,8 @@ FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
         "Debug: when attention surgery is on, full softmax @ V instead of Gibbs top-k + sparse mix."
     ),
     "allow_matmul": (
-        "Debug: when attention surgery is on, matmul QK scores and elementwise p*v sparse mix "
-        "(fast; not plan.md square identity)."
+        "Debug: fast paths — attention: matmul QK and elementwise p*v sparse mix; "
+        "RewrittenLayerNorm: z=u*rsqrt(r2+eps) instead of log/exp+setsign (not identical numerically)."
     ),
 }
 

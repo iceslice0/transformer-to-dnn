@@ -79,6 +79,20 @@ class ExplicitAdd(nn.Module):
         return a + b
 
 
+class ExplicitElementwiseMul(nn.Module):
+    """Hadamard / broadcast multiply ``a * b`` (explicit graph node; e.g. LN fast path ``u * inv_std``)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a * b
+
+
+class ExplicitMatMul(nn.Module):
+    """``torch.matmul(a, b)`` as a named submodule (materialized when ``allow_matmul``)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(a, b)
+
+
 class ExplicitElementwiseAffine(nn.Module):
     """LayerNorm epilogue ``y = x * weight + bias`` (gamma / beta on the normalized last dim)."""
 
@@ -108,6 +122,18 @@ class ExplicitSquare(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * x
+
+
+class ExplicitSqrtReciprocal(nn.Module):
+    """``1/sqrt(x + eps)`` (e.g. LayerNorm inv-std from variance ``x`` = mean of squares)."""
+
+    def __init__(self, eps: float) -> None:
+        super().__init__()
+        self.register_buffer("eps", torch.tensor(float(eps)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e = self.eps.to(device=x.device, dtype=x.dtype)
+        return torch.rsqrt(x + e)
 
 
 class ExplicitExp(nn.Module):
@@ -263,37 +289,50 @@ class MultiTailPWLEpilogue(nn.Module):
 
 class RewrittenLayerNormAbsSign(nn.Module):
     """
-    mu = mean(x); u = x - mu; r2 = mean(u*u)
-    log_a = log(|u|+eps) - log(r2+eps)/2 via ``ExplicitLogPlusEps`` (exact ``torch.log``)
-    a_mag = exp(log_a) via :class:`ExplicitExp` (exact ``torch.exp``, explicit graph node)
-    z = setsign(u, a_mag);  y = affine(z) with :class:`ExplicitElementwiseAffine` (gamma/beta).
+    mu = mean(x); u = x - mu; r2 = mean(u*u).
+
+    **``allow_matmul=False`` (default, strict):** log-domain magnitude
+    ``log_a = log(|u|+eps) - log(r2+eps)/2``, ``a_mag = exp(log_a)``, ``z = setsign(u, a_mag)``.
+
+    **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
+    ``inv_std = 1/sqrt(r2+eps)`` via :class:`ExplicitSqrtReciprocal` (elementwise mul, not the
+    square-identity chain).
     """
 
-    def __init__(self, normalized_shape: int, eps: float) -> None:
+    def __init__(self, normalized_shape: int, eps: float, *, allow_matmul: bool = False) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
         e = float(eps)
-        self.log_eps = ExplicitLogPlusEps(e)
+        self.allow_matmul = allow_matmul
         self.mean_u = ExplicitMean(-1, keepdim=True)
         self.mean_r2 = ExplicitMean(-1, keepdim=True)
         self.square = ExplicitSquare()
-        self.abs_op = AbsOp()
-        self.setsign = SetSign()
-        self.neg_half = ExplicitScale(-0.5)
-        self.exp = ExplicitExp()
         self.affine = ExplicitElementwiseAffine(normalized_shape)
+        if allow_matmul:
+            self.inv_sqrt_var = ExplicitSqrtReciprocal(e)
+            self.u_mul_invstd = ExplicitElementwiseMul()
+        else:
+            self.log_eps = ExplicitLogPlusEps(e)
+            self.abs_op = AbsOp()
+            self.setsign = SetSign()
+            self.neg_half = ExplicitScale(-0.5)
+            self.exp = ExplicitExp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
         u = x - mu
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
-        au = self.abs_op(u)
-        log_num = self.log_eps(au)
-        log_den = self.log_eps(r2)
-        log_a = log_num + self.neg_half(log_den)
-        a_mag = self.exp(log_a)
-        z = self.setsign(u, a_mag)
+        if self.allow_matmul:
+            inv_std = self.inv_sqrt_var(r2)
+            z = self.u_mul_invstd(u, inv_std)
+        else:
+            au = self.abs_op(u)
+            log_num = self.log_eps(au)
+            log_den = self.log_eps(r2)
+            log_a = log_num + self.neg_half(log_den)
+            a_mag = self.exp(log_a)
+            z = self.setsign(u, a_mag)
         return self.affine(z)
 
 
@@ -332,7 +371,8 @@ class PairwiseDotBySquare(nn.Module):
         self.head_dim = head_dim
         self.allow_matmul = allow_matmul
         if allow_matmul:
-            self.register_buffer("inv_sqrt_d", torch.tensor(1.0 / math.sqrt(float(head_dim))))
+            self.q_scale = ExplicitScale(1.0 / math.sqrt(float(head_dim)))
+            self.qk_matmul = ExplicitMatMul()
         else:
             w = 0.25 / math.sqrt(float(head_dim))
             self.square_chain = SquareIdentityOperandChain(
@@ -343,8 +383,8 @@ class PairwiseDotBySquare(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         if self.allow_matmul:
-            s = self.inv_sqrt_d.to(device=q.device, dtype=q.dtype)
-            return (q * s) @ k.transpose(-2, -1)
+            qs = self.q_scale(q)
+            return self.qk_matmul(qs, k.transpose(-2, -1))
         qe = q.unsqueeze(3)
         ke = k.unsqueeze(2)
         nq = q.shape[2]
@@ -401,10 +441,10 @@ class GibbsTopKSoftmax(nn.Module):
         z_tail = exp_vals.sum(dim=-1, keepdim=True) + float(nk - k) * exp_tail
         probs = exp_vals / (z_tail + 1e-30)
         q_tail = float(nk - k) * exp_tail / (z_tail + 1e-30)
-        if self.attn_drop > 0.0 and self.training:
-            drop = torch.rand_like(probs) > self.attn_drop
-            probs = probs * drop.to(probs.dtype) / (1.0 - self.attn_drop + 1e-12)
-            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-30)
+        # if self.attn_drop > 0.0 and self.training:
+        #     drop = torch.rand_like(probs) > self.attn_drop
+        #     probs = probs * drop.to(probs.dtype) / (1.0 - self.attn_drop + 1e-12)
+        #     probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-30)
         return probs, idx, q_tail
 
 
@@ -427,7 +467,9 @@ class SparseWeightedSumBySquare(nn.Module):
     def __init__(self, *, allow_matmul: bool = False) -> None:
         super().__init__()
         self.allow_matmul = allow_matmul
-        if not allow_matmul:
+        if allow_matmul:
+            self.pv_matmul = ExplicitMatMul()
+        else:
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
                 "p,...kpd->...d",
@@ -452,7 +494,8 @@ class SparseWeightedSumBySquare(nn.Module):
         v_h = v.unsqueeze(2).expand(-1, -1, nq, -1, -1)
         v_g = torch.gather(v_h, 3, idx_e)
         if self.allow_matmul:
-            return (probs.unsqueeze(-1) * v_g).sum(dim=3)
+            # [B,H,Nq,1,K] @ [B,H,Nq,K,D] -> [B,H,Nq,1,D]
+            return self.pv_matmul(probs.unsqueeze(-2), v_g).squeeze(-2)
         p = probs.unsqueeze(-1)
         p_b = p.expand(-1, -1, -1, -1, d)
         return self.square_chain(p_b, v_g)
@@ -583,8 +626,9 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
     reference / legacy parity with older PWL runs.
 
     **log_x_knots** — ``logspace`` grid historically tied to LN log PWL; **not** used in the
-    current graph: :class:`RewrittenLayerNormAbsSign` uses :class:`ExplicitLogPlusEps` (exact
-    ``torch.log``). Kept for reference only.
+    strict LN graph: :class:`RewrittenLayerNormAbsSign` with ``allow_matmul=False`` uses
+    :class:`ExplicitLogPlusEps`. With ``allow_matmul=True``, LN uses :class:`ExplicitSqrtReciprocal`
+    only. Kept for reference only.
 
     **GELU** knots ``linspace(-4, 4)`` live inside :class:`GELUUnaryPWL` and are not duplicated here.
     """
@@ -600,8 +644,8 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
                 "this grid matches historical PWL knot positions for reference only."
             ),
             "log_x_knots": (
-                "Unused in forward: RewrittenLayerNormAbsSign uses exact log via ExplicitLogPlusEps; "
-                "this grid is legacy / reference only."
+                "Unused in forward (strict LN uses ExplicitLogPlusEps; fast LN uses rsqrt); "
+                "legacy / reference only."
             ),
             "gelu": (
                 "GELUUnaryPWL uses its own knot positions (default linspace(-4, 4)); not listed here."

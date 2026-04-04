@@ -11,6 +11,7 @@ import torch.nn as nn
 from timm.layers import DropPath
 
 from surgery_utils import (
+    ExplicitMatMul,
     GibbsTopKSoftmax,
     GELUUnaryPWL,
     PairwiseDotBySquare,
@@ -51,6 +52,9 @@ class SurgeryAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.use_attention_surgery = use_attention_surgery
         self.use_surgery_softmax = use_surgery_softmax
+        self.allow_matmul = allow_matmul
+        if use_attention_surgery and not use_surgery_softmax and allow_matmul:
+            self.matmul = ExplicitMatMul()
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -71,7 +75,9 @@ class SurgeryAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         if not self.use_attention_surgery:
             s = self.attn_scale.to(device=q.device, dtype=q.dtype)
-            attn = (q * s) @ k.transpose(-2, -1)
+            qs = q * s
+            kt = k.transpose(-2, -1)
+            attn = qs @ kt
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             attn = attn @ v
@@ -83,7 +89,12 @@ class SurgeryAttention(nn.Module):
             scores = self.dot(q, k)
             attn = scores.softmax(dim=-1)
             attn = self.attn_drop(attn)
-            attn = attn @ v
+            if self.allow_matmul:
+                attn = self.matmul(attn, v)
+            else:
+                _, _, nq, nk = attn.shape
+                v_b = v.unsqueeze(2).expand(-1, -1, nq, nk, -1)
+                attn = (attn.unsqueeze(-1) * v_b).sum(dim=3)
         attn = attn.transpose(1, 2).reshape(b, n, c)
         attn = self.proj(attn)
         attn = self.proj_drop(attn)
@@ -126,8 +137,8 @@ class SurgeryBlock(nn.Module):
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
-            self.norm1 = RewrittenLayerNormAbsSign(dim, eps=eps_ln)
-            self.norm2 = RewrittenLayerNormAbsSign(dim, eps=eps_ln)
+            self.norm1 = RewrittenLayerNormAbsSign(dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.norm2 = RewrittenLayerNormAbsSign(dim, eps=eps_ln, allow_matmul=allow_matmul)
         else:
             self.norm1 = nn.LayerNorm(dim, eps=eps_ln)
             self.norm2 = nn.LayerNorm(dim, eps=eps_ln)
@@ -211,7 +222,7 @@ class DeiTTinySurgeryModel(nn.Module):
             ]
         )
         if use_surgery_layernorm:
-            self.fc_norm = RewrittenLayerNormAbsSign(embed_dim, eps=eps_ln)
+            self.fc_norm = RewrittenLayerNormAbsSign(embed_dim, eps=eps_ln, allow_matmul=allow_matmul)
         else:
             self.fc_norm = nn.LayerNorm(embed_dim, eps=eps_ln)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -302,4 +313,7 @@ class DeiTTinySurgeryModel(nn.Module):
 def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
     for m in model.modules():
         if isinstance(m, RewrittenLayerNormAbsSign):
-            m.log_eps.eps.requires_grad = False
+            if hasattr(m, "log_eps"):
+                m.log_eps.eps.requires_grad = False
+            if hasattr(m, "inv_sqrt_var"):
+                m.inv_sqrt_var.eps.requires_grad = False
