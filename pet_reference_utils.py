@@ -411,15 +411,28 @@ def accuracy_and_loss(
     return float(acc_metric.compute().item()), loss_sum / n_samples
 
 
+def _pet_loader_random_erasing_prob(cfg: Any) -> float:
+    """``random_erasing_prob`` (surgery / pretrain) or ``random_erasing`` (Jeffreys distill config)."""
+    if hasattr(cfg, "random_erasing_prob"):
+        return float(cfg.random_erasing_prob)
+    return float(getattr(cfg, "random_erasing", 0.0))
+
+
 def build_pet_loaders(
-    data_dir: str,
-    batch_size: int,
-    workers: int,
-    randaugment: bool = True,
-    ra_magnitude: int = 9,
-    random_erasing_prob: float = 0.0,
+    cfg: Any,
 ) -> Tuple[DataLoader, DataLoader]:
+    """
+    Train/val Oxford-IIIT Pet loaders from a run config: ``data_dir``, ``batch_size``, ``workers``,
+    ``randaugment``, ``ra_magnitude``, plus random erasing (field name depends on config type).
+    """
     device = get_device()
+    data_dir = cfg.data_dir
+    batch_size = cfg.batch_size
+    workers = cfg.workers
+    randaugment = bool(getattr(cfg, "randaugment", True))
+    ra_magnitude = int(getattr(cfg, "ra_magnitude", 9))
+    random_erasing_prob = _pet_loader_random_erasing_prob(cfg)
+
     os.makedirs(data_dir, exist_ok=True)
     need_download = not oxford_iiit_pet_is_present(data_dir)
     if need_download:
@@ -520,6 +533,15 @@ def _warmup_cosine_scheduler(
     return SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
 
 
+def _fmt_best_epoch_for_log(best_ep: Optional[int]) -> str:
+    """Training epoch (1-based), ``resume`` when baseline was seeded from a checkpoint (0), else ``—``."""
+    if best_ep is None:
+        return "—"
+    if best_ep == 0:
+        return "resume"
+    return str(best_ep)
+
+
 def finetune_model_adaptertune_style(
     model: nn.Module,
     train_loader: DataLoader,
@@ -537,7 +559,9 @@ def finetune_model_adaptertune_style(
     head_only: bool = False,
     keep_best_val: bool = False,
     cosine_eta_min: float = 0.0,
-) -> Tuple[float, float, Optional[int]]:
+    val_gap_th: Optional[float] = None,
+    resume_val_acc: Optional[float] = None,
+) -> Tuple[float, float, Optional[int], int]:
     """
     AdamW + ``LinearLR`` warmup (optional) + ``CosineAnnealingLR`` (``SequentialLR``), stepped once
     per batch. ``cosine_eta_min`` is passed as ``eta_min`` on cosine.
@@ -550,6 +574,15 @@ def finetune_model_adaptertune_style(
 
     If ``keep_best_val`` is True, keeps weights from the epoch with highest validation accuracy
     (returns that accuracy/loss and the 1-based best epoch index; else third return is None).
+
+    If ``resume_val_acc`` is set and ``keep_best_val`` is True, ``best_acc`` / ``best_state`` are
+    seeded before epoch 1 from that value and the model's current weights (e.g. checkpoint
+    ``val_acc`` when continuing training).
+
+    If ``val_gap_th`` is set and ``keep_best_val`` is True, after each epoch when validation
+    accuracy is more than ``val_gap_th`` below the best-so-far, model weights are restored to the
+    best checkpoint only (optimizer state unchanged — simple hook for random search). The fourth
+    return value counts how many such reverts occurred.
     """
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -602,6 +635,15 @@ def finetune_model_adaptertune_style(
     best_acc = float("-inf")
     best_state: Optional[dict] = None
     best_ep: Optional[int] = None
+    gap_revert_count = 0
+    if keep_best_val and resume_val_acc is not None:
+        best_acc = float(resume_val_acc)
+        best_state = copy.deepcopy(model.state_dict())
+        best_ep = 0
+        print(
+            f"  {pf}seed best from resume: val_acc={best_acc:.4f} (checkpoint baseline weights)",
+            flush=True,
+        )
     for ep in range(epochs):
         model.train()
         n_batches = 0
@@ -625,52 +667,70 @@ def finetune_model_adaptertune_style(
             best_acc = acc
             best_ep = ep + 1
             best_state = copy.deepcopy(model.state_dict())
+
+        if (
+            val_gap_th is not None
+            and keep_best_val
+            and best_state is not None
+            and float(acc) < float(best_acc) - float(val_gap_th)
+        ):
+            model.load_state_dict(best_state)
+            acc, loss_v = accuracy_and_loss(model, val_loader, criterion)
+            gap_revert_count += 1
+            print(
+                f"  {pf}gap revert #{gap_revert_count}: val acc below best by > {float(val_gap_th)} "
+                f"(best={best_acc:.4f} @ {_fmt_best_epoch_for_log(best_ep)}) — restored best weights "
+                f"(val acc={acc:.4f} loss={loss_v:.4f})",
+                flush=True,
+            )
     if keep_best_val and best_state is not None:
         model.load_state_dict(best_state)
         print(
-            f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})",
+            f"  {pf}kept best val acc={best_acc:.4f} (epoch {_fmt_best_epoch_for_log(best_ep)}/{epochs})",
             flush=True,
         )
     acc_f, loss_f = accuracy_and_loss(model, val_loader, criterion)
     best_i = best_ep if keep_best_val else None
-    return acc_f, loss_f, best_i
+    return acc_f, loss_f, best_i, gap_revert_count
 
 
 def train_timm_deit_on_pet(
     ref: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int,
-    lr: float,
+    cfg: "PretrainPetConfig",
     *,
-    max_train_batches: Optional[int] = None,
-    weight_decay: float = 0.05,
-    warmup_epochs: int = 5,
-    grad_clip: float = 1.0,
-    label_smoothing: float = 0.05,
-    cosine_eta_min: float = 1e-6,
-) -> Tuple[float, float, Optional[int]]:
+    resume_val_acc: Optional[float] = None,
+) -> Tuple[float, float, Optional[int], int]:
     """Timm DeiT-Tiny: train only the Pet classification head (backbone frozen); keeps best val checkpoint.
 
-    Uses ``LinearLR`` + ``CosineAnnealingLR`` (``SequentialLR``) per step; ``eta_min=cosine_eta_min``.
+    Hyperparameters from ``cfg`` (:class:`PretrainPetConfig`). Uses ``LinearLR`` + ``CosineAnnealingLR``
+    (``SequentialLR``) per step; ``eta_min=cfg.cosine_eta_min``. Optional ``cfg.gap_th`` enables
+    per-epoch gap revert inside the training loop (see :func:`finetune_model_adaptertune_style`).
+
+    Pass ``resume_val_acc`` (e.g. ``val_acc`` from the loaded checkpoint) to seed best-so-far before
+    epoch 1 so gap revert compares against that baseline.
     """
+    c = cfg
     return finetune_model_adaptertune_style(
         ref,
         train_loader,
         val_loader,
-        epochs,
-        lr,
-        max_train_batches=max_train_batches,
-        weight_decay=weight_decay,
+        c.epochs,
+        c.lr,
+        max_train_batches=c.max_train_batches,
+        weight_decay=c.weight_decay,
         backbone_lr_mult=1.0,
-        warmup_epochs=warmup_epochs,
-        grad_clip=grad_clip,
+        warmup_epochs=c.warmup_epochs,
+        grad_clip=c.grad_clip,
         log_prefix="pet ref",
         layer_decay=None,
-        label_smoothing=label_smoothing,
+        label_smoothing=c.label_smoothing,
         head_only=True,
         keep_best_val=True,
-        cosine_eta_min=cosine_eta_min,
+        cosine_eta_min=c.cosine_eta_min,
+        val_gap_th=c.gap_th,
+        resume_val_acc=resume_val_acc,
     )
 
 
@@ -722,31 +782,34 @@ def distill_surgery_from_teacher_jeffreys(
     teacher: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int,
-    lr: float,
+    cfg: "JeffreysDistillConfig",
     *,
-    temperature: float = 1.0,
-    max_train_batches: Optional[int] = None,
-    weight_decay: float = 0.05,
-    warmup_epochs: int = 5,
-    grad_clip: float = 1.0,
-    cosine_eta_min: float = 0.0,
-    keep_best_val: bool = True,
     log_prefix: str = "distill",
-    train_progress_interval: int = 10,
-    val_progress_batches: int = 20,
 ) -> Tuple[float, float, float, Optional[int]]:
     """
     Train student to match frozen timm teacher class distributions using dense Jeffreys J(p,q).
-    Keeps best student by validation accuracy when ``keep_best_val``.
+    Hyperparameters come from ``cfg`` (:class:`JeffreysDistillConfig`). Warmup length follows the
+    same rule as the Jeffreys CLI: ``min(5, max(epochs, 1))`` when ``cfg.warmup_epochs`` is None.
+
     Returns (val_acc, val_ce_mean, val_jeffreys_mean, best_epoch_or_None).
 
-    ``train_progress_interval``: print every N training batches (loss, throughput, ETA for the
-    epoch). Set to 0 to print only per-epoch val lines.
+    ``cfg.train_progress_interval``: print every N training batches. ``0`` = only per-epoch val lines.
 
-    ``val_progress_batches``: print val eval every N batches (teacher + student forward each batch).
-    Set to 0 to run val silently until metrics are ready.
+    ``cfg.val_progress_batches``: val eval progress every N batches; ``0`` = silent until metrics done.
     """
+    c = cfg
+    epochs = c.epochs
+    lr = c.lr
+    temperature = c.temperature
+    max_train_batches = int(c.max_train_batches) if c.max_train_batches is not None else None
+    weight_decay = c.weight_decay
+    warmup_epochs = min(5, max(c.epochs, 1)) if c.warmup_epochs is None else int(c.warmup_epochs)
+    grad_clip = c.grad_clip
+    cosine_eta_min = c.cosine_eta_min
+    keep_best_val = c.keep_best
+    train_progress_interval = c.train_progress_interval
+    val_progress_batches = c.val_progress_batches
+
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
@@ -963,6 +1026,9 @@ class PretrainPetConfig:
     device: str = "auto"
     cosine_eta_min: float = 1e-6
     gap_th: Optional[float] = None
+    randaugment: bool = True
+    ra_magnitude: int = 9
+    random_erasing_prob: float = 0.0
     config_json_path: Optional[str] = None
 
     @classmethod
@@ -973,8 +1039,8 @@ class PretrainPetConfig:
 
 FIELD_HELP_PRETRAIN: Dict[str, str] = {
     "gap_th": (
-        "With resume: if val_acc after training < val_acc from checkpoint (best_acc) minus this gap, "
-        "restore pre-run weights."
+        "During training: after each epoch, if val acc is more than this far below the best-so-far "
+        "val acc, restore model weights to that best checkpoint only (optimizer state unchanged)."
     ),
 }
 
@@ -985,7 +1051,7 @@ def pretrain_train_config_record(
     output_abs: str,
     best_val_epoch: Optional[int] = None,
     best_acc_reference: Optional[float] = None,
-    reverted_below_best_acc_minus_gap: bool = False,
+    gap_revert_count: int = 0,
 ) -> Dict[str, Any]:
     """JSON-serializable ``train_config`` block for the Pet head checkpoint."""
     rec: Dict[str, Any] = {
@@ -1013,8 +1079,8 @@ def pretrain_train_config_record(
         rec["gap_th"] = float(cfg.gap_th)
     if best_acc_reference is not None:
         rec["best_acc_reference"] = best_acc_reference
-    if reverted_below_best_acc_minus_gap:
-        rec["reverted_below_best_acc_minus_gap"] = True
+    if gap_revert_count > 0:
+        rec["gap_revert_count"] = gap_revert_count
     return rec
 
 
@@ -1185,140 +1251,6 @@ def parse_surgery_run_config(argv: Optional[Sequence[str]] = None) -> SurgeryRun
         field_help=FIELD_HELP_SURGERY_RUN,
         argv=argv,
     )
-
-
-def parse_jeffreys_distill_config(argv: Optional[Sequence[str]] = None) -> JeffreysDistillConfig:
-    """Parse argv into a merged :class:`JeffreysDistillConfig`."""
-    return parse_cli_config(
-        JeffreysDistillConfig,
-        description=CLI_JEFFREYS_DESCRIPTION,
-        config_default=CLI_JEFFREYS_CONFIG_DEFAULT,
-        config_help=CLI_JEFFREYS_CONFIG_HELP,
-        field_help=FIELD_HELP_JEFFREYS,
-        argv=argv,
-    )
-
-
-def jeffreys_distill_pipeline(cfg: JeffreysDistillConfig) -> Dict[str, Any]:
-    """
-    End-to-end Jeffreys distillation using a single :class:`JeffreysDistillConfig`.
-
-    Returns ``val_acc``, ``val_ce_mean``, ``val_jeffreys_mean``, ``best_epoch``, paths,
-    and the trained ``student`` module.
-    """
-    c = cfg
-    apply_device_from_config(c)
-
-    pre_path = os.path.abspath(c.pre_checkpoint)
-    pet_path = os.path.abspath(c.pet_ref_checkpoint)
-    if not os.path.isfile(pre_path):
-        raise FileNotFoundError(
-            f"Missing student checkpoint: {pre_path} (run run_deit_tiny_surgery.py first)"
-        )
-    if not os.path.isfile(pet_path):
-        raise FileNotFoundError(
-            f"Missing teacher checkpoint: {pet_path} (run pretrain_pet_deit_tiny.py first)"
-        )
-
-    if not c.quiet:
-        print(f"device={describe_device(get_device())}", flush=True)
-        if c.config_json_path:
-            print(f"config_json={c.config_json_path}", flush=True)
-
-    student, _ = load_surgery_student_checkpoint(pre_path, c.top_k, c.eps)
-    teacher = load_timm_deit_pet_checkpoint(pet_path)
-
-    train_loader, val_loader = build_pet_loaders(
-        c.data_dir,
-        c.batch_size,
-        c.workers,
-        randaugment=c.randaugment,
-        ra_magnitude=c.ra_magnitude,
-        random_erasing_prob=c.random_erasing,
-    )
-
-    w_ep = min(5, max(c.epochs, 1)) if c.warmup_epochs is None else int(c.warmup_epochs)
-    max_tb = c.max_train_batches
-
-    if not c.quiet:
-        print(
-            f"distill Jeffreys | teacher={pet_path} T={c.temperature} "
-            f"epochs={c.epochs} lr={c.lr} wd={c.weight_decay} "
-            f"train_progress_interval={c.train_progress_interval} val_progress_batches={c.val_progress_batches}",
-            flush=True,
-        )
-
-    val_acc, val_ce, val_j, best_ep = distill_surgery_from_teacher_jeffreys(
-        student,
-        teacher,
-        train_loader,
-        val_loader,
-        c.epochs,
-        c.lr,
-        temperature=c.temperature,
-        max_train_batches=int(max_tb) if max_tb is not None else None,
-        weight_decay=c.weight_decay,
-        warmup_epochs=w_ep,
-        grad_clip=c.grad_clip,
-        cosine_eta_min=c.cosine_eta_min,
-        keep_best_val=c.keep_best,
-        log_prefix="distill",
-        train_progress_interval=c.train_progress_interval,
-        val_progress_batches=c.val_progress_batches,
-    )
-
-    if not c.quiet:
-        print(
-            f"final val acc={val_acc:.4f} ce={val_ce:.4f} jeffreys={val_j:.4f}"
-            + (f" best_epoch={best_ep}" if best_ep is not None else ""),
-            flush=True,
-        )
-
-    out_abs = os.path.abspath(c.output)
-    os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    save_deit_checkpoint(
-        out_abs,
-        student,
-        extra={
-            "distill": "jeffreys_dense",
-            "temperature": float(c.temperature),
-            "teacher_checkpoint": pet_path,
-            "student_pre_checkpoint": pre_path,
-            "val_acc": val_acc,
-            "val_ce_mean": val_ce,
-            "val_jeffreys_mean": val_j,
-            "best_val_epoch": best_ep,
-            "config_json": c.config_json_path,
-        },
-    )
-    if not c.quiet:
-        print(f"wrote {out_abs}", flush=True)
-
-    meta_out: Optional[str] = None
-    if c.meta_json:
-        meta_out = os.path.abspath(str(c.meta_json).strip())
-        merge_post_distill_into_surgery_meta(meta_out, val_acc, val_ce, val_j)
-        if not c.quiet:
-            print(f"wrote {meta_out}", flush=True)
-
-    return {
-        "val_acc": val_acc,
-        "val_ce_mean": val_ce,
-        "val_jeffreys_mean": val_j,
-        "best_epoch": best_ep,
-        "output_checkpoint": out_abs,
-        "meta_path": meta_out,
-        "student": student,
-    }
-
-
-def run_jeffreys_distill_cli(argv: Optional[Sequence[str]] = None) -> None:
-    """CLI entry: parse config, run :func:`jeffreys_distill_pipeline`; ``FileNotFoundError`` → ``SystemExit``."""
-    cfg = parse_jeffreys_distill_config(argv)
-    try:
-        jeffreys_distill_pipeline(cfg)
-    except FileNotFoundError as e:
-        raise SystemExit(str(e)) from e
 
 
 # Backward-compatible alias (prefer :func:`set_default_device` + :func:`get_device`).

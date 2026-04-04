@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -79,6 +79,18 @@ class ExplicitAdd(nn.Module):
         return a + b
 
 
+class ExplicitElementwiseAffine(nn.Module):
+    """LayerNorm epilogue ``y = x * weight + bias`` (gamma / beta on the normalized last dim)."""
+
+    def __init__(self, num_features: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight + self.bias
+
+
 class ExplicitLogPlusEps(nn.Module):
     """``log(x + eps)`` with fixed scalar ``eps`` (LayerNorm-style floor), exact ``torch.log``."""
 
@@ -96,6 +108,88 @@ class ExplicitSquare(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * x
+
+
+class ExplicitExp(nn.Module):
+    """Exact ``torch.exp``; explicit graph node (Gibbs softmax, LN magnitude, etc.), no PWL."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.exp(x)
+
+
+class ExplicitStackOperands(nn.Module):
+    """Stack two broadcast-compatible tensors along ``dim=-2`` (operand channel: e.g. q‖k, p‖v)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.stack((a, b), dim=-2)
+
+
+class ExplicitFixedMatrixMix(nn.Module):
+    """
+    Fixed 2×2 linear mix on the operand channel:
+    ``y[...,p,:] = Σ_q M[p,q] * x[...,q,:]`` via ``torch.einsum`` (default ``M`` builds plus/minus).
+    Exposed as a submodule so surgery graphs list an explicit affine node, like LN submodules.
+    """
+
+    def __init__(
+        self,
+        einsum_equation: str,
+        matrix: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.einsum_equation = einsum_equation
+        if matrix is None:
+            matrix = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float32)
+        self.register_buffer("weight", matrix.clone().detach())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(device=x.device, dtype=x.dtype)
+        return torch.einsum(self.einsum_equation, w, x)
+
+
+class ExplicitFixedCoeffContract(nn.Module):
+    """
+    Contract operand / head dims with a fixed coefficient vector (e.g. ``(w,−w)`` for scaled
+    ``plus²−minus²``). One graph node for the output affine of the square-identity chain.
+    """
+
+    def __init__(self, einsum_equation: str, coeffs: torch.Tensor) -> None:
+        super().__init__()
+        self.einsum_equation = einsum_equation
+        self.register_buffer("coeff", coeffs.clone().detach().float())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        c = self.coeff.to(device=x.device, dtype=x.dtype)
+        return torch.einsum(self.einsum_equation, c, x)
+
+
+class SquareIdentityOperandChain(nn.Module):
+    """
+    ``((a+b)²-(a-b)²)/4`` implemented as stack → fixed 2×2 mix → :class:`ExplicitSquare` → coeff
+    contraction. :class:`PairwiseDotBySquare` and :class:`SparseWeightedSumBySquare` share this
+    chain; they differ only in how ``a`` and ``b`` are formed (QK broadcast vs gathered ``p``/``v``)
+    and in the ``einsum`` equations / coefficient vector (attention includes ``1/√d``, value mix does
+    not).
+    """
+
+    def __init__(
+        self,
+        mix_einsum: str,
+        contract_einsum: str,
+        coeffs: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.stack_operands = ExplicitStackOperands()
+        self.operand_mix = ExplicitFixedMatrixMix(mix_einsum)
+        self.square = ExplicitSquare()
+        self.out_contract = ExplicitFixedCoeffContract(contract_einsum, coeffs)
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        stacked = self.stack_operands(a, b)
+        pm = self.operand_mix(stacked)
+        pm = pm.to(torch.result_type(a, b))
+        sq = self.square(pm)
+        return self.out_contract(sq)
 
 
 class ExplicitMean(nn.Module):
@@ -148,19 +242,6 @@ class UnaryScalarPWL(nn.Module):
         return _pwl_eval(x, self.knots, self.values)
 
 
-def fit_pwl_to_fn(
-    knots: torch.Tensor,
-    fn: Callable[[torch.Tensor], torch.Tensor],
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Sample fn at knots for initialization."""
-    if device is None:
-        device = knots.device
-    with torch.no_grad():
-        y = fn(knots.to(device))
-    return y.detach().clone()
-
-
 class MultiTailPWLEpilogue(nn.Module):
     """
     One logical affine/wide tensor feeds multiple unary PWL tails; each tail is a separate
@@ -184,8 +265,8 @@ class RewrittenLayerNormAbsSign(nn.Module):
     """
     mu = mean(x); u = x - mu; r2 = mean(u*u)
     log_a = log(|u|+eps) - log(r2+eps)/2 via ``ExplicitLogPlusEps`` (exact ``torch.log``)
-    a_mag = exp(log_a) — exact ``torch.exp``
-    z = setsign(u, a_mag);  y = gamma * z + beta
+    a_mag = exp(log_a) via :class:`ExplicitExp` (exact ``torch.exp``, explicit graph node)
+    z = setsign(u, a_mag);  y = affine(z) with :class:`ExplicitElementwiseAffine` (gamma/beta).
     """
 
     def __init__(self, normalized_shape: int, eps: float) -> None:
@@ -199,9 +280,8 @@ class RewrittenLayerNormAbsSign(nn.Module):
         self.abs_op = AbsOp()
         self.setsign = SetSign()
         self.neg_half = ExplicitScale(-0.5)
-
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.exp = ExplicitExp()
+        self.affine = ExplicitElementwiseAffine(normalized_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
@@ -212,9 +292,9 @@ class RewrittenLayerNormAbsSign(nn.Module):
         log_num = self.log_eps(au)
         log_den = self.log_eps(r2)
         log_a = log_num + self.neg_half(log_den)
-        a_mag = torch.exp(log_a)
+        a_mag = self.exp(log_a)
         z = self.setsign(u, a_mag)
-        return z * self.weight + self.bias
+        return self.affine(z)
 
 
 def copy_ln_params_to_rewritten(dst: RewrittenLayerNormAbsSign, src: nn.LayerNorm) -> None:
@@ -227,8 +307,8 @@ def copy_ln_params_to_rewritten(dst: RewrittenLayerNormAbsSign, src: nn.LayerNor
     For numerical parity with timm, keep ``eps`` in JSON equal to ``ref.blocks[0].norm1.eps``.
     """
     with torch.no_grad():
-        dst.weight.copy_(torch.nan_to_num(src.weight.detach(), nan=1.0, posinf=1.0, neginf=1.0))
-        dst.bias.copy_(torch.nan_to_num(src.bias.detach(), nan=0.0, posinf=0.0, neginf=0.0))
+        dst.affine.weight.copy_(torch.nan_to_num(src.weight.detach(), nan=1.0, posinf=1.0, neginf=1.0))
+        dst.affine.bias.copy_(torch.nan_to_num(src.bias.detach(), nan=0.0, posinf=0.0, neginf=0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +320,9 @@ class PairwiseDotBySquare(nn.Module):
     """
     scores[b,h,i,j] = (1/sqrt(d)) * sum_l q[b,h,i,l] * k[b,h,j,l]
 
-    **Demonstration / plan.md form (default):** each product ``q[l]*k[l]`` is implemented only
-    via the identity ``a*b = ((a+b)²-(a-b)²)/4`` with **explicit** ``plus`` / ``minus`` / square /
-    sum — **no** ``torch.matmul`` for QKᵀ. This matches the pseudo-hardware story (fixed
-    quarter-scale and squares vs variable activations), not generic var×var GEMM.
+    **Demonstration / plan.md form (default):** uses :class:`SquareIdentityOperandChain` with
+    mix ``pq,...qd→...pd``, contract ``p,...pd→...``, coeffs ``±1/(4√d)``. Operands ``a,b`` are the
+    broadcast Q/K grid. **No** ``torch.matmul`` for QKᵀ.
 
     Optional ``allow_matmul_scores=True`` replaces this with fused ``(q/sqrt(d)) @ kᵀ`` for
     speed / debugging only; that path **does** use matrix multiply and is not valid for the
@@ -257,8 +336,12 @@ class PairwiseDotBySquare(nn.Module):
         if allow_matmul_scores:
             self.register_buffer("inv_sqrt_d", torch.tensor(1.0 / math.sqrt(float(head_dim))))
         else:
-            scale = 0.25 / math.sqrt(float(head_dim))
-            self.dot_scale = ExplicitScale(scale)
+            w = 0.25 / math.sqrt(float(head_dim))
+            self.square_chain = SquareIdentityOperandChain(
+                "pq,...qd->...pd",
+                "p,...pd->...",
+                torch.tensor([w, -w], dtype=torch.float32),
+            )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         if self.allow_matmul_scores:
@@ -266,13 +349,11 @@ class PairwiseDotBySquare(nn.Module):
             return (q * s) @ k.transpose(-2, -1)
         qe = q.unsqueeze(3)
         ke = k.unsqueeze(2)
-        plus = qe + ke
-        minus = qe - ke
-        dt = torch.result_type(plus, minus)
-        plus = plus.to(dt)
-        minus = minus.to(dt)
-        diff = plus * plus - minus * minus
-        return self.dot_scale(diff.sum(dim=-1))
+        nq = q.shape[2]
+        nk = k.shape[2]
+        qe_b = qe.expand(-1, -1, -1, nk, -1)
+        ke_b = ke.expand(-1, -1, nq, -1, -1)
+        return self.square_chain(qe_b, ke_b)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +377,8 @@ class GibbsTopKSoftmax(nn.Module):
     """
     Sparse Gibbs Top-K with implicit replicated tail at s_(k).
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
+
+    Uses :class:`ExplicitExp` (exact ``torch.exp``) on stabilized logits — no unary exp PWL.
     """
 
     def __init__(self, seq_len: int, top_k: int, attn_drop: float = 0.0) -> None:
@@ -303,11 +386,7 @@ class GibbsTopKSoftmax(nn.Module):
         self.seq_len = seq_len
         self.top_k = top_k
         self.attn_drop = attn_drop
-        exp_k = torch.linspace(-25.0, 5.0, PWL_NUM_KNOTS)
-        self.exp_pwl = UnaryScalarPWL(
-            exp_k,
-            init_values=fit_pwl_to_fn(exp_k, torch.exp),
-        )
+        self.exp = ExplicitExp()
 
     def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -319,8 +398,8 @@ class GibbsTopKSoftmax(nn.Module):
         scores_stable = scores - scores.max(dim=-1, keepdim=True).values
         vals, idx = torch.topk(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
-        exp_vals = self.exp_pwl(vals)
-        exp_tail = self.exp_pwl(s_k)
+        exp_vals = self.exp(vals)
+        exp_tail = self.exp(s_k)
         z_tail = exp_vals.sum(dim=-1, keepdim=True) + float(nk - k) * exp_tail
         probs = exp_vals / (z_tail + 1e-30)
         q_tail = float(nk - k) * exp_tail / (z_tail + 1e-30)
@@ -338,10 +417,11 @@ class GibbsTopKSoftmax(nn.Module):
 
 class SparseWeightedSumBySquare(nn.Module):
     """
-    y_i[c] = sum_{j in I} p_ij * v_j[c]
+    y[b,h,nq,d] = sum_{k in top} p[b,h,nq,k] * v[b,h, idx[b,h,nq,k], d]
 
-    **Default (plan.md):** each product ``p * v`` uses ``((p+v)²-(p-v)²)/4`` with
-    :class:`ExplicitSquare` — no dense ``matmul`` for attention-value mixing.
+    **Default (plan.md):** uses :class:`SquareIdentityOperandChain` with mix ``pq,...kqd→...kpd``,
+    contract ``p,...kpd→...d``, coeffs ``(¼,−¼)``. Operands ``a,b`` are expanded prob and gathered
+    value per top-k slot. No dense ``matmul`` for attention-value mixing.
 
     ``allow_elementwise_mul=True`` uses ``p * v`` then sum (faster; invalid for strict demo).
     """
@@ -350,8 +430,11 @@ class SparseWeightedSumBySquare(nn.Module):
         super().__init__()
         self.allow_elementwise_mul = allow_elementwise_mul
         if not allow_elementwise_mul:
-            self.square = ExplicitSquare()
-            self.q = ExplicitScale(0.25)
+            self.square_chain = SquareIdentityOperandChain(
+                "pq,...kqd->...kpd",
+                "p,...kpd->...d",
+                torch.tensor([0.25, -0.25], dtype=torch.float32),
+            )
 
     def forward(
         self,
@@ -373,10 +456,8 @@ class SparseWeightedSumBySquare(nn.Module):
         if self.allow_elementwise_mul:
             return (probs.unsqueeze(-1) * v_g).sum(dim=3)
         p = probs.unsqueeze(-1)
-        plus = p + v_g
-        minus = p - v_g
-        terms = self.q(self.square(plus) - self.square(minus))
-        return terms.sum(dim=3)
+        p_b = p.expand(-1, -1, -1, -1, d)
+        return self.square_chain(p_b, v_g)
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +580,9 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
     """
     Returns tensor grids and a JSON-safe ``meta`` dict for :class:`SurgeryMeta`.
 
-    **exp_knots** — positions ``linspace(-25, 5, PWL_NUM_KNOTS)``, matching
-    :class:`GibbsTopKSoftmax` ``exp_pwl`` (PWL fit to ``exp``). **Used** in forward.
+    **exp_knots** — positions ``linspace(-25, 5, PWL_NUM_KNOTS)``. **Not** used in forward:
+    :class:`GibbsTopKSoftmax` uses :class:`ExplicitExp` (exact ``torch.exp``). Grid kept for
+    reference / legacy parity with older PWL runs.
 
     **log_x_knots** — ``logspace`` grid historically tied to LN log PWL; **not** used in the
     current graph: :class:`RewrittenLayerNormAbsSign` uses :class:`ExplicitLogPlusEps` (exact
@@ -516,8 +598,8 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
         "log_x_knots": log_x_knots.tolist(),
         "usage": {
             "exp_knots": (
-                "Used: GibbsTopKSoftmax UnaryScalarPWL (same positions as "
-                "torch.linspace(-25.0, 5.0, PWL_NUM_KNOTS) in code)."
+                "Unused in forward: GibbsTopKSoftmax uses exact torch.exp via ExplicitExp; "
+                "this grid matches historical PWL knot positions for reference only."
             ),
             "log_x_knots": (
                 "Unused in forward: RewrittenLayerNormAbsSign uses exact log via ExplicitLogPlusEps; "

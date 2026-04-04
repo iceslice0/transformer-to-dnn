@@ -199,14 +199,7 @@ def main() -> None:
             flush=True,
         )
 
-    _, val_loader = build_pet_loaders(
-        cfg.data_dir,
-        cfg.batch_size,
-        cfg.workers,
-        randaugment=cfg.randaugment,
-        ra_magnitude=cfg.ra_magnitude,
-        random_erasing_prob=cfg.random_erasing_prob,
-    )
+    _, val_loader = build_pet_loaders(cfg)
 
     print(f"Loading timm reference from {pet_ref_path} ...", flush=True)
     ref = load_timm_deit_pet_checkpoint(pet_ref_path)
