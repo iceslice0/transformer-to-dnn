@@ -11,9 +11,9 @@ import torch.nn as nn
 from timm.layers import DropPath
 
 from surgery_utils import (
-    ExplicitAdd,
-    ExplicitMatMul,
+    AffineAdd,
     GibbsTopKSoftmax,
+    MatMul,
     GELUUnaryPWL,
     PairwiseDotBySquare,
     RewrittenLayerNormAbsSign,
@@ -56,7 +56,7 @@ class SurgeryAttention(nn.Module):
         self.use_surgery_softmax = use_surgery_softmax
         self.allow_matmul = allow_matmul
         if use_attention_surgery and not use_surgery_softmax and allow_matmul:
-            self.matmul = ExplicitMatMul()
+            self.matmul = MatMul()
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -159,7 +159,7 @@ class SurgeryBlock(nn.Module):
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
         self.drop_path = DropPath(drop_path)
-        self.residual_add = ExplicitAdd()
+        self.residual_add = AffineAdd()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.residual_add(x, self.drop_path(self.attn(self.norm1(x))))
@@ -203,7 +203,7 @@ class DeiTTinySurgeryModel(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.seq_len = num_patches + 1
-        self.pos_embed_add = ExplicitAdd()
+        self.pos_embed_add = AffineAdd()
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList(

@@ -18,7 +18,12 @@ import torch.nn.functional as F
 PWL_NUM_KNOTS = 17
 
 # ---------------------------------------------------------------------------
-# Selection / routing primitives (explicit ops)
+# Op vocabulary: Affine* (add/sub, channel scale+bias, fixed einsum mixes), Unary* (maps & reductions),
+# MatMul* (contracting ``matmul`` + Hadamard ``a*b`` with two variable tensors). Routing helpers below.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Selection / routing primitives
 # ---------------------------------------------------------------------------
 
 
@@ -52,17 +57,7 @@ class TupleUnpack(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class ExplicitIdentity(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-class ExplicitNegate(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return -x
-
-
-class ExplicitScale(nn.Module):
+class UnaryScale(nn.Module):
     def __init__(self, scale: float) -> None:
         super().__init__()
         self.register_buffer("scale", torch.tensor(float(scale)))
@@ -74,36 +69,36 @@ class ExplicitScale(nn.Module):
         return x * s.to(dtype=x.dtype)
 
 
-class ExplicitAdd(nn.Module):
-    """Binary add ``a + b`` (broadcasting); explicit leaf for residual-style sums."""
+class AffineAdd(nn.Module):
+    """Binary add ``a + b`` (broadcasting); residual / log-domain sums."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a + b
 
 
-class ExplicitSub(nn.Module):
-    """Binary subtract ``a - b`` (broadcasting); explicit leaf for centering / logit shift."""
+class AffineSub(nn.Module):
+    """Binary subtract ``a - b`` (broadcasting); centering / logit shift."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a - b
 
 
-class ExplicitElementwiseMul(nn.Module):
-    """Hadamard / broadcast multiply ``a * b`` (explicit graph node; e.g. LN fast path ``u * inv_std``)."""
+class MatMulHadamard(nn.Module):
+    """Elementwise / broadcast product ``a * b``; both operands are tensors (MatMul group, not ``@``)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a * b
 
 
-class ExplicitMatMul(nn.Module):
-    """``torch.matmul(a, b)`` as a named submodule (materialized when ``allow_matmul``)."""
+class MatMul(nn.Module):
+    """Contracting product ``torch.matmul(a, b)`` (when ``allow_matmul`` enables batched @)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.matmul(a, b)
 
 
-class ExplicitElementwiseAffine(nn.Module):
-    """LayerNorm epilogue ``y = x * weight + bias`` (gamma / beta on the normalized last dim)."""
+class AffineScaleBias(nn.Module):
+    """Per-channel ``y = x * weight + bias`` (LayerNorm gamma / beta on the last dim)."""
 
     def __init__(self, num_features: int) -> None:
         super().__init__()
@@ -114,7 +109,7 @@ class ExplicitElementwiseAffine(nn.Module):
         return x * self.weight + self.bias
 
 
-class ExplicitLogPlusEps(nn.Module):
+class UnaryLogPlusEps(nn.Module):
     """``log(x + eps)`` with fixed scalar ``eps`` (LayerNorm-style floor), exact ``torch.log``."""
 
     def __init__(self, eps: float) -> None:
@@ -126,15 +121,15 @@ class ExplicitLogPlusEps(nn.Module):
         return torch.log(x + e)
 
 
-class ExplicitSquare(nn.Module):
-    """Exact unary square ``x * x`` (e.g. LayerNorm variance and (a+b)²−(a−b)² identities)."""
+class UnarySquare(nn.Module):
+    """Unary square ``x * x`` (e.g. variance and (a+b)²−(a−b)² identities)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * x
 
 
-class ExplicitSqrtReciprocal(nn.Module):
-    """``1/sqrt(x + eps)`` (e.g. LayerNorm inv-std from variance ``x`` = mean of squares)."""
+class UnaryRsqrtPlusEps(nn.Module):
+    """``1/sqrt(x + eps)`` via ``torch.rsqrt`` (e.g. LayerNorm inv-std from variance)."""
 
     def __init__(self, eps: float) -> None:
         super().__init__()
@@ -145,8 +140,8 @@ class ExplicitSqrtReciprocal(nn.Module):
         return torch.rsqrt(x + e)
 
 
-class ExplicitReciprocalPlusEps(nn.Module):
-    """``1 / (x + eps)`` (normalization factor; use with :class:`ExplicitElementwiseMul`, not ``/``)."""
+class UnaryReciprocalPlusEps(nn.Module):
+    """``1 / (x + eps)`` (pair with :class:`MatMulHadamard`, not ``/``)."""
 
     def __init__(self, eps: float) -> None:
         super().__init__()
@@ -157,8 +152,8 @@ class ExplicitReciprocalPlusEps(nn.Module):
         return torch.reciprocal(x + e)
 
 
-class ExplicitSum(nn.Module):
-    """Sum reduction (explicit graph node; unlike :class:`ExplicitMean`, no ``1/n`` scaling)."""
+class UnarySum(nn.Module):
+    """Sum reduction (unlike :class:`UnaryMean`, no ``1/n`` scaling)."""
 
     def __init__(self, dim: int, keepdim: bool = False) -> None:
         super().__init__()
@@ -169,21 +164,14 @@ class ExplicitSum(nn.Module):
         return x.sum(dim=self.dim, keepdim=self.keepdim)
 
 
-class ExplicitExp(nn.Module):
-    """Exact ``torch.exp``; explicit graph node (Gibbs softmax, LN magnitude, etc.), no PWL."""
+class UnaryExp(nn.Module):
+    """``torch.exp`` (Gibbs softmax, LN magnitude, etc.)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x)
 
 
-class ExplicitStackOperands(nn.Module):
-    """Stack two broadcast-compatible tensors along ``dim=-2`` (operand channel: e.g. q‖k, p‖v)."""
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.stack((a, b), dim=-2)
-
-
-class ExplicitFixedMatrixMix(nn.Module):
+class AffineFixedMix(nn.Module):
     """
     Fixed 2×2 linear mix on the operand channel:
     ``y[...,p,:] = Σ_q M[p,q] * x[...,q,:]`` via ``torch.einsum`` (default ``M`` builds plus/minus).
@@ -206,7 +194,7 @@ class ExplicitFixedMatrixMix(nn.Module):
         return torch.einsum(self.einsum_equation, w, x)
 
 
-class ExplicitFixedCoeffContract(nn.Module):
+class AffineContract(nn.Module):
     """
     Contract operand / head dims with a fixed coefficient vector (e.g. ``(w,−w)`` for scaled
     ``plus²−minus²``). One graph node for the output affine of the square-identity chain.
@@ -224,11 +212,11 @@ class ExplicitFixedCoeffContract(nn.Module):
 
 class SquareIdentityOperandChain(nn.Module):
     """
-    ``((a+b)²-(a-b)²)/4`` implemented as stack → fixed 2×2 mix → :class:`ExplicitSquare` → coeff
-    contraction. :class:`PairwiseDotBySquare` and :class:`SparseWeightedSumBySquare` share this
-    chain; they differ only in how ``a`` and ``b`` are formed (QK broadcast vs gathered ``p``/``v``)
-    and in the ``einsum`` equations / coefficient vector (attention includes ``1/√d``, value mix does
-    not).
+    ``((a+b)²-(a-b)²)/4`` implemented as ``torch.stack((a,b), dim=-2)`` (operand layout only) →
+    fixed 2×2 mix → :class:`UnarySquare` → coeff contraction. :class:`PairwiseDotBySquare` and
+    :class:`SparseWeightedSumBySquare` share this chain; they differ only in how ``a`` and ``b`` are
+    formed (QK broadcast vs gathered ``p``/``v``) and in the ``einsum`` equations / coefficient
+    vector (attention includes ``1/√d``, value mix does not).
     """
 
     def __init__(
@@ -238,21 +226,20 @@ class SquareIdentityOperandChain(nn.Module):
         coeffs: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.stack_operands = ExplicitStackOperands()
-        self.operand_mix = ExplicitFixedMatrixMix(mix_einsum)
-        self.square = ExplicitSquare()
-        self.out_contract = ExplicitFixedCoeffContract(contract_einsum, coeffs)
+        self.operand_mix = AffineFixedMix(mix_einsum)
+        self.square = UnarySquare()
+        self.out_contract = AffineContract(contract_einsum, coeffs)
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        stacked = self.stack_operands(a, b)
+        stacked = torch.stack((a, b), dim=-2)
         pm = self.operand_mix(stacked)
         pm = pm.to(torch.result_type(a, b))
         sq = self.square(pm)
         return self.out_contract(sq)
 
 
-class ExplicitMean(nn.Module):
-    """Mean as sum followed by fixed scalar (affine reduction)."""
+class UnaryMean(nn.Module):
+    """Mean as sum followed by fixed scalar ``1/n``."""
 
     def __init__(self, dim: int, keepdim: bool = False) -> None:
         super().__init__()
@@ -316,7 +303,7 @@ class MultiTailPWLEpilogue(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: ExplicitLogPlusEps, SetSign, exact exp (no log PWL, no exp PWL)
+# LayerNorm rewrite: UnaryLogPlusEps, SetSign, UnaryExp (no log PWL, no exp PWL)
 # ---------------------------------------------------------------------------
 
 
@@ -328,8 +315,8 @@ class RewrittenLayerNormAbsSign(nn.Module):
     ``log_a = log(|u|+eps) - log(r2+eps)/2``, ``a_mag = exp(log_a)``, ``z = setsign(u, a_mag)``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
-    ``inv_std = 1/sqrt(r2+eps)`` via :class:`ExplicitSqrtReciprocal` (elementwise mul, not the
-    square-identity chain).
+    ``inv_std = 1/sqrt(r2+eps)`` via :class:`UnaryRsqrtPlusEps` and :class:`MatMulHadamard`, not the
+    square-identity chain.
     """
 
     def __init__(self, normalized_shape: int, eps: float, *, allow_matmul: bool = False) -> None:
@@ -337,21 +324,21 @@ class RewrittenLayerNormAbsSign(nn.Module):
         self.normalized_shape = (normalized_shape,)
         e = float(eps)
         self.allow_matmul = allow_matmul
-        self.mean_u = ExplicitMean(-1, keepdim=True)
-        self.mean_r2 = ExplicitMean(-1, keepdim=True)
-        self.square = ExplicitSquare()
-        self.u_minus_mu = ExplicitSub()
-        self.affine = ExplicitElementwiseAffine(normalized_shape)
+        self.mean_u = UnaryMean(-1, keepdim=True)
+        self.mean_r2 = UnaryMean(-1, keepdim=True)
+        self.square = UnarySquare()
+        self.u_minus_mu = AffineSub()
+        self.affine = AffineScaleBias(normalized_shape)
         if allow_matmul:
-            self.inv_sqrt_var = ExplicitSqrtReciprocal(e)
-            self.u_mul_invstd = ExplicitElementwiseMul()
+            self.inv_sqrt_var = UnaryRsqrtPlusEps(e)
+            self.u_mul_invstd = MatMulHadamard()
         else:
-            self.log_eps = ExplicitLogPlusEps(e)
+            self.log_eps = UnaryLogPlusEps(e)
             self.abs_op = AbsOp()
             self.setsign = SetSign()
-            self.neg_half = ExplicitScale(-0.5)
-            self.log_a_add = ExplicitAdd()
-            self.exp = ExplicitExp()
+            self.neg_half = UnaryScale(-0.5)
+            self.log_a_add = AffineAdd()
+            self.exp = UnaryExp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
@@ -406,8 +393,8 @@ class PairwiseDotBySquare(nn.Module):
         self.head_dim = head_dim
         self.allow_matmul = allow_matmul
         if allow_matmul:
-            self.q_scale = ExplicitScale(1.0 / math.sqrt(float(head_dim)))
-            self.qk_matmul = ExplicitMatMul()
+            self.q_scale = UnaryScale(1.0 / math.sqrt(float(head_dim)))
+            self.qk_matmul = MatMul()
         else:
             w = 0.25 / math.sqrt(float(head_dim))
             self.square_chain = SquareIdentityOperandChain(
@@ -452,11 +439,11 @@ class GibbsTopKSoftmax(nn.Module):
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
-    :class:`ExplicitReciprocalPlusEps` and :class:`ExplicitElementwiseMul`; with
+    :class:`UnaryReciprocalPlusEps` and :class:`MatMulHadamard`; with
     ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
 
-    **z_tail** is explicit: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`ExplicitSum`,
-    :class:`ExplicitElementwiseMul` (tail mass scale), and :class:`ExplicitAdd`.
+    **z_tail**: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`UnarySum`,
+    :class:`MatMulHadamard` (tail mass scale), and :class:`AffineAdd`.
 
     Only subgraphs for the chosen ``allow_matmul`` mode are registered (no unused children).
 
@@ -476,18 +463,17 @@ class GibbsTopKSoftmax(nn.Module):
         self.top_k = top_k
         self.allow_matmul = allow_matmul
         e = float(eps)
-        self.exp = ExplicitExp()
-        self.sum_exp_vals = ExplicitSum(-1, keepdim=True)
-        self.tail_mass_scale = ExplicitElementwiseMul()
-        self.z_tail_add = ExplicitAdd()
-        self.scores_minus_rowmax = ExplicitSub()
+        self.exp = UnaryExp()
+        self.sum_exp_vals = UnarySum(-1, keepdim=True)
+        self.tail_mass_scale = MatMulHadamard()
+        self.z_tail_add = AffineAdd()
+        self.scores_minus_rowmax = AffineSub()
         if allow_matmul:
-            self.inv_z = ExplicitReciprocalPlusEps(e)
-            self.mul_by_inv_z = ExplicitElementwiseMul()
+            self.inv_z = UnaryReciprocalPlusEps(e)
+            self.mul_by_inv_z = MatMulHadamard()
         else:
-            self.log_z = ExplicitLogPlusEps(e)
-            self.neg_log_z = ExplicitNegate()
-            self.logit_minus_logz = ExplicitAdd()
+            self.log_z = UnaryLogPlusEps(e)
+            self.logit_minus_logz = AffineAdd()
 
     def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -513,10 +499,9 @@ class GibbsTopKSoftmax(nn.Module):
             q_tail = self.mul_by_inv_z(tail_term, inv_z)
         else:
             log_z = self.log_z(z_tail)
-            neg_lz = self.neg_log_z(log_z)
-            logits_norm = self.logit_minus_logz(vals, neg_lz)
+            logits_norm = self.logit_minus_logz(vals, -log_z)
             probs = self.exp(logits_norm)
-            sk_norm = self.logit_minus_logz(s_k, neg_lz)
+            sk_norm = self.logit_minus_logz(s_k, -log_z)
             q_tail = self.tail_mass_scale(self.exp(sk_norm), torch.full_like(s_k, tail_coeff))
 
         return probs, idx, q_tail
@@ -542,7 +527,7 @@ class SparseWeightedSumBySquare(nn.Module):
         super().__init__()
         self.allow_matmul = allow_matmul
         if allow_matmul:
-            self.pv_matmul = ExplicitMatMul()
+            self.pv_matmul = MatMul()
         else:
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
@@ -696,12 +681,12 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
     Returns tensor grids and a JSON-safe ``meta`` dict for :class:`SurgeryMeta`.
 
     **exp_knots** — positions ``linspace(-25, 5, PWL_NUM_KNOTS)``. **Not** used in forward:
-    :class:`GibbsTopKSoftmax` uses :class:`ExplicitExp` (exact ``torch.exp``). Grid kept for
+    :class:`GibbsTopKSoftmax` uses :class:`UnaryExp` (exact ``torch.exp``). Grid kept for
     reference / legacy parity with older PWL runs.
 
     **log_x_knots** — ``logspace`` grid historically tied to LN log PWL; **not** used in the
     strict LN graph: :class:`RewrittenLayerNormAbsSign` with ``allow_matmul=False`` uses
-    :class:`ExplicitLogPlusEps`. With ``allow_matmul=True``, LN uses :class:`ExplicitSqrtReciprocal`
+    :class:`UnaryLogPlusEps`. With ``allow_matmul=True``, LN uses :class:`UnaryRsqrtPlusEps`
     only. Kept for reference only.
 
     **GELU** knots ``linspace(-4, 4)`` live inside :class:`GELUUnaryPWL` and are not duplicated here.
@@ -714,11 +699,11 @@ def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any
         "log_x_knots": log_x_knots.tolist(),
         "usage": {
             "exp_knots": (
-                "Unused in forward: GibbsTopKSoftmax uses exact torch.exp via ExplicitExp; "
+                "Unused in forward: GibbsTopKSoftmax uses exact torch.exp via UnaryExp; "
                 "this grid matches historical PWL knot positions for reference only."
             ),
             "log_x_knots": (
-                "Unused in forward (strict LN uses ExplicitLogPlusEps; fast LN uses rsqrt); "
+                "Unused in forward (strict LN uses UnaryLogPlusEps; fast LN uses UnaryRsqrtPlusEps); "
                 "legacy / reference only."
             ),
             "gelu": (
