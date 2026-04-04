@@ -1,0 +1,14 @@
+{
+  "data_dir": "./data",
+  "batch_size": 128,
+  "workers": 2,
+  "top_k": 32,
+  "eps": 1e-3,
+  "pet_ref_checkpoint": "./pet_timm_deit_tiny.pt",
+  "device": "auto",
+  "disable_layernorm_replacement": false,
+  "disable_attention_surgery": false,
+  "disable_softmax_replacement": false,
+  "allow_matmul_scores": true,
+  "allow_elementwise_attn_value_mul": true
+}

@@ -1,0 +1,16 @@
+{
+  "data_dir": "./data",
+  "output": "./pet_timm_deit_tiny.pt",
+  "epochs": 20,
+  "batch_size": 32,
+  "workers": 2,
+  "lr": 0.001,
+  "weight_decay": 0.05,
+  "warmup_epochs": 5,
+  "grad_clip": 1.0,
+  "label_smoothing": 0.05,
+  "seed": 42,
+  "device": "auto",
+  "cosine_eta_min": 1e-6,
+  "gap_th": 1e-3
+}
