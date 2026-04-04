@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from surgery_utils import get_surgery_dtype
+
 from pet_reference_utils import (
     CLI_JEFFREYS_CONFIG_DEFAULT,
     CLI_JEFFREYS_CONFIG_HELP,
@@ -16,10 +18,12 @@ from pet_reference_utils import (
     FIELD_HELP_JEFFREYS,
     JeffreysDistillConfig,
     apply_device_from_config,
+    apply_dtype_from_config,
     build_config_cli_parser,
     build_pet_loaders,
     cli_overrides_from_namespace,
     describe_device,
+    describe_dtype,
     distill_surgery_from_teacher_jeffreys,
     get_device,
     load_surgery_student_checkpoint,
@@ -52,7 +56,10 @@ def require_pet_teacher_checkpoint_path(c: JeffreysDistillConfig) -> str:
 def log_distill_device_and_config_json(c: JeffreysDistillConfig) -> None:
     if c.quiet:
         return
-    print(f"device={describe_device(get_device())}", flush=True)
+    print(
+        f"device={describe_device(get_device())} surgery_dtype={describe_dtype(get_surgery_dtype())}",
+        flush=True,
+    )
     if c.config_json_path:
         print(f"config_json={c.config_json_path}", flush=True)
 
@@ -123,12 +130,15 @@ def main() -> None:
     )
 
     apply_device_from_config(c)
+    apply_dtype_from_config(c)
     pre_path = require_pre_student_checkpoint_path(c)
     pet_path = require_pet_teacher_checkpoint_path(c)
     log_distill_device_and_config_json(c)
 
     student, _ = load_surgery_student_checkpoint(pre_path, c)
-    teacher = load_timm_deit_pet_checkpoint(pet_path)
+    teacher = load_timm_deit_pet_checkpoint(pet_path).to(
+        device=get_device(), dtype=get_surgery_dtype()
+    )
     train_loader, val_loader = build_pet_loaders(c)
 
     log_distill_session_line(c, pet_path)

@@ -40,7 +40,13 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
-from surgery_utils import CALIBRATION_LEGEND_TEXT, SurgeryMeta, jeffreys_divergence_dense
+from surgery_utils import (
+    CALIBRATION_LEGEND_TEXT,
+    SurgeryMeta,
+    get_surgery_dtype,
+    jeffreys_divergence_dense,
+    set_surgery_dtype,
+)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -305,6 +311,27 @@ def describe_device(device: torch.device) -> str:
     return str(device)
 
 
+def describe_dtype(dt: torch.dtype) -> str:
+    return str(dt).replace("torch.", "")
+
+
+def apply_dtype_from_config(
+    cfg: Union[Mapping[str, Any], Any],
+) -> torch.dtype:
+    """
+    Resolve ``surgery_dtype`` from a run config mapping or dataclass and set the process default
+    (``set_surgery_dtype``), mirroring :func:`apply_device_from_config`.
+    Default name is ``bfloat16`` when the field is absent.
+    """
+    if isinstance(cfg, Mapping):
+        name = str(cfg.get("surgery_dtype", "bfloat16"))
+    else:
+        name = str(getattr(cfg, "surgery_dtype", "bfloat16"))
+    dt = getattr(torch, name.strip())
+    set_surgery_dtype(dt)
+    return dt
+
+
 def build_pet_transforms(
     img_size: int = 224,
     *,
@@ -376,8 +403,12 @@ def accuracy_and_loss(
     use_cuda = device.type == "cuda"
     acc_metric: Optional[MulticlassAccuracy] = None
     loss_sum, n_samples = 0.0, 0
+    try:
+        input_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        input_dtype = torch.float32
     for x, y in loader:
-        x = x.to(device, non_blocking=use_cuda)
+        x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
         logits = model(x)
         loss = criterion(logits, y)
@@ -655,8 +686,9 @@ def eval_distillation_metrics(
     correct = 0
     n_val = len(val_loader)
     t0 = time.perf_counter()
+    dt = get_surgery_dtype()
     for bi, (x, y) in enumerate(val_loader):
-        x = x.to(device, non_blocking=use_cuda)
+        x = x.to(device, dtype=dt, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
         t_log = teacher(x)
         s_log = student(x)
@@ -735,13 +767,14 @@ def distill_surgery_from_teacher_jeffreys(
     )
 
     global_step = 0
+    dt = get_surgery_dtype()
     for ep in range(epochs):
         student.train()
         n_batches = 0
         ep_t0 = time.perf_counter()
         running_loss = 0.0
         for x, _ in train_loader:
-            x = x.to(device, non_blocking=use_cuda)
+            x = x.to(device, dtype=dt, non_blocking=use_cuda)
             opt.zero_grad(set_to_none=True)
             with torch.no_grad():
                 t_log = teacher(x)
@@ -950,6 +983,7 @@ class SurgeryRunConfig:
     eps: float = 1e-5
     pet_ref_checkpoint: str = "./pet_timm_deit_tiny.pt"
     device: str = "cuda"
+    surgery_dtype: str = "bfloat16"
     disable_layernorm_replacement: bool = False
     disable_attention_surgery: bool = False
     disable_softmax_replacement: bool = False
@@ -981,6 +1015,10 @@ FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
         "Debug: fast paths — attention: matmul QK and elementwise p*v sparse mix; "
         "RewrittenLayerNorm: z=u*rsqrt(r2+eps) instead of log/exp+setsign (not identical numerically)."
     ),
+    "surgery_dtype": (
+        "``torch.<name>`` compute dtype (e.g. bfloat16, float32). Default bfloat16; "
+        "set via apply_dtype_from_config like device."
+    ),
 }
 
 
@@ -996,6 +1034,7 @@ def surgery_meta_for_pre_ft(
     return SurgeryMeta(
         eps=float(cfg.eps),
         top_k=int(cfg.top_k),
+        surgery_dtype=str(cfg.surgery_dtype),
         pwl_knees=pwl_knees,
         calibration=dict(calibration),
         module_mapping=module_mapping,
@@ -1020,6 +1059,7 @@ def pre_ft_checkpoint_extra(
         "disable_attention_surgery": cfg.disable_attention_surgery,
         "disable_softmax_replacement": cfg.disable_softmax_replacement,
         "allow_matmul": cfg.allow_matmul,
+        "surgery_dtype": str(cfg.surgery_dtype),
     }
 
 
@@ -1047,6 +1087,7 @@ class JeffreysDistillConfig:
     ra_magnitude: int = 9
     random_erasing: float = 0.0
     device: str = "cuda"
+    surgery_dtype: str = "bfloat16"
     train_progress_interval: int = 10
     val_progress_batches: int = 20
     top_k: Optional[int] = None
@@ -1070,8 +1111,8 @@ def load_surgery_student_checkpoint(
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Load a surgery DeiT student from ``surgery_pre_ft.pt`` (or compatible) for distillation / eval.
-    Architecture flags come from checkpoint ``extra``. ``cfg`` may override ``top_k`` / ``eps`` when set;
-    otherwise those fields fall back to ``extra``.
+    Checkpoint ``extra`` must list all architecture fields (see ``pre_ft_checkpoint_extra``).
+    ``cfg`` may override ``top_k`` / ``eps`` when set.
     """
     from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
 
@@ -1080,12 +1121,15 @@ def load_surgery_student_checkpoint(
         payload = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location=device)
-    ex = dict(payload.get("extra") or {})
+    ex = dict(payload["extra"])
     if cfg.top_k is not None:
         ex["top_k"] = int(cfg.top_k)
     if cfg.eps is not None:
         ex["eps_ln"] = float(cfg.eps)
-    model = DeiTTinySurgeryModel.from_pretrained_extra(ex, num_classes=PET_NUM_CLASSES).to(device)
+    set_surgery_dtype(getattr(torch, str(ex["surgery_dtype"]).strip()))
+    model = DeiTTinySurgeryModel.from_pretrained_extra(ex, num_classes=PET_NUM_CLASSES).to(
+        device=device, dtype=get_surgery_dtype()
+    )
     model.load_state_dict(payload["model_state_dict"], strict=True)
     freeze_eps_parameters(model)
     return model, ex
@@ -1094,6 +1138,7 @@ def load_surgery_student_checkpoint(
 FIELD_HELP_JEFFREYS: Dict[str, str] = {
     "meta_json": "Path to surgery_meta.json; empty string disables merge.",
     "quiet": "Less pipeline logging.",
+    "surgery_dtype": FIELD_HELP_SURGERY_RUN["surgery_dtype"],
 }
 
 # Default ``--config`` paths and parser descriptions (single source for all three CLIs).

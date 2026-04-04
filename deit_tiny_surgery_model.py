@@ -254,12 +254,12 @@ class DeiTTinySurgeryModel(nn.Module):
         """Restore architecture from a checkpoint ``extra`` dict (e.g. ``surgery_pre_ft.pt``)."""
         return cls(
             num_classes=num_classes,
-            top_k=int(ex.get("top_k", 32)),
-            eps_ln=float(ex.get("eps_ln", 1e-5)),
-            use_surgery_layernorm=not bool(ex.get("disable_layernorm_replacement", False)),
-            use_attention_surgery=not bool(ex.get("disable_attention_surgery", False)),
-            use_surgery_softmax=not bool(ex.get("disable_softmax_replacement", False)),
-            allow_matmul=bool(ex.get("allow_matmul", False)),
+            top_k=int(ex["top_k"]),
+            eps_ln=float(ex["eps_ln"]),
+            use_surgery_layernorm=not bool(ex["disable_layernorm_replacement"]),
+            use_attention_surgery=not bool(ex["disable_attention_surgery"]),
+            use_surgery_softmax=not bool(ex["disable_softmax_replacement"]),
+            allow_matmul=bool(ex["allow_matmul"]),
         )
 
     def _init_weights(self) -> None:

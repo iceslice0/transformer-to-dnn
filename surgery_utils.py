@@ -17,6 +17,20 @@ import torch.nn.functional as F
 # Default number of PWL knots (log, exp, GELU, Gibbs exp epilogue); cap at 17.
 PWL_NUM_KNOTS = 17
 
+# Process-wide dtype for surgery tensor literals and ``.to(dtype=...)`` (set via ``apply_dtype_from_config``).
+_SURGERY_DTYPE: torch.dtype = torch.bfloat16
+
+
+def get_surgery_dtype() -> torch.dtype:
+    """Current surgery compute dtype (default ``bfloat16``; set with :func:`set_surgery_dtype`)."""
+    return _SURGERY_DTYPE
+
+
+def set_surgery_dtype(dt: torch.dtype) -> None:
+    """Set global surgery dtype (mirrors process device pattern in ``pet_reference_utils``)."""
+    global _SURGERY_DTYPE
+    _SURGERY_DTYPE = dt
+
 # ---------------------------------------------------------------------------
 # Op vocabulary: Affine* (add/sub, channel scale+bias, fixed einsum mixes), Unary* (maps & reductions),
 # MatMul* (contracting ``matmul`` + Hadamard ``a*b`` with two variable tensors). Routing helpers below.
@@ -186,7 +200,7 @@ class AffineFixedMix(nn.Module):
         super().__init__()
         self.einsum_equation = einsum_equation
         if matrix is None:
-            matrix = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float32)
+            matrix = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=get_surgery_dtype())
         self.register_buffer("weight", matrix.clone().detach())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -400,7 +414,7 @@ class PairwiseDotBySquare(nn.Module):
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...qd->...pd",
                 "p,...pd->...",
-                torch.tensor([w, -w], dtype=torch.float32),
+                torch.tensor([w, -w], dtype=get_surgery_dtype()),
             )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
@@ -532,7 +546,7 @@ class SparseWeightedSumBySquare(nn.Module):
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
                 "p,...kpd->...d",
-                torch.tensor([0.25, -0.25], dtype=torch.float32),
+                torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()),
             )
 
     def forward(
@@ -582,7 +596,17 @@ class GELUUnaryPWL(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _kl_safe(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+def _jeffreys_metric_eps(dt: torch.dtype) -> Tuple[float, float]:
+    """``(kl_clamp, denom_add)`` for Jeffreys helpers: scalars must survive ``dt`` (fp16 cannot hold 1e-30)."""
+    f = torch.finfo(dt)
+    smn = float(f.smallest_normal)
+    sms = float(getattr(f, "smallest_subnormal", smn))
+    return (max(1e-12, sms), max(1e-30, smn))
+
+
+def _kl_safe(p: torch.Tensor, q: torch.Tensor, eps: Optional[float] = None) -> torch.Tensor:
+    if eps is None:
+        eps, _ = _jeffreys_metric_eps(p.dtype)
     p = p.clamp_min(eps)
     q = q.clamp_min(eps)
     return (p * (p.log() - q.log())).sum(dim=-1)
@@ -620,16 +644,17 @@ def jeffreys_distance_sparse_teacher(
     """
     t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
     p = F.softmax(t, dim=-1)
+    _, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
 
     s_k = vals[:, -1:]
     exp_vals = torch.exp(vals)
     exp_tail = torch.exp(s_k)
     z_tail = exp_vals.sum(dim=-1, keepdim=True) + float(nk - k) * exp_tail
-    q_on_I = exp_vals / (z_tail + 1e-30)
+    q_on_I = exp_vals / (z_tail + denom_eps)
 
     r = teacher_logits.shape[0]
     device = teacher_logits.device
-    q_tail_each = exp_tail / (z_tail + 1e-30)
+    q_tail_each = exp_tail / (z_tail + denom_eps)
     q_dense = q_tail_each.expand(r, nk).clone()
     q_dense.scatter_(1, idx, q_on_I)
 
@@ -647,12 +672,13 @@ def jeffreys_naive_topk(
     """Naive: softmax renormalized only over the top-k logits; zeros elsewhere."""
     t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
     p = F.softmax(t, dim=-1)
+    kl_eps, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
     exp_vals = torch.exp(vals)
     z_sub = exp_vals.sum(dim=-1, keepdim=True)
-    q_sub = exp_vals / (z_sub + 1e-30)
+    q_sub = exp_vals / (z_sub + denom_eps)
     q_dense = torch.zeros_like(p)
     q_dense.scatter_(1, idx, q_sub)
-    j = _kl_safe(p, q_dense.clamp_min(1e-12)) + _kl_safe(q_dense.clamp_min(1e-12), p)
+    j = _kl_safe(p, q_dense.clamp_min(kl_eps)) + _kl_safe(q_dense.clamp_min(kl_eps), p)
     return j
 
 
@@ -720,6 +746,7 @@ class SurgeryMeta:
     dataset: str = "Oxford-IIIT Pet"
     eps: float = 1e-5
     top_k: int = 32
+    surgery_dtype: str = "bfloat16"
     pwl_knees: Dict[str, Any] = field(default_factory=dict)
     calibration: Dict[str, float] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
@@ -734,6 +761,7 @@ class SurgeryMeta:
                     "dataset": self.dataset,
                     "eps": self.eps,
                     "top_k": self.top_k,
+                    "surgery_dtype": self.surgery_dtype,
                     "pwl_knees": self.pwl_knees,
                     "calibration": self.calibration,
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,

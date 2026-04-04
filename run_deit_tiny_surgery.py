@@ -28,8 +28,10 @@ from pet_reference_utils import (
     SurgeryRunConfig,
     accuracy_and_loss,
     apply_device_from_config,
+    apply_dtype_from_config,
     build_pet_loaders,
     describe_device,
+    describe_dtype,
     get_device,
     load_timm_deit_pet_checkpoint,
     parse_surgery_run_config,
@@ -42,6 +44,7 @@ from surgery_utils import (
     RewrittenLayerNormAbsSign,
     build_default_pwl_knots,
     copy_ln_params_to_rewritten,
+    get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
     jeffreys_naive_topk,
 )
@@ -80,13 +83,14 @@ def calibration_ln_and_softmax(
     dense vs sparse top-k softmax (not distillation training—no student model, no gradients).
     """
     device = get_device()
+    dt = get_surgery_dtype()
     ref.eval()
     stats: Dict[str, float] = {}
     eps = float(cfg.eps)
     top_k = int(cfg.top_k)
     use_cuda = device.type == "cuda"
     batch, _ = next(iter(loader))
-    batch = batch.to(device, non_blocking=use_cuda)
+    batch = batch.to(device, dtype=dt, non_blocking=use_cuda)
 
     b = batch.shape[0]
     x = ref.patch_embed(batch)
@@ -94,7 +98,9 @@ def calibration_ln_and_softmax(
     x = ref.pos_drop(x)
     h0 = x
     y_ref0 = ref.blocks[0].norm1(h0)
-    rw0 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
+    rw0 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+        device=device, dtype=dt
+    )
     copy_ln_params_to_rewritten(rw0, ref.blocks[0].norm1)
     y_rw0 = rw0(h0)
     stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
@@ -104,20 +110,26 @@ def calibration_ln_and_softmax(
     n_ln = 0
     for blk in ref.blocks:
         n1 = blk.norm1(h)
-        rw = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
+        rw = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+            device=device, dtype=dt
+        )
         copy_ln_params_to_rewritten(rw, blk.norm1)
         mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
         n_ln += 1
         h = h + blk.attn(n1)
         n2 = blk.norm2(h)
-        rw2 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
+        rw2 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+            device=device, dtype=dt
+        )
         copy_ln_params_to_rewritten(rw2, blk.norm2)
         mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
         n_ln += 1
         h = h + blk.mlp(n2)
     h_pre = h
     h_out = ref.norm(h_pre)
-    rwf = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(device)
+    rwf = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+        device=device, dtype=dt
+    )
     copy_ln_params_to_rewritten(rwf, ref.norm)
     mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
     n_ln += 1
@@ -142,7 +154,7 @@ def calibration_ln_and_softmax(
     stats["jeffreys_naive_mean_cached"] = float(j_naive.cpu())
     stats["jeffreys_improvement_naive_minus_gibbs_cached"] = float((j_naive - j_gibbs).cpu())
 
-    teacher2 = torch.randn(4096, nk, device=device)
+    teacher2 = torch.randn(4096, nk, device=device, dtype=dt)
     t2 = teacher2 - teacher2.max(dim=-1, keepdim=True).values
     vals2, idx2 = torch.topk(t2, k=k, dim=-1, largest=True, sorted=True)
     j_gibbs2 = jeffreys_distance_sparse_teacher(teacher2, vals2, idx2, nk, k).mean()
@@ -188,6 +200,7 @@ def main() -> None:
     cfg = parse_surgery_run_config()
 
     device = apply_device_from_config(cfg)
+    dtype = apply_dtype_from_config(cfg)
 
     pet_ref_path = os.path.abspath(cfg.pet_ref_checkpoint)
     if not os.path.isfile(pet_ref_path):
@@ -197,6 +210,7 @@ def main() -> None:
         )
 
     print(f"Using device: {describe_device(device)}", flush=True)
+    print(f"Using surgery dtype: {describe_dtype(dtype)}", flush=True)
     if cfg.config_json_path:
         print(f"config_json={cfg.config_json_path}", flush=True)
 
@@ -204,6 +218,7 @@ def main() -> None:
 
     print(f"Loading timm reference from {pet_ref_path} ...", flush=True)
     ref = load_timm_deit_pet_checkpoint(pet_ref_path)
+    ref = ref.to(device=device, dtype=dtype)
     log_dir = os.path.abspath("logs")
     _write_model_structure_txt(
         os.path.join(log_dir, "model_before_surgery.txt"),
@@ -227,7 +242,9 @@ def main() -> None:
         f"disable_softmax_replacement={cfg.disable_softmax_replacement}  allow_matmul={cfg.allow_matmul}",
         flush=True,
     )
-    model = DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES).to(device)
+    model = DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES).to(
+        device=device, dtype=dtype
+    )
     mapping = model.load_from_timm(ref)
     freeze_eps_parameters(model)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
