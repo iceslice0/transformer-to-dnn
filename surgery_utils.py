@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,36 +35,6 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
 # Op vocabulary: Affine* (add/sub, channel scale+bias, fixed einsum mixes), Unary* (maps & reductions),
 # MatMul* (contracting ``matmul`` + Hadamard ``a*b`` with two variable tensors). Routing helpers below.
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Selection / routing primitives
-# ---------------------------------------------------------------------------
-
-
-class AbsOp(nn.Module):
-    """Routing: abs(x)."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.abs(x)
-
-
-class SetSign(nn.Module):
-    """setsign(x, y) = sign(x) * |y| with sign(0)=1 (same convention as torch.sign for zero)."""
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        s = torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-        return s * torch.abs(y)
-
-
-class TuplePack(nn.Module):
-    def forward(self, *xs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        return xs
-
-
-class TupleUnpack(nn.Module):
-    def forward(self, packed: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
-        return packed
-
 
 # ---------------------------------------------------------------------------
 # Affine-style explicit combinators
@@ -302,22 +272,8 @@ class UnaryScalarPWL(nn.Module):
         return _pwl_eval(x, self.knots, self.values)
 
 
-class MultiTailPWLEpilogue(nn.Module):
-    """
-    One logical affine/wide tensor feeds multiple unary PWL tails; each tail is a separate
-    submodule (explicit multi-tail epilogue).
-    """
-
-    def __init__(self, tails: nn.ModuleDict) -> None:
-        super().__init__()
-        self.tails = tails
-
-    def forward(self, x: torch.Tensor, which: str) -> torch.Tensor:
-        return self.tails[which](x)
-
-
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: UnaryLogPlusEps, SetSign, UnaryExp (no log PWL, no exp PWL)
+# LayerNorm rewrite: relu± stack + affine reductions + UnaryExp (no log PWL, no exp PWL)
 # ---------------------------------------------------------------------------
 
 
@@ -325,12 +281,16 @@ class RewrittenLayerNormAbsSign(nn.Module):
     """
     mu = mean(x); u = x - mu; r2 = mean(u*u).
 
-    **``allow_matmul=False`` (default, strict):** log-domain magnitude
-    ``log_a = log(|u|+eps) - log(r2+eps)/2``, ``a_mag = exp(log_a)``, ``z = setsign(u, a_mag)``.
+    **``allow_matmul=False`` (default, strict):** ``au = stack(relu(u),relu(-u))`` (dim ``-2``);
+    ``log_num = log_eps(au)`` is two-channel (operand ``p``); ``log_den = log_eps(r2)`` with
+    ``unsqueeze(-2)`` so it broadcasts with that operand axis; ``a_mag = exp(log_a)`` is
+    ``[...,2,C]``; ``z = out_contract(a_mag)`` (:class:`AffineContract` coeffs ``[1,-1]``) — same
+    contraction pattern as :class:`SquareIdentityOperandChain.out_contract`, applied to magnitude
+    channels instead of ``z_mul(a_mag, out_contract(stacked))``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
     ``inv_std = 1/sqrt(r2+eps)`` via :class:`UnaryRsqrtPlusEps` and :class:`MatMulHadamard`, not the
-    square-identity chain.
+    log-domain path.
     """
 
     def __init__(self, normalized_shape: int, eps: float, *, allow_matmul: bool = False) -> None:
@@ -347,9 +307,8 @@ class RewrittenLayerNormAbsSign(nn.Module):
             self.inv_sqrt_var = UnaryRsqrtPlusEps(e)
             self.u_mul_invstd = MatMulHadamard()
         else:
+            self.out_contract = AffineContract("p,...pc->...c", torch.tensor([1.0, -1.0]))
             self.log_eps = UnaryLogPlusEps(e)
-            self.abs_op = AbsOp()
-            self.setsign = SetSign()
             self.neg_half = UnaryScale(-0.5)
             self.log_a_add = AffineAdd()
             self.exp = UnaryExp()
@@ -363,12 +322,13 @@ class RewrittenLayerNormAbsSign(nn.Module):
             inv_std = self.inv_sqrt_var(r2)
             z = self.u_mul_invstd(u, inv_std)
         else:
-            au = self.abs_op(u)
+            au = torch.stack((F.relu(u), F.relu(-u)), dim=-2)
             log_num = self.log_eps(au)
-            log_den = self.log_eps(r2)
+            # Keep separate singleton axes for operand and channel broadcasting.
+            log_den = self.log_eps(r2).unsqueeze(-2)
             log_a = self.log_a_add(log_num, self.neg_half(log_den))
             a_mag = self.exp(log_a)
-            z = self.setsign(u, a_mag)
+            z = self.out_contract(a_mag)
         return self.affine(z)
 
 
@@ -680,13 +640,6 @@ def jeffreys_naive_topk(
     q_dense.scatter_(1, idx, q_sub)
     j = _kl_safe(p, q_dense.clamp_min(kl_eps)) + _kl_safe(q_dense.clamp_min(kl_eps), p)
     return j
-
-
-def layer_norm_mse(rewrite: nn.Module, reference: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    with torch.no_grad():
-        y0 = reference(x)
-        y1 = rewrite(x)
-    return F.mse_loss(y1, y0)
 
 
 # ---------------------------------------------------------------------------
