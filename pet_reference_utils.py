@@ -64,22 +64,20 @@ def load_dataclass_from_json(
     config_json_path_field: str = "config_json_path",
 ) -> TConfig:
     """
-    Instantiate ``cls()`` (defaults), merge JSON keys, then ``overrides`` (e.g. CLI).
-    Only keys that match dataclass fields are applied; ``config_json_path_field`` is set to the
-    loaded JSON path when the file exists.
+    Load JSON from ``json_path``, merge keys into ``cls()`` defaults, then ``overrides`` (e.g. CLI).
+    Only keys that match dataclass fields are applied; ``config_json_path_field`` is the resolved
+    absolute path. Missing/invalid files or JSON raise from ``open`` / ``json.load`` (no silent skip).
     """
     cfg = cls()
     allowed = {f.name for f in fields(cls)}
     skip = {config_json_path_field}
-    loaded: Optional[str] = None
-    ap = os.path.abspath(os.path.expanduser(json_path))
-    if os.path.isfile(ap):
-        with open(ap, encoding="utf-8") as f:
-            raw = json.load(f)
-        kwargs = {k: v for k, v in raw.items() if k in allowed and k not in skip}
-        if kwargs:
-            cfg = replace(cfg, **kwargs)
-        loaded = ap
+    ap = os.path.abspath(os.path.expanduser((json_path or "").strip()))
+    with open(ap, encoding="utf-8") as f:
+        raw = json.load(f)
+    kwargs = {k: v for k, v in raw.items() if k in allowed and k not in skip}
+    if kwargs:
+        cfg = replace(cfg, **kwargs)
+    loaded = ap
     if overrides:
         kwargs = {k: v for k, v in overrides.items() if k in allowed and k not in skip}
         if kwargs:
@@ -921,7 +919,7 @@ class PretrainPetConfig:
 
     @classmethod
     def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "PretrainPetConfig":
-        """Defaults → JSON (if present) → ``overrides``; sets ``config_json_path``."""
+        """Defaults merged with required JSON file, then ``overrides``; sets ``config_json_path``."""
         return load_dataclass_from_json(cls, json_path, overrides)
 
 
@@ -997,7 +995,7 @@ class SurgeryRunConfig:
 
     @classmethod
     def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "SurgeryRunConfig":
-        """Defaults → JSON (if present) → ``overrides``; sets ``config_json_path``."""
+        """Defaults merged with required JSON file, then ``overrides``; sets ``config_json_path``."""
         return load_dataclass_from_json(cls, json_path, overrides)
 
 
@@ -1097,7 +1095,7 @@ class JeffreysDistillConfig:
 
     @classmethod
     def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "JeffreysDistillConfig":
-        """Defaults → JSON file (if present) → ``overrides`` (e.g. CLI). Sets ``config_json_path``."""
+        """Defaults merged with required JSON file, then ``overrides`` (e.g. CLI). Sets ``config_json_path``."""
         cfg = load_dataclass_from_json(cls, json_path, overrides)
         mj = cfg.meta_json
         if mj is not None and isinstance(mj, str) and not mj.strip():

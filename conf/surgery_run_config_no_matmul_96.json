@@ -2,13 +2,13 @@
   "data_dir": "./data",
   "batch_size": 32,
   "workers": 2,
-  "top_k": 32,
-  "eps": 1e-3,
+  "top_k": 96,
+  "eps": 1e-5,
   "pet_ref_checkpoint": "./pet_timm_deit_tiny.pt",
   "device": "cuda",
   "surgery_dtype": "float16",
   "disable_layernorm_replacement": false,
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
-  "allow_matmul": true
+  "allow_matmul": false
 }
