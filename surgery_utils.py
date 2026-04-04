@@ -75,8 +75,17 @@ class ExplicitScale(nn.Module):
 
 
 class ExplicitAdd(nn.Module):
+    """Binary add ``a + b`` (broadcasting); explicit leaf for residual-style sums."""
+
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a + b
+
+
+class ExplicitSub(nn.Module):
+    """Binary subtract ``a - b`` (broadcasting); explicit leaf for centering / logit shift."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a - b
 
 
 class ExplicitElementwiseMul(nn.Module):
@@ -134,6 +143,30 @@ class ExplicitSqrtReciprocal(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e = self.eps.to(device=x.device, dtype=x.dtype)
         return torch.rsqrt(x + e)
+
+
+class ExplicitReciprocalPlusEps(nn.Module):
+    """``1 / (x + eps)`` (normalization factor; use with :class:`ExplicitElementwiseMul`, not ``/``)."""
+
+    def __init__(self, eps: float) -> None:
+        super().__init__()
+        self.register_buffer("eps", torch.tensor(float(eps)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e = self.eps.to(device=x.device, dtype=x.dtype)
+        return torch.reciprocal(x + e)
+
+
+class ExplicitSum(nn.Module):
+    """Sum reduction (explicit graph node; unlike :class:`ExplicitMean`, no ``1/n`` scaling)."""
+
+    def __init__(self, dim: int, keepdim: bool = False) -> None:
+        super().__init__()
+        self.dim = dim
+        self.keepdim = keepdim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.sum(dim=self.dim, keepdim=self.keepdim)
 
 
 class ExplicitExp(nn.Module):
@@ -307,6 +340,7 @@ class RewrittenLayerNormAbsSign(nn.Module):
         self.mean_u = ExplicitMean(-1, keepdim=True)
         self.mean_r2 = ExplicitMean(-1, keepdim=True)
         self.square = ExplicitSquare()
+        self.u_minus_mu = ExplicitSub()
         self.affine = ExplicitElementwiseAffine(normalized_shape)
         if allow_matmul:
             self.inv_sqrt_var = ExplicitSqrtReciprocal(e)
@@ -316,11 +350,12 @@ class RewrittenLayerNormAbsSign(nn.Module):
             self.abs_op = AbsOp()
             self.setsign = SetSign()
             self.neg_half = ExplicitScale(-0.5)
+            self.log_a_add = ExplicitAdd()
             self.exp = ExplicitExp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
-        u = x - mu
+        u = self.u_minus_mu(x, mu)
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
         if self.allow_matmul:
@@ -330,7 +365,7 @@ class RewrittenLayerNormAbsSign(nn.Module):
             au = self.abs_op(u)
             log_num = self.log_eps(au)
             log_den = self.log_eps(r2)
-            log_a = log_num + self.neg_half(log_den)
+            log_a = self.log_a_add(log_num, self.neg_half(log_den))
             a_mag = self.exp(log_a)
             z = self.setsign(u, a_mag)
         return self.affine(z)
@@ -413,38 +448,77 @@ class SelectionRoutingTopK(nn.Module):
 
 class GibbsTopKSoftmax(nn.Module):
     """
-    Sparse Gibbs Top-K with implicit replicated tail at s_(k).
+    Sparse Gibbs Top-K with replicated tail at s_(k).
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
-    Uses :class:`ExplicitExp` (exact ``torch.exp``) on stabilized logits — no unary exp PWL.
+    Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
+    :class:`ExplicitReciprocalPlusEps` and :class:`ExplicitElementwiseMul`; with
+    ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
+
+    **z_tail** is explicit: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`ExplicitSum`,
+    :class:`ExplicitElementwiseMul` (tail mass scale), and :class:`ExplicitAdd`.
+
+    Only subgraphs for the chosen ``allow_matmul`` mode are registered (no unused children).
+
+    ``eps`` is the same floor as LayerNorm / run config: ``log(z_tail + eps)`` and ``1/(z_tail + eps)``.
     """
 
-    def __init__(self, seq_len: int, top_k: int, attn_drop: float = 0.0) -> None:
+    def __init__(
+        self,
+        seq_len: int,
+        top_k: int,
+        *,
+        eps: float,
+        allow_matmul: bool = False,
+    ) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.top_k = top_k
-        self.attn_drop = attn_drop
+        self.allow_matmul = allow_matmul
+        e = float(eps)
         self.exp = ExplicitExp()
+        self.sum_exp_vals = ExplicitSum(-1, keepdim=True)
+        self.tail_mass_scale = ExplicitElementwiseMul()
+        self.z_tail_add = ExplicitAdd()
+        self.scores_minus_rowmax = ExplicitSub()
+        if allow_matmul:
+            self.inv_z = ExplicitReciprocalPlusEps(e)
+            self.mul_by_inv_z = ExplicitElementwiseMul()
+        else:
+            self.log_z = ExplicitLogPlusEps(e)
+            self.neg_log_z = ExplicitNegate()
+            self.logit_minus_logz = ExplicitAdd()
 
     def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         scores: [B, H, Nq, Nk]
         returns probs [B,H,Nq,K], idx [B,H,Nq,K], q_tail [B,H,Nq,1]
         """
-        b, h, nq, nk = scores.shape
+        _b, _h, _nq, nk = scores.shape
         k = min(self.top_k, nk)
-        scores_stable = scores - scores.max(dim=-1, keepdim=True).values
+        tail_coeff = float(nk - k)
+        row_max = scores.max(dim=-1, keepdim=True).values
+        scores_stable = self.scores_minus_rowmax(scores, row_max)
         vals, idx = torch.topk(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
         exp_tail = self.exp(s_k)
-        z_tail = exp_vals.sum(dim=-1, keepdim=True) + float(nk - k) * exp_tail
-        probs = exp_vals / (z_tail + 1e-30)
-        q_tail = float(nk - k) * exp_tail / (z_tail + 1e-30)
-        # if self.attn_drop > 0.0 and self.training:
-        #     drop = torch.rand_like(probs) > self.attn_drop
-        #     probs = probs * drop.to(probs.dtype) / (1.0 - self.attn_drop + 1e-12)
-        #     probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-30)
+        sum_exp = self.sum_exp_vals(exp_vals)
+        tail_term = self.tail_mass_scale(exp_tail, torch.full_like(exp_tail, tail_coeff))
+        z_tail = self.z_tail_add(sum_exp, tail_term)
+
+        if self.allow_matmul:
+            inv_z = self.inv_z(z_tail)
+            probs = self.mul_by_inv_z(exp_vals, inv_z)
+            q_tail = self.mul_by_inv_z(tail_term, inv_z)
+        else:
+            log_z = self.log_z(z_tail)
+            neg_lz = self.neg_log_z(log_z)
+            logits_norm = self.logit_minus_logz(vals, neg_lz)
+            probs = self.exp(logits_norm)
+            sk_norm = self.logit_minus_logz(s_k, neg_lz)
+            q_tail = self.tail_mass_scale(self.exp(sk_norm), torch.full_like(s_k, tail_coeff))
+
         return probs, idx, q_tail
 
 

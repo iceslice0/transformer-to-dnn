@@ -11,6 +11,7 @@ import torch.nn as nn
 from timm.layers import DropPath
 
 from surgery_utils import (
+    ExplicitAdd,
     ExplicitMatMul,
     GibbsTopKSoftmax,
     GELUUnaryPWL,
@@ -46,6 +47,7 @@ class SurgeryAttention(nn.Module):
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
+        eps_ln: float = 1e-5,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -61,7 +63,7 @@ class SurgeryAttention(nn.Module):
         if use_attention_surgery:
             self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
             if use_surgery_softmax:
-                self.gibbs = GibbsTopKSoftmax(seq_len, top_k, attn_drop=0.0)
+                self.gibbs = GibbsTopKSoftmax(seq_len, top_k, eps=eps_ln, allow_matmul=allow_matmul)
                 self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
             else:
                 self.attn_drop = nn.Dropout(attn_drop)
@@ -152,14 +154,16 @@ class SurgeryBlock(nn.Module):
             use_attention_surgery=use_attention_surgery,
             use_surgery_softmax=use_surgery_softmax,
             allow_matmul=allow_matmul,
+            eps_ln=eps_ln,
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
         self.drop_path = DropPath(drop_path)
+        self.residual_add = ExplicitAdd()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = self.residual_add(x, self.drop_path(self.attn(self.norm1(x))))
+        x = self.residual_add(x, self.drop_path(self.mlp(self.norm2(x))))
         return x
 
 
@@ -199,6 +203,7 @@ class DeiTTinySurgeryModel(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.seq_len = num_patches + 1
+        self.pos_embed_add = ExplicitAdd()
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList(
@@ -269,7 +274,7 @@ class DeiTTinySurgeryModel(nn.Module):
         x = self.patch_embed(x)
         cls = self.cls_token.expand(b, -1, -1)
         x = torch.cat((cls, x), dim=1)
-        x = x + self.pos_embed
+        x = self.pos_embed_add(x, self.pos_embed)
         x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x)
@@ -317,3 +322,8 @@ def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
                 m.log_eps.eps.requires_grad = False
             if hasattr(m, "inv_sqrt_var"):
                 m.inv_sqrt_var.eps.requires_grad = False
+        if isinstance(m, GibbsTopKSoftmax):
+            if hasattr(m, "log_z"):
+                m.log_z.eps.requires_grad = False
+            if hasattr(m, "inv_z"):
+                m.inv_z.eps.requires_grad = False
