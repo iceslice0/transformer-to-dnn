@@ -44,8 +44,7 @@ class SurgeryAttention(nn.Module):
         proj_drop: float = 0.0,
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
-        allow_matmul_scores: bool = False,
-        allow_elementwise_attn_value_mul: bool = False,
+        allow_matmul: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -56,12 +55,10 @@ class SurgeryAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul_scores=allow_matmul_scores)
+            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
             if use_surgery_softmax:
                 self.gibbs = GibbsTopKSoftmax(seq_len, top_k, attn_drop=0.0)
-                self.sparse_mix = SparseWeightedSumBySquare(
-                    allow_elementwise_mul=allow_elementwise_attn_value_mul
-                )
+                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
             else:
                 self.attn_drop = nn.Dropout(attn_drop)
         else:
@@ -125,8 +122,7 @@ class SurgeryBlock(nn.Module):
         use_surgery_layernorm: bool = True,
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
-        allow_matmul_scores: bool = False,
-        allow_elementwise_attn_value_mul: bool = False,
+        allow_matmul: bool = False,
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
@@ -144,8 +140,7 @@ class SurgeryBlock(nn.Module):
             proj_drop=drop,
             use_attention_surgery=use_attention_surgery,
             use_surgery_softmax=use_surgery_softmax,
-            allow_matmul_scores=allow_matmul_scores,
-            allow_elementwise_attn_value_mul=allow_elementwise_attn_value_mul,
+            allow_matmul=allow_matmul,
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
@@ -179,8 +174,7 @@ class DeiTTinySurgeryModel(nn.Module):
         use_surgery_layernorm: bool = True,
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
-        allow_matmul_scores: bool = False,
-        allow_elementwise_attn_value_mul: bool = False,
+        allow_matmul: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -211,8 +205,7 @@ class DeiTTinySurgeryModel(nn.Module):
                     use_surgery_layernorm=use_surgery_layernorm,
                     use_attention_surgery=use_attention_surgery,
                     use_surgery_softmax=use_surgery_softmax,
-                    allow_matmul_scores=allow_matmul_scores,
-                    allow_elementwise_attn_value_mul=allow_elementwise_attn_value_mul,
+                    allow_matmul=allow_matmul,
                 )
                 for i in range(depth)
             ]
@@ -226,6 +219,32 @@ class DeiTTinySurgeryModel(nn.Module):
         self._init_weights()
         self.eps_ln = eps_ln
         self.top_k = top_k
+
+    @classmethod
+    def from_surgery_run_config(cls, cfg: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
+        """Build from :class:`pet_reference_utils.SurgeryRunConfig` (or same fields)."""
+        return cls(
+            num_classes=num_classes,
+            top_k=int(cfg.top_k),
+            eps_ln=float(cfg.eps),
+            use_surgery_layernorm=not bool(cfg.disable_layernorm_replacement),
+            use_attention_surgery=not bool(cfg.disable_attention_surgery),
+            use_surgery_softmax=not bool(cfg.disable_softmax_replacement),
+            allow_matmul=bool(cfg.allow_matmul),
+        )
+
+    @classmethod
+    def from_pretrained_extra(cls, ex: Dict[str, Any], *, num_classes: int) -> "DeiTTinySurgeryModel":
+        """Restore architecture from a checkpoint ``extra`` dict (e.g. ``surgery_pre_ft.pt``)."""
+        return cls(
+            num_classes=num_classes,
+            top_k=int(ex.get("top_k", 32)),
+            eps_ln=float(ex.get("eps_ln", 1e-5)),
+            use_surgery_layernorm=not bool(ex.get("disable_layernorm_replacement", False)),
+            use_attention_surgery=not bool(ex.get("disable_attention_surgery", False)),
+            use_surgery_softmax=not bool(ex.get("disable_softmax_replacement", False)),
+            allow_matmul=bool(ex.get("allow_matmul", False)),
+        )
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)

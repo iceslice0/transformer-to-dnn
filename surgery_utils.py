@@ -301,10 +301,8 @@ def copy_ln_params_to_rewritten(dst: RewrittenLayerNormAbsSign, src: nn.LayerNor
     """
     Copy ``gamma``/``beta`` from a timm ``LayerNorm`` into :class:`RewrittenLayerNormAbsSign`.
 
-    **Does not** overwrite ``dst.log_eps.eps``: that buffer is set at construction from
-    ``eps_ln`` (e.g. run config). Previously we copied ``src.eps`` here, which silently
-    discarded a user-configured epsilon and forced the reference value (~1e-5).
-    For numerical parity with timm, keep ``eps`` in JSON equal to ``ref.blocks[0].norm1.eps``.
+    **Does not** copy ``src.eps`` into ``dst``: ``dst.log_eps.eps`` is fixed at construction from
+    ``eps_ln`` (run config). Weight and bias are copied from the reference checkpoint.
     """
     with torch.no_grad():
         dst.affine.weight.copy_(torch.nan_to_num(src.weight.detach(), nan=1.0, posinf=1.0, neginf=1.0))
@@ -324,16 +322,16 @@ class PairwiseDotBySquare(nn.Module):
     mix ``pq,...qd→...pd``, contract ``p,...pd→...``, coeffs ``±1/(4√d)``. Operands ``a,b`` are the
     broadcast Q/K grid. **No** ``torch.matmul`` for QKᵀ.
 
-    Optional ``allow_matmul_scores=True`` replaces this with fused ``(q/sqrt(d)) @ kᵀ`` for
+    Optional ``allow_matmul=True`` replaces this with fused ``(q/sqrt(d)) @ kᵀ`` for
     speed / debugging only; that path **does** use matrix multiply and is not valid for the
     strict surgery demonstration.
     """
 
-    def __init__(self, head_dim: int, *, allow_matmul_scores: bool = False) -> None:
+    def __init__(self, head_dim: int, *, allow_matmul: bool = False) -> None:
         super().__init__()
         self.head_dim = head_dim
-        self.allow_matmul_scores = allow_matmul_scores
-        if allow_matmul_scores:
+        self.allow_matmul = allow_matmul
+        if allow_matmul:
             self.register_buffer("inv_sqrt_d", torch.tensor(1.0 / math.sqrt(float(head_dim))))
         else:
             w = 0.25 / math.sqrt(float(head_dim))
@@ -344,7 +342,7 @@ class PairwiseDotBySquare(nn.Module):
             )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        if self.allow_matmul_scores:
+        if self.allow_matmul:
             s = self.inv_sqrt_d.to(device=q.device, dtype=q.dtype)
             return (q * s) @ k.transpose(-2, -1)
         qe = q.unsqueeze(3)
@@ -423,13 +421,13 @@ class SparseWeightedSumBySquare(nn.Module):
     contract ``p,...kpd→...d``, coeffs ``(¼,−¼)``. Operands ``a,b`` are expanded prob and gathered
     value per top-k slot. No dense ``matmul`` for attention-value mixing.
 
-    ``allow_elementwise_mul=True`` uses ``p * v`` then sum (faster; invalid for strict demo).
+    ``allow_matmul=True`` uses ``p * v`` then sum (faster; invalid for strict demo).
     """
 
-    def __init__(self, *, allow_elementwise_mul: bool = False) -> None:
+    def __init__(self, *, allow_matmul: bool = False) -> None:
         super().__init__()
-        self.allow_elementwise_mul = allow_elementwise_mul
-        if not allow_elementwise_mul:
+        self.allow_matmul = allow_matmul
+        if not allow_matmul:
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
                 "p,...kpd->...d",
@@ -453,7 +451,7 @@ class SparseWeightedSumBySquare(nn.Module):
         idx_e = idx.unsqueeze(-1).expand(-1, -1, -1, -1, d)
         v_h = v.unsqueeze(2).expand(-1, -1, nq, -1, -1)
         v_g = torch.gather(v_h, 3, idx_e)
-        if self.allow_elementwise_mul:
+        if self.allow_matmul:
             return (probs.unsqueeze(-1) * v_g).sum(dim=3)
         p = probs.unsqueeze(-1)
         p_b = p.expand(-1, -1, -1, -1, d)
@@ -623,8 +621,7 @@ class SurgeryMeta:
     calibration: Dict[str, float] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
     pet_ref_checkpoint: str = ""
-    allow_matmul_scores: bool = False
-    allow_elementwise_attn_value_mul: bool = False
+    allow_matmul: bool = False
 
     def to_json(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
@@ -639,8 +636,7 @@ class SurgeryMeta:
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,
                     "module_mapping": self.module_mapping,
                     "pet_ref_checkpoint": self.pet_ref_checkpoint,
-                    "allow_matmul_scores": self.allow_matmul_scores,
-                    "allow_elementwise_attn_value_mul": self.allow_elementwise_attn_value_mul,
+                    "allow_matmul": self.allow_matmul,
                 },
                 f,
                 indent=2,

@@ -10,7 +10,7 @@
   "grad_clip": 1.0,
   "label_smoothing": 0.05,
   "seed": 42,
-  "device": "auto",
+  "device": "cuda",
   "cosine_eta_min": 1e-6,
   "gap_th": 1e-3
 }

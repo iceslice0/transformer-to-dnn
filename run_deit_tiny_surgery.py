@@ -8,8 +8,8 @@ It only builds the surgery student from timm weights, runs **eval** accuracy/los
 not that this step finetunes.)
 
 Run `pretrain_pet_deit_tiny.py` first for the Pet timm checkpoint. Defaults live in ``conf/surgery_run_config.json``;
-CLI overrides optional. Use ``disable_layernorm_replacement``, ``disable_attention_surgery`` (vanilla attention),
-``disable_softmax_replacement`` (Gibbs vs full softmax when dot surgery is on), or ``--disable-*`` flags to bisect. Then run `finetune_surgery_deit_tiny.py` (``conf/surgery_distill_config.json``) **separately**
+CLI overrides optional. Bisect with ``disable_layernorm_replacement``, ``disable_attention_surgery``,
+``disable_softmax_replacement``, ``allow_matmul``. Then run `finetune_surgery_deit_tiny.py` (``conf/surgery_distill_config.json``) **separately**
 if you want Jeffreys distillation.
 """
 
@@ -73,8 +73,7 @@ def _write_model_structure_txt(path: str, model: nn.Module, title: str) -> None:
 def calibration_ln_and_softmax(
     ref: nn.Module,
     loader,
-    top_k: int,
-    eps: float,
+    cfg: SurgeryRunConfig,
 ) -> Dict[str, float]:
     """
     Read-only diagnostics for ``surgery_meta.json``: LN-rewrite MSE vs timm, and Jeffreys **metrics** comparing
@@ -83,6 +82,8 @@ def calibration_ln_and_softmax(
     device = get_device()
     ref.eval()
     stats: Dict[str, float] = {}
+    eps = float(cfg.eps)
+    top_k = int(cfg.top_k)
     use_cuda = device.type == "cuda"
     batch, _ = next(iter(loader))
     batch = batch.to(device, non_blocking=use_cuda)
@@ -158,13 +159,13 @@ def build_module_mapping(cfg: SurgeryRunConfig) -> Dict[str, str]:
     if cfg.disable_attention_surgery:
         attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
     else:
-        dot = "PairwiseDotBySquare(QK^T matmul)" if cfg.allow_matmul_scores else "PairwiseDotBySquare(square identity)"
+        dot = "PairwiseDotBySquare(QK^T matmul)" if cfg.allow_matmul else "PairwiseDotBySquare(square identity)"
         if cfg.disable_softmax_replacement:
             attn = f"SurgeryAttention({dot}+full_softmax+dense@V)"
         else:
             mix = (
                 "SparseWeightedSumBySquare(elementwise p*v)"
-                if cfg.allow_elementwise_attn_value_mul
+                if cfg.allow_matmul
                 else "SparseWeightedSumBySquare(square identity)"
             )
             attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax+{mix})"
@@ -193,11 +194,6 @@ def main() -> None:
     print(f"Using device: {describe_device(device)}", flush=True)
     if cfg.config_json_path:
         print(f"config_json={cfg.config_json_path}", flush=True)
-    if cfg.device.strip().lower() == "auto" and device.type == "cpu":
-        print(
-            "Note: CPU. Install CUDA PyTorch for GPU (https://pytorch.org/get-started/locally/).",
-            flush=True,
-        )
 
     _, val_loader = build_pet_loaders(cfg)
 
@@ -216,44 +212,20 @@ def main() -> None:
     ref_acc, ref_loss = accuracy_and_loss(ref, val_loader, criterion)
     print(f"Reference timm (Pet) val acc={ref_acc:.4f} loss={ref_loss:.4f}")
 
-    cal = calibration_ln_and_softmax(ref, val_loader, cfg.top_k, cfg.eps)
+    cal = calibration_ln_and_softmax(ref, val_loader, cfg)
     print("Calibration:", json.dumps(cal, indent=2))
 
-    dlr = cfg.disable_layernorm_replacement
-    das = cfg.disable_attention_surgery
-    dsr = cfg.disable_softmax_replacement
-    ams = cfg.allow_matmul_scores
-    aev = cfg.allow_elementwise_attn_value_mul
     print("Building surgery model...", flush=True)
     print(
-        f"  disable_layernorm_replacement={dlr}  disable_attention_surgery={das}  "
-        f"disable_softmax_replacement={dsr}  allow_matmul_scores={ams}  "
-        f"allow_elementwise_attn_value_mul={aev}",
+        f"  disable_layernorm_replacement={cfg.disable_layernorm_replacement}  "
+        f"disable_attention_surgery={cfg.disable_attention_surgery}  "
+        f"disable_softmax_replacement={cfg.disable_softmax_replacement}  allow_matmul={cfg.allow_matmul}",
         flush=True,
     )
-    model = DeiTTinySurgeryModel(
-        num_classes=PET_NUM_CLASSES,
-        top_k=cfg.top_k,
-        eps_ln=cfg.eps,
-        use_surgery_layernorm=not dlr,
-        use_attention_surgery=not das,
-        use_surgery_softmax=not dsr,
-        allow_matmul_scores=ams,
-        allow_elementwise_attn_value_mul=aev,
-    ).to(device)
+    model = DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES).to(device)
     mapping = model.load_from_timm(ref)
     freeze_eps_parameters(model)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
-    if not dlr:
-        ref_eps = float(getattr(ref.blocks[0].norm1, "eps", 1e-5))
-        cfg_eps = float(cfg.eps)
-        if abs(cfg_eps - ref_eps) > 1e-12:
-            print(
-                f"Note: eps_ln={cfg_eps} (config) != timm LayerNorm eps={ref_eps}. "
-                "Rewritten LN uses config eps (no longer overwritten from checkpoint). "
-                "Match timm by setting eps to the reference value (usually 1e-5).",
-                flush=True,
-            )
 
     _write_model_structure_txt(
         os.path.join(log_dir, "model_after_surgery.txt"),

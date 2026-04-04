@@ -127,7 +127,7 @@ def main() -> None:
     pet_path = require_pet_teacher_checkpoint_path(c)
     log_distill_device_and_config_json(c)
 
-    student, _ = load_surgery_student_checkpoint(pre_path, c.top_k, c.eps)
+    student, _ = load_surgery_student_checkpoint(pre_path, c)
     teacher = load_timm_deit_pet_checkpoint(pet_path)
     train_loader, val_loader = build_pet_loaders(c)
 

@@ -34,7 +34,6 @@ from typing import (
 import timm
 import torch
 import torch.nn as nn
-from timm.optim import create_optimizer_v2
 from torchmetrics.classification import MulticlassAccuracy
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 from torch.utils.data import DataLoader
@@ -88,12 +87,13 @@ def cli_overrides_from_namespace(
     *,
     exclude: frozenset[str] = frozenset({"config", "config_json_path"}),
 ) -> Dict[str, Any]:
-    """Collect ``argparse`` overrides: only attributes present on ``args`` (e.g. not ``SUPPRESS``)."""
+    """Collect ``argparse`` overrides: only keys present on ``args`` (omitted ``SUPPRESS`` flags are absent)."""
     patchable = {f.name for f in fields(cls)} - exclude
+    avars = vars(args)
     out: Dict[str, Any] = {}
     for name in patchable:
-        if hasattr(args, name):
-            out[name] = getattr(args, name)
+        if name in avars:
+            out[name] = avars[name]
     return out
 
 
@@ -248,41 +248,23 @@ def set_seed(seed: int) -> None:
     # Full determinism may require CUBLAS_WORKSPACE_CONFIG etc.
 
 
-def _resolve_device_string(name: str) -> torch.device:
-    n = (name or "auto").strip().lower()
-    if n == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if n == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "device cuda but torch.cuda.is_available() is False. "
-                "Install a CUDA build of PyTorch or use device cpu."
-            )
-        return torch.device("cuda")
-    if n == "mps":
-        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but not available.")
-        return torch.device("mps")
-    return torch.device(n)
-
-
 # Process-wide default for loaders, checkpoints, and training loops. Call ``set_default_device`` once at startup.
 TORCH_DEVICE: torch.device = torch.device("cpu")
 
 
-def set_default_device(name: str = "auto") -> torch.device:
+def set_default_device(name: str) -> torch.device:
     """
-    Set :data:`TORCH_DEVICE` from ``\"auto\"`` / ``\"cuda\"`` / ``\"cpu\"`` / …; enables cudnn benchmark on CUDA.
+    Store the training device in :data:`TORCH_DEVICE` (``torch.device(...)`` only).
 
-    Prefer :func:`apply_device_from_config` at CLI entry points so the device string comes from merged
-    JSON/CLI config in one place.
+    Does **not** call ``torch.set_default_device``: that API makes ops like ``torch.randperm`` used
+    inside DataLoader shuffling expect a CUDA RNG and raises at sampler init. Training code should
+    keep using ``.to(get_device())`` for model/tensors.
+
+    ``name`` is any string accepted by ``torch.device`` (e.g. ``\"cuda\"``, ``\"cpu\"``, ``\"cuda:0\"``).
+    Enables cudnn benchmark when the device is CUDA.
     """
     global TORCH_DEVICE
-    TORCH_DEVICE = _resolve_device_string(name)
+    TORCH_DEVICE = torch.device(name.strip())
     if TORCH_DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
     return TORCH_DEVICE
@@ -308,9 +290,9 @@ def apply_device_from_config(
     mapping or from any run config dataclass. Internally calls :func:`set_default_device`.
     """
     if isinstance(cfg, Mapping):
-        name = str(cfg.get("device", "auto"))
+        name = str(cfg.get("device", "cuda"))
     else:
-        name = str(getattr(cfg, "device", "auto"))
+        name = str(cfg.device)
     return set_default_device(name)
 
 
@@ -413,9 +395,10 @@ def accuracy_and_loss(
 
 def _pet_loader_random_erasing_prob(cfg: Any) -> float:
     """``random_erasing_prob`` (surgery / pretrain) or ``random_erasing`` (Jeffreys distill config)."""
-    if hasattr(cfg, "random_erasing_prob"):
-        return float(cfg.random_erasing_prob)
-    return float(getattr(cfg, "random_erasing", 0.0))
+    v = vars(cfg)
+    if "random_erasing_prob" in v:
+        return float(v["random_erasing_prob"])
+    return float(v["random_erasing"])
 
 
 def build_pet_loaders(
@@ -429,8 +412,8 @@ def build_pet_loaders(
     data_dir = cfg.data_dir
     batch_size = cfg.batch_size
     workers = cfg.workers
-    randaugment = bool(getattr(cfg, "randaugment", True))
-    ra_magnitude = int(getattr(cfg, "ra_magnitude", 9))
+    randaugment = bool(cfg.randaugment)
+    ra_magnitude = int(cfg.ra_magnitude)
     random_erasing_prob = _pet_loader_random_erasing_prob(cfg)
 
     os.makedirs(data_dir, exist_ok=True)
@@ -546,97 +529,44 @@ def finetune_model_adaptertune_style(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int,
-    lr: float,
-    max_train_batches: Optional[int] = None,
-    weight_decay: float = 0.05,
-    backbone_lr_mult: float = 1.0,
-    warmup_epochs: int = 5,
-    grad_clip: float = 1.0,
-    log_prefix: str = "",
-    layer_decay: Optional[float] = None,
-    label_smoothing: float = 0.0,
-    head_only: bool = False,
-    keep_best_val: bool = False,
-    cosine_eta_min: float = 0.0,
-    val_gap_th: Optional[float] = None,
+    cfg: "PretrainPetConfig",
+    *,
     resume_val_acc: Optional[float] = None,
 ) -> Tuple[float, float, Optional[int], int]:
     """
-    AdamW + ``LinearLR`` warmup (optional) + ``CosineAnnealingLR`` (``SequentialLR``), stepped once
-    per batch. ``cosine_eta_min`` is passed as ``eta_min`` on cosine.
-
-    If ``head_only`` is True, freezes all parameters except those whose names start with ``head``
-    (timm ViT classifier) and trains only that layer — typical linear probe / head fine-tune.
-
-    If ``layer_decay`` is set (e.g. 0.75), uses timm ``create_optimizer_v2`` BEiT-style grouping
-    (ignored when ``head_only`` or combined with ``backbone_lr_mult != 1``).
-
-    If ``keep_best_val`` is True, keeps weights from the epoch with highest validation accuracy
-    (returns that accuracy/loss and the 1-based best epoch index; else third return is None).
-
-    If ``resume_val_acc`` is set and ``keep_best_val`` is True, ``best_acc`` / ``best_state`` are
-    seeded before epoch 1 from that value and the model's current weights (e.g. checkpoint
-    ``val_acc`` when continuing training).
-
-    If ``val_gap_th`` is set and ``keep_best_val`` is True, after each epoch when validation
-    accuracy is more than ``val_gap_th`` below the best-so-far, model weights are restored to the
-    best checkpoint only (optimizer state unchanged — simple hook for random search). The fourth
-    return value counts how many such reverts occurred.
+    Pet timm DeiT-Tiny: train classifier head only (AdamW + warmup + cosine per step).
+    Hyperparameters from ``cfg``; optional ``resume_val_acc`` seeds best-so-far before epoch 1.
+    Optional ``cfg.gap_th`` enables per-epoch gap revert vs best val acc.
     """
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-
-    if head_only:
-        for n, p in model.named_parameters():
-            p.requires_grad = n.startswith("head")
-        head_params = [p for n, p in model.named_parameters() if n.startswith("head")]
-        if not head_params:
-            raise ValueError(
-                "head_only=True but no parameters named 'head*' — expected timm ViT classifier weights."
-            )
-        opt = torch.optim.AdamW(head_params, lr=lr, weight_decay=weight_decay)
-    elif layer_decay is not None and backbone_lr_mult == 1.0:
-        opt = create_optimizer_v2(
-            model,
-            "adamw",
-            lr=lr,
-            weight_decay=weight_decay,
-            layer_decay=layer_decay,
-        )
-    elif backbone_lr_mult != 1.0:
-        head_params, bb_params = [], []
-        for n, p in model.named_parameters():
-            (head_params if n.startswith("head") else bb_params).append(p)
-        opt = torch.optim.AdamW(
-            [
-                {"params": bb_params, "lr": lr * backbone_lr_mult},
-                {"params": head_params, "lr": lr},
-            ],
-            weight_decay=weight_decay,
-        )
-    else:
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    for n, p in model.named_parameters():
+        p.requires_grad = n.startswith("head")
+    head_params = [p for n, p in model.named_parameters() if n.startswith("head")]
+    if not head_params:
+        raise ValueError("Expected timm ViT parameters named 'head*' for classifier fine-tune.")
+    opt = torch.optim.AdamW(head_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     steps_per_epoch = len(train_loader)
-    if max_train_batches is not None:
-        steps_per_epoch = min(steps_per_epoch, max_train_batches)
+    if cfg.max_train_batches is not None:
+        steps_per_epoch = min(steps_per_epoch, cfg.max_train_batches)
+    epochs = cfg.epochs
     total_steps = max(1, epochs * steps_per_epoch)
-    warmup_steps = min(warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
+    warmup_steps = min(cfg.warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
 
     scheduler = _warmup_cosine_scheduler(
         opt,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
-        eta_min=max(0.0, float(cosine_eta_min)),
+        eta_min=max(0.0, float(cfg.cosine_eta_min)),
     )
     device = get_device()
     use_cuda = device.type == "cuda"
-    pf = f"{log_prefix} " if log_prefix else ""
+    pf = "pet ref "
     best_acc = float("-inf")
     best_state: Optional[dict] = None
     best_ep: Optional[int] = None
     gap_revert_count = 0
-    if keep_best_val and resume_val_acc is not None:
+    if resume_val_acc is not None:
         best_acc = float(resume_val_acc)
         best_state = copy.deepcopy(model.state_dict())
         best_ep = 0
@@ -653,45 +583,44 @@ def finetune_model_adaptertune_style(
             opt.zero_grad(set_to_none=True)
             loss = criterion(model(x), y)
             loss.backward()
-            if grad_clip > 0:
+            if cfg.grad_clip > 0:
                 trainable = [p for p in model.parameters() if p.requires_grad]
-                torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
             opt.step()
             scheduler.step()
             n_batches += 1
-            if max_train_batches is not None and n_batches >= max_train_batches:
+            if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
         acc, loss_v = accuracy_and_loss(model, val_loader, criterion)
         print(f"  {pf}epoch {ep + 1}/{epochs} | val acc={acc:.4f} loss={loss_v:.4f}", flush=True)
-        if keep_best_val and acc > best_acc:
+        if acc > best_acc:
             best_acc = acc
             best_ep = ep + 1
             best_state = copy.deepcopy(model.state_dict())
 
+        gap_th = cfg.gap_th
         if (
-            val_gap_th is not None
-            and keep_best_val
+            gap_th is not None
             and best_state is not None
-            and float(acc) < float(best_acc) - float(val_gap_th)
+            and float(acc) < float(best_acc) - float(gap_th)
         ):
             model.load_state_dict(best_state)
             acc, loss_v = accuracy_and_loss(model, val_loader, criterion)
             gap_revert_count += 1
             print(
-                f"  {pf}gap revert #{gap_revert_count}: val acc below best by > {float(val_gap_th)} "
+                f"  {pf}gap revert #{gap_revert_count}: val acc below best by > {float(gap_th)} "
                 f"(best={best_acc:.4f} @ {_fmt_best_epoch_for_log(best_ep)}) — restored best weights "
                 f"(val acc={acc:.4f} loss={loss_v:.4f})",
                 flush=True,
             )
-    if keep_best_val and best_state is not None:
+    if best_state is not None:
         model.load_state_dict(best_state)
         print(
             f"  {pf}kept best val acc={best_acc:.4f} (epoch {_fmt_best_epoch_for_log(best_ep)}/{epochs})",
             flush=True,
         )
     acc_f, loss_f = accuracy_and_loss(model, val_loader, criterion)
-    best_i = best_ep if keep_best_val else None
-    return acc_f, loss_f, best_i, gap_revert_count
+    return acc_f, loss_f, best_ep, gap_revert_count
 
 
 def train_timm_deit_on_pet(
@@ -702,36 +631,8 @@ def train_timm_deit_on_pet(
     *,
     resume_val_acc: Optional[float] = None,
 ) -> Tuple[float, float, Optional[int], int]:
-    """Timm DeiT-Tiny: train only the Pet classification head (backbone frozen); keeps best val checkpoint.
-
-    Hyperparameters from ``cfg`` (:class:`PretrainPetConfig`). Uses ``LinearLR`` + ``CosineAnnealingLR``
-    (``SequentialLR``) per step; ``eta_min=cfg.cosine_eta_min``. Optional ``cfg.gap_th`` enables
-    per-epoch gap revert inside the training loop (see :func:`finetune_model_adaptertune_style`).
-
-    Pass ``resume_val_acc`` (e.g. ``val_acc`` from the loaded checkpoint) to seed best-so-far before
-    epoch 1 so gap revert compares against that baseline.
-    """
-    c = cfg
-    return finetune_model_adaptertune_style(
-        ref,
-        train_loader,
-        val_loader,
-        c.epochs,
-        c.lr,
-        max_train_batches=c.max_train_batches,
-        weight_decay=c.weight_decay,
-        backbone_lr_mult=1.0,
-        warmup_epochs=c.warmup_epochs,
-        grad_clip=c.grad_clip,
-        log_prefix="pet ref",
-        layer_decay=None,
-        label_smoothing=c.label_smoothing,
-        head_only=True,
-        keep_best_val=True,
-        cosine_eta_min=c.cosine_eta_min,
-        val_gap_th=c.gap_th,
-        resume_val_acc=resume_val_acc,
-    )
+    """Timm DeiT-Tiny Pet head training; delegates to :func:`finetune_model_adaptertune_style`."""
+    return finetune_model_adaptertune_style(ref, train_loader, val_loader, cfg, resume_val_acc=resume_val_acc)
 
 
 @torch.no_grad()
@@ -797,35 +698,24 @@ def distill_surgery_from_teacher_jeffreys(
 
     ``cfg.val_progress_batches``: val eval progress every N batches; ``0`` = silent until metrics done.
     """
-    c = cfg
-    epochs = c.epochs
-    lr = c.lr
-    temperature = c.temperature
-    max_train_batches = int(c.max_train_batches) if c.max_train_batches is not None else None
-    weight_decay = c.weight_decay
-    warmup_epochs = min(5, max(c.epochs, 1)) if c.warmup_epochs is None else int(c.warmup_epochs)
-    grad_clip = c.grad_clip
-    cosine_eta_min = c.cosine_eta_min
-    keep_best_val = c.keep_best
-    train_progress_interval = c.train_progress_interval
-    val_progress_batches = c.val_progress_batches
-
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
 
     device = get_device()
-    opt = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps_per_epoch = len(train_loader)
-    if max_train_batches is not None:
-        steps_per_epoch = min(steps_per_epoch, max_train_batches)
+    if cfg.max_train_batches is not None:
+        steps_per_epoch = min(steps_per_epoch, cfg.max_train_batches)
+    epochs = cfg.epochs
     total_steps = max(1, epochs * steps_per_epoch)
+    warmup_epochs = min(5, max(cfg.epochs, 1)) if cfg.warmup_epochs is None else int(cfg.warmup_epochs)
     warmup_steps = min(warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
     scheduler = _warmup_cosine_scheduler(
         opt,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
-        eta_min=max(0.0, float(cosine_eta_min)),
+        eta_min=max(0.0, float(cfg.cosine_eta_min)),
     )
     use_cuda = device.type == "cuda"
     pf = f"{log_prefix} " if log_prefix else ""
@@ -835,8 +725,12 @@ def distill_surgery_from_teacher_jeffreys(
 
     print(
         f"  {pf}schedule: {epochs} epoch(s) × {steps_per_epoch} train batches "
-        f"→ {total_steps} optimizer steps | train log every {train_progress_interval} batch(es)"
-        + (f" | val log every {val_progress_batches} batch(es)" if val_progress_batches > 0 else " | val silent"),
+        f"→ {total_steps} optimizer steps | train log every {cfg.train_progress_interval} batch(es)"
+        + (
+            f" | val log every {cfg.val_progress_batches} batch(es)"
+            if cfg.val_progress_batches > 0
+            else " | val silent"
+        ),
         flush=True,
     )
 
@@ -852,23 +746,23 @@ def distill_surgery_from_teacher_jeffreys(
             with torch.no_grad():
                 t_log = teacher(x)
             s_log = student(x)
-            loss = jeffreys_divergence_dense(t_log, s_log, temperature=temperature).mean()
+            loss = jeffreys_divergence_dense(t_log, s_log, temperature=cfg.temperature).mean()
             loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.grad_clip)
             opt.step()
             scheduler.step()
             n_batches += 1
             global_step += 1
             li = float(loss.item())
             running_loss += li
-            if train_progress_interval > 0:
+            if cfg.train_progress_interval > 0:
                 do_log = (
                     n_batches == 1
-                    or n_batches % train_progress_interval == 0
+                    or n_batches % cfg.train_progress_interval == 0
                     or n_batches == steps_per_epoch
                 )
-                if max_train_batches is not None and n_batches >= max_train_batches:
+                if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                     do_log = True
                 if do_log:
                     elapsed = time.perf_counter() - ep_t0
@@ -883,25 +777,25 @@ def distill_surgery_from_teacher_jeffreys(
                         f"lr={lr_c:.2e} {rate:.2f} batch/s epoch_eta~{eta_s / 60.0:.1f}m",
                         flush=True,
                     )
-            if max_train_batches is not None and n_batches >= max_train_batches:
+            if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
         acc, ce_v, j_v = eval_distillation_metrics(
             teacher,
             student,
             val_loader,
-            temperature,
-            progress_batches=val_progress_batches,
+            cfg.temperature,
+            progress_batches=cfg.val_progress_batches,
             progress_prefix=pf,
         )
         print(
             f"  {pf}epoch {ep + 1}/{epochs} | val acc={acc:.4f} ce={ce_v:.4f} jeffreys={j_v:.4f}",
             flush=True,
         )
-        if keep_best_val and acc > best_acc:
+        if cfg.keep_best and acc > best_acc:
             best_acc = acc
             best_ep = ep + 1
             best_state = copy.deepcopy(student.state_dict())
-    if keep_best_val and best_state is not None:
+    if cfg.keep_best and best_state is not None:
         student.load_state_dict(best_state)
         print(
             f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})",
@@ -911,11 +805,11 @@ def distill_surgery_from_teacher_jeffreys(
         teacher,
         student,
         val_loader,
-        temperature,
-        progress_batches=val_progress_batches,
+        cfg.temperature,
+        progress_batches=cfg.val_progress_batches,
         progress_prefix=pf,
     )
-    best_i = best_ep if keep_best_val else None
+    best_i = best_ep if cfg.keep_best else None
     return acc_f, ce_f, j_f, best_i
 
 
@@ -927,45 +821,6 @@ def distill_surgery_from_teacher_jeffreys(
 def save_deit_checkpoint(path: str, model: nn.Module, extra: Optional[Dict[str, Any]] = None) -> None:
     """Save ``{model_state_dict, extra}`` in the same format as legacy ``save_surgery_checkpoint``."""
     torch.save({"model_state_dict": model.state_dict(), "extra": extra or {}}, path)
-
-
-def load_surgery_student_checkpoint(
-    path: str,
-    top_k: Optional[int],
-    eps_ln: Optional[float],
-) -> Tuple[Any, Dict[str, Any]]:
-    """
-    Load a surgery DeiT student from ``surgery_pre_ft.pt`` (or compatible) for distillation / eval.
-    Architecture flags and ``top_k`` / ``eps_ln`` default from checkpoint ``extra`` when overrides are None.
-    """
-    from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
-
-    device = get_device()
-    try:
-        payload = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location=device)
-    ex = payload.get("extra") or {}
-    tk = int(top_k) if top_k is not None else int(ex.get("top_k", 32))
-    ep = float(eps_ln) if eps_ln is not None else float(ex.get("eps_ln", 1e-5))
-    dlr = bool(ex.get("disable_layernorm_replacement", False))
-    das = bool(ex.get("disable_attention_surgery", False))
-    dsr = bool(ex.get("disable_softmax_replacement", False))
-    ams = bool(ex.get("allow_matmul_scores", False))
-    aev = bool(ex.get("allow_elementwise_attn_value_mul", False))
-    model = DeiTTinySurgeryModel(
-        num_classes=PET_NUM_CLASSES,
-        top_k=tk,
-        eps_ln=ep,
-        use_surgery_layernorm=not dlr,
-        use_attention_surgery=not das,
-        use_surgery_softmax=not dsr,
-        allow_matmul_scores=ams,
-        allow_elementwise_attn_value_mul=aev,
-    ).to(device)
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    freeze_eps_parameters(model)
-    return model, ex
 
 
 def merge_post_distill_into_surgery_meta(
@@ -1023,7 +878,7 @@ class PretrainPetConfig:
     label_smoothing: float = 0.05
     seed: int = 42
     max_train_batches: Optional[int] = None
-    device: str = "auto"
+    device: str = "cuda"
     cosine_eta_min: float = 1e-6
     gap_th: Optional[float] = None
     randaugment: bool = True
@@ -1094,12 +949,11 @@ class SurgeryRunConfig:
     top_k: int = 32
     eps: float = 1e-5
     pet_ref_checkpoint: str = "./pet_timm_deit_tiny.pt"
-    device: str = "auto"
+    device: str = "cuda"
     disable_layernorm_replacement: bool = False
     disable_attention_surgery: bool = False
     disable_softmax_replacement: bool = False
-    allow_matmul_scores: bool = False
-    allow_elementwise_attn_value_mul: bool = False
+    allow_matmul: bool = False
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
@@ -1115,19 +969,17 @@ class SurgeryRunConfig:
 
 FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
     "disable_layernorm_replacement": (
-        "Use nn.LayerNorm instead of RewrittenLayerNormAbsSign (isolates LN PWL path)."
+        "Debug: use nn.LayerNorm instead of RewrittenLayerNormAbsSign (isolates LN PWL path)."
     ),
     "disable_attention_surgery": (
-        "Use timm-like attention (scaled QK^T, full softmax, dense @ V); no PairwiseDotBySquare."
+        "Debug: timm-like attention (scaled QK^T, full softmax, dense @ V); no PairwiseDotBySquare."
     ),
     "disable_softmax_replacement": (
-        "When attention surgery is on: full softmax @ V instead of Gibbs top-k + sparse mix."
+        "Debug: when attention surgery is on, full softmax @ V instead of Gibbs top-k + sparse mix."
     ),
-    "allow_matmul_scores": (
-        "When attention surgery is on: fused (q/sqrt(d))@k^T for scores (fast; not plan.md explicit square)."
-    ),
-    "allow_elementwise_attn_value_mul": (
-        "With Gibbs sparse mix: p*v instead of square identity (fast; not strict demo)."
+    "allow_matmul": (
+        "Debug: when attention surgery is on, matmul QK scores and elementwise p*v sparse mix "
+        "(fast; not plan.md square identity)."
     ),
 }
 
@@ -1148,8 +1000,7 @@ def surgery_meta_for_pre_ft(
         calibration=dict(calibration),
         module_mapping=module_mapping,
         pet_ref_checkpoint=pet_ref_checkpoint_abs,
-        allow_matmul_scores=cfg.allow_matmul_scores,
-        allow_elementwise_attn_value_mul=cfg.allow_elementwise_attn_value_mul,
+        allow_matmul=cfg.allow_matmul,
     )
 
 
@@ -1168,8 +1019,7 @@ def pre_ft_checkpoint_extra(
         "disable_layernorm_replacement": cfg.disable_layernorm_replacement,
         "disable_attention_surgery": cfg.disable_attention_surgery,
         "disable_softmax_replacement": cfg.disable_softmax_replacement,
-        "allow_matmul_scores": cfg.allow_matmul_scores,
-        "allow_elementwise_attn_value_mul": cfg.allow_elementwise_attn_value_mul,
+        "allow_matmul": cfg.allow_matmul,
     }
 
 
@@ -1196,7 +1046,7 @@ class JeffreysDistillConfig:
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing: float = 0.0
-    device: str = "auto"
+    device: str = "cuda"
     train_progress_interval: int = 10
     val_progress_batches: int = 20
     top_k: Optional[int] = None
@@ -1212,6 +1062,33 @@ class JeffreysDistillConfig:
         if mj is not None and isinstance(mj, str) and not mj.strip():
             cfg = replace(cfg, meta_json=None)
         return cfg
+
+
+def load_surgery_student_checkpoint(
+    path: str,
+    cfg: JeffreysDistillConfig,
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Load a surgery DeiT student from ``surgery_pre_ft.pt`` (or compatible) for distillation / eval.
+    Architecture flags come from checkpoint ``extra``. ``cfg`` may override ``top_k`` / ``eps`` when set;
+    otherwise those fields fall back to ``extra``.
+    """
+    from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
+
+    device = get_device()
+    try:
+        payload = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
+    ex = dict(payload.get("extra") or {})
+    if cfg.top_k is not None:
+        ex["top_k"] = int(cfg.top_k)
+    if cfg.eps is not None:
+        ex["eps_ln"] = float(cfg.eps)
+    model = DeiTTinySurgeryModel.from_pretrained_extra(ex, num_classes=PET_NUM_CLASSES).to(device)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    freeze_eps_parameters(model)
+    return model, ex
 
 
 FIELD_HELP_JEFFREYS: Dict[str, str] = {
@@ -1253,5 +1130,3 @@ def parse_surgery_run_config(argv: Optional[Sequence[str]] = None) -> SurgeryRun
     )
 
 
-# Backward-compatible alias (prefer :func:`set_default_device` + :func:`get_device`).
-resolve_device = _resolve_device_string

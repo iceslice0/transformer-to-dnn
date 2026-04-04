@@ -18,7 +18,7 @@
   "randaugment": true,
   "ra_magnitude": 9,
   "random_erasing": 0.0,
-  "device": "auto",
+  "device": "cuda",
   "train_progress_interval": 1,
   "val_progress_batches": 5
 }
