@@ -47,29 +47,8 @@ from surgery_utils import (
     get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
     jeffreys_naive_topk,
+    write_model_structure_txt,
 )
-
-
-def _write_model_structure_txt(path: str, model: nn.Module, title: str) -> None:
-    """Write ``str(model)``, parameter counts, and ``named_modules`` listing to a UTF-8 text file."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    n_all = sum(p.numel() for p in model.parameters())
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    lines = [
-        title,
-        "=" * min(80, max(len(title), 40)),
-        f"class: {type(model).__name__}",
-        f"parameters: total={n_all:,} trainable={n_train:,}",
-        "",
-        str(model),
-        "",
-        "--- named_modules (name: class) ---",
-        "",
-    ]
-    for name, mod in model.named_modules():
-        lines.append(f"{name if name else '<root>'}: {type(mod).__name__}")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
 
 
 @torch.no_grad()
@@ -220,7 +199,7 @@ def main() -> None:
     ref = load_timm_deit_pet_checkpoint(pet_ref_path)
     ref = ref.to(device=device, dtype=dtype)
     log_dir = os.path.abspath("logs")
-    _write_model_structure_txt(
+    write_model_structure_txt(
         os.path.join(log_dir, "model_before_surgery.txt"),
         ref,
         "Timm DeiT-Tiny (Pet reference, before surgery transform)",
@@ -249,7 +228,7 @@ def main() -> None:
     freeze_eps_parameters(model)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
 
-    _write_model_structure_txt(
+    write_model_structure_txt(
         os.path.join(log_dir, "model_after_surgery.txt"),
         model,
         "DeiTTinySurgeryModel (after surgery, pre-finetune checkpoint)",

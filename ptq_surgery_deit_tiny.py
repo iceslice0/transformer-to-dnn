@@ -46,6 +46,7 @@ from surgery_utils import (
     UnaryScale,
     get_surgery_dtype,
     jeffreys_divergence_dense,
+    write_model_structure_txt,
 )
 
 
@@ -109,28 +110,6 @@ def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
     )
     args = parser.parse_args(argv)
     return PTQSurgeryConfig.load(args.config)
-
-
-def _write_model_structure_txt(path: str, model: nn.Module, title: str) -> None:
-    """Write ``str(model)``, parameter counts, and ``named_modules`` listing to a UTF-8 text file."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    n_all = sum(p.numel() for p in model.parameters())
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    lines = [
-        title,
-        "=" * min(80, max(len(title), 40)),
-        f"class: {type(model).__name__}",
-        f"parameters: total={n_all:,} trainable={n_train:,}",
-        "",
-        str(model),
-        "",
-        "--- named_modules (name: class) ---",
-        "",
-    ]
-    for name, mod in model.named_modules():
-        lines.append(f"{name if name else '<root>'}: {type(mod).__name__}")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
 
 
 def _name_matches(name: str, patterns: Sequence[str]) -> bool:
@@ -775,7 +754,7 @@ def main() -> None:
         "calibration_batches": int(cfg.calibration_batches),
         "calibration_examples_per_node": int(cfg.calibration_examples_per_node),
     }
-    _write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped DeiT-Tiny Surgery Model")
+    write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped DeiT-Tiny Surgery Model")
     save_deit_checkpoint(out_abs, wrapped_model, extra=out_extra)
     with open(meta_abs, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
