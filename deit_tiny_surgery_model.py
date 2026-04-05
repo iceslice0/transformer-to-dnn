@@ -11,7 +11,7 @@ import torch.nn as nn
 from timm.layers import DropPath
 
 from surgery_utils import (
-    AffineAdd,
+    AffineContract,
     GibbsTopKSoftmax,
     MatMul,
     GELUUnaryPWL,
@@ -19,6 +19,7 @@ from surgery_utils import (
     RewrittenLayerNormAbsSign,
     SparseWeightedSumBySquare,
     copy_ln_params_to_rewritten,
+    get_surgery_dtype,
 )
 
 
@@ -159,11 +160,16 @@ class SurgeryBlock(nn.Module):
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
         self.drop_path = DropPath(drop_path)
-        self.residual_add = AffineAdd()
+        self.residual_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.residual_add(x, self.drop_path(self.attn(self.norm1(x))))
-        x = self.residual_add(x, self.drop_path(self.mlp(self.norm2(x))))
+        a, b = torch.broadcast_tensors(x, self.drop_path(self.attn(self.norm1(x))))
+        x = self.residual_contract(torch.stack((a, b), dim=-1))
+        a, b = torch.broadcast_tensors(x, self.drop_path(self.mlp(self.norm2(x))))
+        x = self.residual_contract(torch.stack((a, b), dim=-1))
         return x
 
 
@@ -203,7 +209,10 @@ class DeiTTinySurgeryModel(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.seq_len = num_patches + 1
-        self.pos_embed_add = AffineAdd()
+        self.pos_embed_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+        )
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList(
@@ -274,7 +283,8 @@ class DeiTTinySurgeryModel(nn.Module):
         x = self.patch_embed(x)
         cls = self.cls_token.expand(b, -1, -1)
         x = torch.cat((cls, x), dim=1)
-        x = self.pos_embed_add(x, self.pos_embed)
+        pe_a, pe_b = torch.broadcast_tensors(x, self.pos_embed)
+        x = self.pos_embed_contract(torch.stack((pe_a, pe_b), dim=-1))
         x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x)

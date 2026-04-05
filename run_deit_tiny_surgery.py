@@ -172,7 +172,7 @@ def build_module_mapping(cfg: SurgeryRunConfig) -> Dict[str, str]:
     elif cfg.allow_matmul:
         ln = "RewrittenLayerNormAbsSign(rsqrt·mul)"
     else:
-        ln = "RewrittenLayerNormAbsSign(log/exp)"
+        ln = "RewrittenLayerNormAbsSign(log/sqrt_exp)"
     if cfg.disable_attention_surgery:
         attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
     else:

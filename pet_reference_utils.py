@@ -15,6 +15,7 @@ import os
 import pathlib
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, fields, replace
 from typing import (
     Any,
@@ -430,6 +431,28 @@ def _pet_loader_random_erasing_prob(cfg: Any) -> float:
     return float(v["random_erasing"])
 
 
+def _maybe_cuda_autocast(device: torch.device, dt: torch.dtype):
+    """CUDA autocast for half/bfloat16 distillation; no-op elsewhere."""
+    if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dt)
+    return nullcontext()
+
+
+def _copy_trainable_state(src: nn.Module, dst: nn.Module) -> None:
+    """Copy trainable floating-point state from ``src`` into ``dst`` preserving ``dst`` dtype."""
+    with torch.no_grad():
+        src_sd = src.state_dict()
+        dst_sd = dst.state_dict()
+        for name, tensor in dst_sd.items():
+            if name not in src_sd:
+                continue
+            src_t = src_sd[name]
+            if torch.is_floating_point(tensor):
+                tensor.copy_(src_t.to(device=tensor.device, dtype=tensor.dtype))
+            else:
+                tensor.copy_(src_t.to(device=tensor.device))
+
+
 def build_pet_loaders(
     cfg: Any,
 ) -> Tuple[DataLoader, DataLoader]:
@@ -669,7 +692,7 @@ def eval_distillation_metrics(
     teacher: nn.Module,
     student: nn.Module,
     val_loader: DataLoader,
-    temperature: float,
+    temperature: float = 1.0,
     *,
     progress_batches: int = 0,
     progress_prefix: str = "",
@@ -688,10 +711,11 @@ def eval_distillation_metrics(
     for bi, (x, y) in enumerate(val_loader):
         x = x.to(device, dtype=dt, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
-        t_log = teacher(x)
-        s_log = student(x)
+        with _maybe_cuda_autocast(device, dt):
+            t_log = teacher(x)
+            s_log = student(x)
+        ce_sum += torch.nn.functional.cross_entropy(s_log.float(), y, reduction="sum").item()
         j_sum += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().item()
-        ce_sum += torch.nn.functional.cross_entropy(s_log, y, reduction="sum").item()
         correct += (s_log.argmax(dim=-1) == y).sum().item()
         n += y.size(0)
         if progress_batches > 0 and n_val > 0:
@@ -718,7 +742,7 @@ def distill_surgery_from_teacher_jeffreys(
     log_prefix: str = "distill",
 ) -> Tuple[float, float, float, Optional[int]]:
     """
-    Train student to match frozen timm teacher class distributions using dense Jeffreys J(p,q).
+    Train student with a mixed objective: hard-label cross-entropy plus Jeffreys teacher matching.
     Hyperparameters come from ``cfg`` (:class:`JeffreysDistillConfig`). Warmup length follows the
     same rule as the Jeffreys CLI: ``min(5, max(epochs, 1))`` when ``cfg.warmup_epochs`` is None.
 
@@ -728,10 +752,6 @@ def distill_surgery_from_teacher_jeffreys(
 
     ``cfg.val_progress_batches``: val eval progress every N batches; ``0`` = silent until metrics done.
     """
-    for p in teacher.parameters():
-        p.requires_grad = False
-    teacher.eval()
-
     device = get_device()
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps_per_epoch = len(train_loader)
@@ -766,23 +786,86 @@ def distill_surgery_from_teacher_jeffreys(
 
     global_step = 0
     dt = get_surgery_dtype()
+    use_master_fp32 = use_cuda and dt == torch.float16
+    if use_master_fp32:
+        train_student = copy.deepcopy(student).float()
+        train_opt = torch.optim.AdamW(train_student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        train_scheduler = _warmup_cosine_scheduler(
+            train_opt,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            eta_min=max(0.0, float(cfg.cosine_eta_min)),
+        )
+        # fp16 checkpoints remain the saved format; fp32 masters just drive the optimizer.
+        train_student.train()
+    else:
+        train_student = student
+        train_opt = opt
+        train_scheduler = scheduler
+    scaler = None
+    baseline_student = train_student if use_master_fp32 else student
+    baseline_teacher = teacher
+    for p in baseline_teacher.parameters():
+        p.requires_grad = False
+    baseline_teacher.eval()
+    baseline_acc, baseline_ce, baseline_j = eval_distillation_metrics(
+        baseline_teacher,
+        baseline_student,
+        val_loader,
+        temperature=cfg.temperature,
+        progress_batches=cfg.val_progress_batches,
+        progress_prefix=pf,
+    )
+    print(
+        f"  {pf}baseline val acc={baseline_acc:.4f} ce={baseline_ce:.4f} jeffreys={baseline_j:.4f}",
+        flush=True,
+    )
+    best_acc = baseline_acc
+    best_ep = 0
+    best_state = copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
     for ep in range(epochs):
-        student.train()
+        train_student.train()
         n_batches = 0
         ep_t0 = time.perf_counter()
         running_loss = 0.0
-        for x, _ in train_loader:
+        for x, y in train_loader:
             x = x.to(device, dtype=dt, non_blocking=use_cuda)
-            opt.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                t_log = teacher(x)
-            s_log = student(x)
-            loss = jeffreys_divergence_dense(t_log, s_log, temperature=cfg.temperature).mean()
-            loss.backward()
-            if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.grad_clip)
-            opt.step()
-            scheduler.step()
+            y = y.to(device, non_blocking=use_cuda)
+            train_opt.zero_grad(set_to_none=True)
+            if use_master_fp32:
+                with torch.no_grad():
+                    with _maybe_cuda_autocast(device, dt):
+                        t_log = baseline_teacher(x)
+                s_log = train_student(x.float())
+            else:
+                with torch.no_grad():
+                    with _maybe_cuda_autocast(device, dt):
+                        t_log = baseline_teacher(x)
+                with _maybe_cuda_autocast(device, dt):
+                    s_log = train_student(x)
+            ce_loss = torch.nn.functional.cross_entropy(s_log.float(), y, reduction="mean")
+            j_loss = jeffreys_divergence_dense(t_log, s_log, temperature=cfg.temperature).mean()
+            mix = float(cfg.distill_weight)
+            loss = (1.0 - mix) * ce_loss + mix * j_loss
+            if use_master_fp32:
+                loss.backward()
+                if cfg.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(train_student.parameters(), cfg.grad_clip)
+                train_opt.step()
+            else:
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    if cfg.grad_clip > 0:
+                        scaler.unscale_(train_opt)
+                        torch.nn.utils.clip_grad_norm_(train_student.parameters(), cfg.grad_clip)
+                    scaler.step(train_opt)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if cfg.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(train_student.parameters(), cfg.grad_clip)
+                    train_opt.step()
+            train_scheduler.step()
             n_batches += 1
             global_step += 1
             li = float(loss.item())
@@ -801,20 +884,25 @@ def distill_surgery_from_teacher_jeffreys(
                     rate = n_batches / elapsed if elapsed > 0 else 0.0
                     left = steps_per_epoch - n_batches
                     eta_s = left / rate if rate > 0 else 0.0
-                    lr_c = opt.param_groups[0]["lr"]
+                    lr_c = train_opt.param_groups[0]["lr"]
                     print(
                         f"  {pf}epoch {ep + 1}/{epochs} train {n_batches}/{steps_per_epoch} "
                         f"step {global_step}/{total_steps} loss={li:.6f} loss_avg={avg:.6f} "
+                        f"ce={float(ce_loss.item()):.6f} j={float(j_loss.item()):.6f} "
                         f"lr={lr_c:.2e} {rate:.2f} batch/s epoch_eta~{eta_s / 60.0:.1f}m",
                         flush=True,
                     )
             if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
+        if use_master_fp32:
+            _copy_trainable_state(train_student, student)
+        else:
+            student = train_student
         acc, ce_v, j_v = eval_distillation_metrics(
-            teacher,
+            baseline_teacher,
             student,
             val_loader,
-            cfg.temperature,
+            temperature=cfg.temperature,
             progress_batches=cfg.val_progress_batches,
             progress_prefix=pf,
         )
@@ -825,18 +913,24 @@ def distill_surgery_from_teacher_jeffreys(
         if cfg.keep_best and acc > best_acc:
             best_acc = acc
             best_ep = ep + 1
-            best_state = copy.deepcopy(student.state_dict())
+            best_state = copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
     if cfg.keep_best and best_state is not None:
-        student.load_state_dict(best_state)
+        if use_master_fp32:
+            train_student.load_state_dict(best_state)
+            _copy_trainable_state(train_student, student)
+        else:
+            student.load_state_dict(best_state)
         print(
             f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})",
             flush=True,
         )
+    if use_master_fp32:
+        _copy_trainable_state(train_student, student)
     acc_f, ce_f, j_f = eval_distillation_metrics(
-        teacher,
+        baseline_teacher,
         student,
         val_loader,
-        cfg.temperature,
+        temperature=cfg.temperature,
         progress_batches=cfg.val_progress_batches,
         progress_prefix=pf,
     )
@@ -1011,7 +1105,7 @@ FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
     ),
     "allow_matmul": (
         "Debug: fast paths — attention: matmul QK and elementwise p*v sparse mix; "
-        "RewrittenLayerNorm: z=u*rsqrt(r2+eps) instead of log/exp+setsign (not identical numerically)."
+        "RewrittenLayerNorm: z=u*rsqrt(r2+eps) instead of log/sqrt_exp+out_contract (not identical numerically)."
     ),
     "surgery_dtype": (
         "``torch.<name>`` compute dtype (e.g. bfloat16, float32). Default bfloat16; "
@@ -1075,6 +1169,7 @@ class JeffreysDistillConfig:
     grad_clip: float = 1.0
     cosine_eta_min: float = 0.0
     temperature: float = 1.0
+    distill_weight: float = 0.5
     max_train_batches: Optional[int] = None
     keep_best: bool = True
     pet_ref_checkpoint: str = "./pet_timm_deit_tiny.pt"
@@ -1110,7 +1205,8 @@ def load_surgery_student_checkpoint(
     """
     Load a surgery DeiT student from ``surgery_pre_ft.pt`` (or compatible) for distillation / eval.
     Checkpoint ``extra`` must list all architecture fields (see ``pre_ft_checkpoint_extra``).
-    ``cfg`` may override ``top_k`` / ``eps`` when set.
+    ``cfg`` may override ``top_k`` / ``eps`` when set. Runtime dtype comes from checkpoint metadata
+    when present; ``cfg.surgery_dtype`` is only a fallback for older checkpoints without that field.
     """
     from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
 
@@ -1124,7 +1220,10 @@ def load_surgery_student_checkpoint(
         ex["top_k"] = int(cfg.top_k)
     if cfg.eps is not None:
         ex["eps_ln"] = float(cfg.eps)
-    set_surgery_dtype(getattr(torch, str(ex["surgery_dtype"]).strip()))
+    dtype_name = str(ex.get("surgery_dtype", getattr(cfg, "surgery_dtype", "bfloat16"))).strip()
+    runtime_dtype = getattr(torch, dtype_name)
+    set_surgery_dtype(runtime_dtype)
+    ex["surgery_dtype"] = describe_dtype(runtime_dtype)
     model = DeiTTinySurgeryModel.from_pretrained_extra(ex, num_classes=PET_NUM_CLASSES).to(
         device=device, dtype=get_surgery_dtype()
     )
@@ -1136,6 +1235,7 @@ def load_surgery_student_checkpoint(
 FIELD_HELP_JEFFREYS: Dict[str, str] = {
     "meta_json": "Path to surgery_meta.json; empty string disables merge.",
     "quiet": "Less pipeline logging.",
+    "distill_weight": "Mixing weight for teacher matching vs hard-label CE (0 = pure CE, 1 = pure distill).",
     "surgery_dtype": FIELD_HELP_SURGERY_RUN["surgery_dtype"],
 }
 
@@ -1146,7 +1246,7 @@ CLI_SURGERY_RUN_DESCRIPTION = (
     "DeiT-Tiny surgery: timm Pet checkpoint → surgery student + surgery_meta.json"
 )
 CLI_SURGERY_RUN_CONFIG_DEFAULT = "conf/surgery_run_config.json"
-CLI_JEFFREYS_DESCRIPTION = "Jeffreys distillation: timm teacher → surgery student"
+CLI_JEFFREYS_DESCRIPTION = "Mixed CE + teacher matching: timm teacher → surgery student"
 CLI_JEFFREYS_CONFIG_DEFAULT = "conf/surgery_distill_config.json"
 CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
 
@@ -1171,5 +1271,3 @@ def parse_surgery_run_config(argv: Optional[Sequence[str]] = None) -> SurgeryRun
         field_help=FIELD_HELP_SURGERY_RUN,
         argv=argv,
     )
-
-

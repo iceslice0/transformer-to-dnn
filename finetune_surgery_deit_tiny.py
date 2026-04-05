@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-CLI for Jeffreys distillation. Config: :class:`pet_reference_utils.JeffreysDistillConfig`;
+CLI for mixed CE + teacher matching fine-tuning of the surgery student. Config:
+:class:`pet_reference_utils.JeffreysDistillConfig`;
 training loop: :func:`pet_reference_utils.distill_surgery_from_teacher_jeffreys`.
 """
 
@@ -68,7 +69,7 @@ def log_distill_session_line(c: JeffreysDistillConfig, pet_teacher_path: str) ->
     if c.quiet:
         return
     print(
-        f"distill Jeffreys | teacher={pet_teacher_path} T={c.temperature} "
+        f"fine-tune CE+distill | teacher={pet_teacher_path} mix={c.distill_weight} "
         f"epochs={c.epochs} lr={c.lr} wd={c.weight_decay} "
         f"train_progress_interval={c.train_progress_interval} val_progress_batches={c.val_progress_batches}",
         flush=True,
@@ -133,9 +134,9 @@ def main() -> None:
     apply_dtype_from_config(c)
     pre_path = require_pre_student_checkpoint_path(c)
     pet_path = require_pet_teacher_checkpoint_path(c)
-    log_distill_device_and_config_json(c)
 
-    student, _ = load_surgery_student_checkpoint(pre_path, c)
+    student, student_extra = load_surgery_student_checkpoint(pre_path, c)
+    log_distill_device_and_config_json(c)
     teacher = load_timm_deit_pet_checkpoint(pet_path).to(
         device=get_device(), dtype=get_surgery_dtype()
     )
@@ -153,12 +154,12 @@ def main() -> None:
 
     out_abs = os.path.abspath(c.output)
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    save_deit_checkpoint(
-        out_abs,
-        student,
-        extra={
-            "distill": "jeffreys_dense",
+    out_extra = dict(student_extra)
+    out_extra.update(
+        {
+            "distill": "mix_ce_jeffreys",
             "temperature": float(c.temperature),
+            "distill_weight": float(c.distill_weight),
             "teacher_checkpoint": pet_path,
             "student_pre_checkpoint": pre_path,
             "val_acc": val_acc,
@@ -166,7 +167,13 @@ def main() -> None:
             "val_jeffreys_mean": val_j,
             "best_val_epoch": best_ep,
             "config_json": c.config_json_path,
-        },
+            "surgery_dtype": describe_dtype(get_surgery_dtype()),
+        }
+    )
+    save_deit_checkpoint(
+        out_abs,
+        student,
+        extra=out_extra,
     )
     log_wrote_checkpoint(out_abs, c)
     merge_meta_after_distill_if_configured(c, val_acc, val_ce, val_j)

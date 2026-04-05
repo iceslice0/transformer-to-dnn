@@ -32,7 +32,7 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
     _SURGERY_DTYPE = dt
 
 # ---------------------------------------------------------------------------
-# Op vocabulary: Affine* (add/sub, channel scale+bias, fixed einsum mixes), Unary* (maps & reductions),
+# Op vocabulary: Affine* (fixed coeff einsum, channel scale+bias, fixed matrix mixes), Unary* (maps & reductions),
 # MatMul* (contracting ``matmul`` + Hadamard ``a*b`` with two variable tensors). Routing helpers below.
 # ---------------------------------------------------------------------------
 
@@ -51,20 +51,6 @@ class UnaryScale(nn.Module):
         if s.device != x.device:
             s = s.to(device=x.device)
         return x * s.to(dtype=x.dtype)
-
-
-class AffineAdd(nn.Module):
-    """Binary add ``a + b`` (broadcasting); residual / log-domain sums."""
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a + b
-
-
-class AffineSub(nn.Module):
-    """Binary subtract ``a - b`` (broadcasting); centering / logit shift."""
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a - b
 
 
 class MatMulHadamard(nn.Module):
@@ -153,6 +139,13 @@ class UnaryExp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x)
+
+
+class UnarySqrtExp(nn.Module):
+    """``sqrt(exp(x))`` — use in strict LN as ``SqrtExp(2·log|u| - log(r2))`` instead of ``exp(x - ½·y)``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(torch.exp(x))
 
 
 class AffineFixedMix(nn.Module):
@@ -273,7 +266,7 @@ class UnaryScalarPWL(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: relu± stack + affine reductions + UnaryExp (no log PWL, no exp PWL)
+# LayerNorm rewrite: relu± stack + affine reductions + UnarySqrtExp (no log PWL)
 # ---------------------------------------------------------------------------
 
 
@@ -282,11 +275,10 @@ class RewrittenLayerNormAbsSign(nn.Module):
     mu = mean(x); u = x - mu; r2 = mean(u*u).
 
     **``allow_matmul=False`` (default, strict):** ``au = stack(relu(u),relu(-u))`` (dim ``-2``);
-    ``log_num = log_eps(au)`` is two-channel (operand ``p``); ``log_den = log_eps(r2)`` with
-    ``unsqueeze(-2)`` so it broadcasts with that operand axis; ``a_mag = exp(log_a)`` is
-    ``[...,2,C]``; ``z = out_contract(a_mag)`` (:class:`AffineContract` coeffs ``[1,-1]``) — same
-    contraction pattern as :class:`SquareIdentityOperandChain.out_contract`, applied to magnitude
-    channels instead of ``z_mul(a_mag, out_contract(stacked))``.
+    ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
+    ``t = AffineContract([2,-1])(stack(log_num, log_den))`` (= ``2·log_num - log_den``);
+    ``a_mag = UnarySqrtExp(t)`` (= ``sqrt(exp(t))``, same value as ``exp(log_num - ½·log_den)``);
+    ``z = out_contract(a_mag)``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
     ``inv_std = 1/sqrt(r2+eps)`` via :class:`UnaryRsqrtPlusEps` and :class:`MatMulHadamard`, not the
@@ -301,21 +293,24 @@ class RewrittenLayerNormAbsSign(nn.Module):
         self.mean_u = UnaryMean(-1, keepdim=True)
         self.mean_r2 = UnaryMean(-1, keepdim=True)
         self.square = UnarySquare()
-        self.u_minus_mu = AffineSub()
+        self.u_center_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
+        )
         self.affine = AffineScaleBias(normalized_shape)
         if allow_matmul:
             self.inv_sqrt_var = UnaryRsqrtPlusEps(e)
             self.u_mul_invstd = MatMulHadamard()
         else:
             self.out_contract = AffineContract("p,...pc->...c", torch.tensor([1.0, -1.0]))
+            self.log_a_contract = AffineContract("q,...qpc->...pc", torch.tensor([2.0, -1.0]))
             self.log_eps = UnaryLogPlusEps(e)
-            self.neg_half = UnaryScale(-0.5)
-            self.log_a_add = AffineAdd()
-            self.exp = UnaryExp()
+            self.sqrt_exp = UnarySqrtExp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
-        u = self.u_minus_mu(x, mu)
+        _x, _m = torch.broadcast_tensors(x, mu)
+        u = self.u_center_contract(torch.stack((_x, _m), dim=-1))
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
         if self.allow_matmul:
@@ -324,10 +319,9 @@ class RewrittenLayerNormAbsSign(nn.Module):
         else:
             au = torch.stack((F.relu(u), F.relu(-u)), dim=-2)
             log_num = self.log_eps(au)
-            # Keep separate singleton axes for operand and channel broadcasting.
-            log_den = self.log_eps(r2).unsqueeze(-2)
-            log_a = self.log_a_add(log_num, self.neg_half(log_den))
-            a_mag = self.exp(log_a)
+            log_den = self.log_eps(r2).unsqueeze(-2).expand_as(log_num)
+            lin_log = self.log_a_contract(torch.stack((log_num, log_den), dim=2))
+            a_mag = self.sqrt_exp(lin_log)
             z = self.out_contract(a_mag)
         return self.affine(z)
 
@@ -417,7 +411,9 @@ class GibbsTopKSoftmax(nn.Module):
     ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
 
     **z_tail**: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`UnarySum`,
-    :class:`MatMulHadamard` (tail mass scale), and :class:`AffineAdd`.
+    tail mass as :class:`MatMulHadamard` (``allow_matmul=True``) or :class:`UnaryScale` with
+    fixed ``(N_k - K)`` from ``seq_len``/``top_k`` (strict — no Hadamard in graph), then
+    ``stack`` (routing) and :class:`AffineContract` ``(1,1)`` on the last dim.
 
     Only subgraphs for the chosen ``allow_matmul`` mode are registered (no unused children).
 
@@ -433,21 +429,32 @@ class GibbsTopKSoftmax(nn.Module):
         allow_matmul: bool = False,
     ) -> None:
         super().__init__()
-        self.seq_len = seq_len
         self.top_k = top_k
         self.allow_matmul = allow_matmul
         e = float(eps)
         self.exp = UnaryExp()
         self.sum_exp_vals = UnarySum(-1, keepdim=True)
-        self.tail_mass_scale = MatMulHadamard()
-        self.z_tail_add = AffineAdd()
-        self.scores_minus_rowmax = AffineSub()
+        self.z_tail_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+        )
+        self.scores_stable_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
+        )
         if allow_matmul:
+            self.tail_mass_mul = MatMulHadamard()
             self.inv_z = UnaryReciprocalPlusEps(e)
             self.mul_by_inv_z = MatMulHadamard()
         else:
+            nk = seq_len
+            kk = min(top_k, nk)
+            self.tail_mass_mul = UnaryScale(float(max(0, nk - kk)))
             self.log_z = UnaryLogPlusEps(e)
-            self.logit_minus_logz = AffineAdd()
+            self.logit_logz_contract = AffineContract(
+                "i,...i->...",
+                torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+            )
 
     def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -458,14 +465,19 @@ class GibbsTopKSoftmax(nn.Module):
         k = min(self.top_k, nk)
         tail_coeff = float(nk - k)
         row_max = scores.max(dim=-1, keepdim=True).values
-        scores_stable = self.scores_minus_rowmax(scores, row_max)
+        _s, _r = torch.broadcast_tensors(scores, row_max)
+        scores_stable = self.scores_stable_contract(torch.stack((_s, _r), dim=-1))
         vals, idx = torch.topk(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
         exp_tail = self.exp(s_k)
         sum_exp = self.sum_exp_vals(exp_vals)
-        tail_term = self.tail_mass_scale(exp_tail, torch.full_like(exp_tail, tail_coeff))
-        z_tail = self.z_tail_add(sum_exp, tail_term)
+        if self.allow_matmul:
+            tail_term = self.tail_mass_mul(exp_tail, torch.full_like(exp_tail, tail_coeff))
+        else:
+            tail_term = self.tail_mass_mul(exp_tail)
+        _se, _tt = torch.broadcast_tensors(sum_exp, tail_term)
+        z_tail = self.z_tail_contract(torch.stack((_se, _tt), dim=-1))
 
         if self.allow_matmul:
             inv_z = self.inv_z(z_tail)
@@ -473,10 +485,13 @@ class GibbsTopKSoftmax(nn.Module):
             q_tail = self.mul_by_inv_z(tail_term, inv_z)
         else:
             log_z = self.log_z(z_tail)
-            logits_norm = self.logit_minus_logz(vals, -log_z)
+            neg_log_z = -log_z
+            _v, _nlz = torch.broadcast_tensors(vals, neg_log_z)
+            logits_norm = self.logit_logz_contract(torch.stack((_v, _nlz), dim=-1))
             probs = self.exp(logits_norm)
-            sk_norm = self.logit_minus_logz(s_k, -log_z)
-            q_tail = self.tail_mass_scale(self.exp(sk_norm), torch.full_like(s_k, tail_coeff))
+            _sk, _nlz2 = torch.broadcast_tensors(s_k, neg_log_z)
+            sk_norm = self.logit_logz_contract(torch.stack((_sk, _nlz2), dim=-1))
+            q_tail = self.tail_mass_mul(self.exp(sk_norm))
 
         return probs, idx, q_tail
 
@@ -582,8 +597,11 @@ def jeffreys_divergence_dense(
     Symmetric Jeffreys J(p,q) = KL(p||q) + KL(q||p) for full softmax distributions.
     ``p = softmax(teacher_logits / T)``, ``q = softmax(student_logits / T)``. Returns shape [B].
     """
-    t = teacher_logits / temperature
-    s = student_logits / temperature
+    loss_dtype = torch.promote_types(teacher_logits.dtype, student_logits.dtype)
+    if loss_dtype in (torch.float16, torch.bfloat16):
+        loss_dtype = torch.float32
+    t = teacher_logits.to(dtype=loss_dtype) / temperature
+    s = student_logits.to(dtype=loss_dtype) / temperature
     p = F.softmax(t, dim=-1)
     q = F.softmax(s, dim=-1)
     return _kl_safe(p, q) + _kl_safe(q, p)
