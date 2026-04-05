@@ -963,13 +963,8 @@ def merge_post_distill_into_surgery_meta(
             "patient": "DeiT-Tiny",
             "dataset": "Oxford-IIIT Pet",
             "calibration": {},
-            "pwl_knees": {
-                "usage": {
-                    "note": (
-                        "No surgery run meta on disk; run run_deit_tiny_surgery.py for full "
-                        "pwl_knees (exp_knots, log_x_knots, usage)."
-                    ),
-                },
+            "pwl": {
+                "note": "No surgery run meta on disk; run run_deit_tiny_surgery.py for GELU PWL knot_positions.",
             },
             "meta_note": "Stub created before distill (no prior surgery_meta at this path).",
         }
@@ -1095,7 +1090,7 @@ class SurgeryRunConfig:
 
 FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
     "disable_layernorm_replacement": (
-        "Debug: use nn.LayerNorm instead of RewrittenLayerNormAbsSign (isolates LN PWL path)."
+        "Debug: use nn.LayerNorm instead of RewrittenLayerNorm (isolates LN PWL path)."
     ),
     "disable_attention_surgery": (
         "Debug: timm-like attention (scaled QK^T, full softmax, dense @ V); no PairwiseDotBySquare."
@@ -1119,7 +1114,7 @@ def surgery_meta_for_pre_ft(
     *,
     calibration: Dict[str, float],
     pet_ref_checkpoint_abs: str,
-    pwl_knees: Dict[str, Any],
+    pwl: Dict[str, Any],
     module_mapping: Dict[str, str],
 ) -> SurgeryMeta:
     """Build :class:`surgery_utils.SurgeryMeta` for the pre–Jeffreys surgery run."""
@@ -1127,7 +1122,7 @@ def surgery_meta_for_pre_ft(
         eps=float(cfg.eps),
         top_k=int(cfg.top_k),
         surgery_dtype=str(cfg.surgery_dtype),
-        pwl_knees=pwl_knees,
+        pwl=pwl,
         calibration=dict(calibration),
         module_mapping=module_mapping,
         pet_ref_checkpoint=pet_ref_checkpoint_abs,

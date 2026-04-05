@@ -41,8 +41,8 @@ from pet_reference_utils import (
     surgery_meta_for_pre_ft,
 )
 from surgery_utils import (
-    RewrittenLayerNormAbsSign,
-    build_default_pwl_knots,
+    RewrittenLayerNorm,
+    build_surgery_pwl_meta,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
@@ -77,7 +77,7 @@ def calibration_ln_and_softmax(
     x = ref.pos_drop(x)
     h0 = x
     y_ref0 = ref.blocks[0].norm1(h0)
-    rw0 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+    rw0 = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
         device=device, dtype=dt
     )
     copy_ln_params_to_rewritten(rw0, ref.blocks[0].norm1)
@@ -89,7 +89,7 @@ def calibration_ln_and_softmax(
     n_ln = 0
     for blk in ref.blocks:
         n1 = blk.norm1(h)
-        rw = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+        rw = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
             device=device, dtype=dt
         )
         copy_ln_params_to_rewritten(rw, blk.norm1)
@@ -97,7 +97,7 @@ def calibration_ln_and_softmax(
         n_ln += 1
         h = h + blk.attn(n1)
         n2 = blk.norm2(h)
-        rw2 = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+        rw2 = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
             device=device, dtype=dt
         )
         copy_ln_params_to_rewritten(rw2, blk.norm2)
@@ -106,7 +106,7 @@ def calibration_ln_and_softmax(
         h = h + blk.mlp(n2)
     h_pre = h
     h_out = ref.norm(h_pre)
-    rwf = RewrittenLayerNormAbsSign(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+    rwf = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
         device=device, dtype=dt
     )
     copy_ln_params_to_rewritten(rwf, ref.norm)
@@ -149,9 +149,9 @@ def build_module_mapping(cfg: SurgeryRunConfig) -> Dict[str, str]:
     if cfg.disable_layernorm_replacement:
         ln = "nn.LayerNorm"
     elif cfg.allow_matmul:
-        ln = "RewrittenLayerNormAbsSign(rsqrt·mul)"
+        ln = "RewrittenLayerNorm(rsqrt·mul)"
     else:
-        ln = "RewrittenLayerNormAbsSign(log/sqrt_exp)"
+        ln = "RewrittenLayerNorm(log/sqrt_exp)"
     if cfg.disable_attention_surgery:
         attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
     else:
@@ -238,13 +238,13 @@ def main() -> None:
     pre_acc, pre_loss = accuracy_and_loss(model, val_loader, criterion)
     print(f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f}")
 
-    _, _, pwl_meta = build_default_pwl_knots()
+    pwl_meta = build_surgery_pwl_meta()
     mod_map = build_module_mapping(cfg)
     meta = surgery_meta_for_pre_ft(
         cfg,
         calibration=cal,
         pet_ref_checkpoint_abs=pet_ref_path,
-        pwl_knees=pwl_meta,
+        pwl=pwl_meta,
         module_mapping=mod_map,
     )
     meta.calibration["ref_val_acc"] = float(ref_acc)

@@ -271,7 +271,7 @@ class UnaryScalarPWL(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class RewrittenLayerNormAbsSign(nn.Module):
+class RewrittenLayerNorm(nn.Module):
     """
     mu = mean(x); u = x - mu; r2 = mean(u*u).
 
@@ -327,9 +327,9 @@ class RewrittenLayerNormAbsSign(nn.Module):
         return self.affine(z)
 
 
-def copy_ln_params_to_rewritten(dst: RewrittenLayerNormAbsSign, src: nn.LayerNorm) -> None:
+def copy_ln_params_to_rewritten(dst: RewrittenLayerNorm, src: nn.LayerNorm) -> None:
     """
-    Copy ``gamma``/``beta`` from a timm ``LayerNorm`` into :class:`RewrittenLayerNormAbsSign`.
+    Copy ``gamma``/``beta`` from a timm ``LayerNorm`` into :class:`RewrittenLayerNorm`.
 
     **Does not** copy ``src.eps`` into ``dst``: ``dst.log_eps.eps`` is fixed at construction from
     ``eps_ln`` (run config). Weight and bias are copied from the reference checkpoint.
@@ -674,42 +674,23 @@ CALIBRATION_LEGEND_TEXT = (
 )
 
 
-def build_default_pwl_knots() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+def build_surgery_pwl_meta() -> Dict[str, Any]:
     """
-    Returns tensor grids and a JSON-safe ``meta`` dict for :class:`SurgeryMeta`.
-
-    **exp_knots** — positions ``linspace(-25, 5, PWL_NUM_KNOTS)``. **Not** used in forward:
-    :class:`GibbsTopKSoftmax` uses :class:`UnaryExp` (exact ``torch.exp``). Grid kept for
-    reference / legacy parity with older PWL runs.
-
-    **log_x_knots** — ``logspace`` grid historically tied to LN log PWL; **not** used in the
-    strict LN graph: :class:`RewrittenLayerNormAbsSign` with ``allow_matmul=False`` uses
-    :class:`UnaryLogPlusEps`. With ``allow_matmul=True``, LN uses :class:`UnaryRsqrtPlusEps`
-    only. Kept for reference only.
-
-    **GELU** knots ``linspace(-4, 4)`` live inside :class:`GELUUnaryPWL` and are not duplicated here.
+    JSON-safe summary of **live** PWL in the surgery model. Gibbs / LN use exact ``exp`` /
+    ``log`` on buffers — no PWL grids there. Only :class:`GELUUnaryPWL` uses scalar PWL; knot
+    positions match its default (values are trainable parameters in the checkpoint).
     """
-    n = PWL_NUM_KNOTS
-    log_x_knots = torch.logspace(math.log10(1e-8), math.log10(1e3), n)
-    exp_knots = torch.linspace(-25.0, 5.0, n)
-    meta: Dict[str, Any] = {
-        "exp_knots": exp_knots.tolist(),
-        "log_x_knots": log_x_knots.tolist(),
-        "usage": {
-            "exp_knots": (
-                "Unused in forward: GibbsTopKSoftmax uses exact torch.exp via UnaryExp; "
-                "this grid matches historical PWL knot positions for reference only."
-            ),
-            "log_x_knots": (
-                "Unused in forward (strict LN uses UnaryLogPlusEps; fast LN uses UnaryRsqrtPlusEps); "
-                "legacy / reference only."
-            ),
-            "gelu": (
-                "GELUUnaryPWL uses its own knot positions (default linspace(-4, 4)); not listed here."
+    k = torch.linspace(-4.0, 4.0, PWL_NUM_KNOTS)
+    return {
+        "gelu_mlp": {
+            "knot_positions": [float(x) for x in k],
+            "num_knots": int(PWL_NUM_KNOTS),
+            "note": (
+                "Default knot x-positions for GELUUnaryPWL; knot values are "
+                "``blocks.*.mlp.act.pwl.values`` in the state dict."
             ),
         },
     }
-    return log_x_knots, exp_knots, meta
 
 
 def _forward_output_shape_str(out: Any) -> str:
@@ -822,7 +803,7 @@ class SurgeryMeta:
     eps: float = 1e-5
     top_k: int = 32
     surgery_dtype: str = "bfloat16"
-    pwl_knees: Dict[str, Any] = field(default_factory=dict)
+    pwl: Dict[str, Any] = field(default_factory=dict)
     calibration: Dict[str, float] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
     pet_ref_checkpoint: str = ""
@@ -837,7 +818,7 @@ class SurgeryMeta:
                     "eps": self.eps,
                     "top_k": self.top_k,
                     "surgery_dtype": self.surgery_dtype,
-                    "pwl_knees": self.pwl_knees,
+                    "pwl": self.pwl,
                     "calibration": self.calibration,
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,
                     "module_mapping": self.module_mapping,

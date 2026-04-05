@@ -82,7 +82,7 @@ What must be removed from the original model
 
 After transformation (in **strict** surgery mode), there should be no implicit:
 
-- ``torch.nn.LayerNorm`` in blocks that use ``RewrittenLayerNormAbsSign``
+- ``torch.nn.LayerNorm`` in blocks that use ``RewrittenLayerNorm``
 - dense softmax over full key length when ``use_surgery_softmax`` is enabled
 - variable ``torch.matmul`` for attention **score** computation or for **sparse value mixing**
   when ``allow_matmul=False``
@@ -90,9 +90,9 @@ After transformation (in **strict** surgery mode), there should be no implicit:
 Everything important must be explicit in the module tree. Optional flags may re-enable library
 ``LayerNorm``, dense softmax, or matmul for debugging (see run configs).
 
-Main transform 1: LayerNorm rewrite — ``RewrittenLayerNormAbsSign``
+Main transform 1: LayerNorm rewrite — ``RewrittenLayerNorm``
 
-Implemented in ``surgery_utils.RewrittenLayerNormAbsSign``.
+Implemented in ``surgery_utils.RewrittenLayerNorm``.
 
 Given ``x``:
 
@@ -162,7 +162,7 @@ These are the main exported concepts; names match ``surgery_utils`` / ``deit_tin
 - **Unary:** ``UnaryMean``, ``UnarySum``, ``UnaryScale``, ``UnarySquare``, ``UnaryExp``, ``UnaryLogPlusEps``,
   ``UnarySqrtExp``, ``UnaryRsqrtPlusEps``, ``UnaryReciprocalPlusEps``, …
 - **Chains:** ``SquareIdentityOperandChain``, ``PairwiseDotBySquare``, ``SparseWeightedSumBySquare``
-- **LayerNorm replacement:** ``RewrittenLayerNormAbsSign``
+- **LayerNorm replacement:** ``RewrittenLayerNorm``
 - **Attention softmax:** ``GibbsTopKSoftmax``
 - **GELU:** ``GELUUnaryPWL``
 - **Optional matmul wrappers:** ``MatMul``, ``MatMulHadamard``
@@ -198,7 +198,7 @@ Save:
 - pre-finetune checkpoint
 - post-finetune checkpoint (when run)
 - surgery / PTQ metadata JSON
-- optional calibration stats (LN MSE, Jeffreys metrics, top-k, PWL knees, eps)
+- optional calibration stats (LN MSE, Jeffreys metrics, top-k, GELU PWL knot positions in ``pwl``, eps)
 - text dumps under ``./logs/`` with model structure and per-layer forward output shapes
 
 Acceptance criteria
@@ -227,7 +227,7 @@ Do not:
 - rely on undocumented black-box shortcuts in strict mode
 
 Do:
-- use ``RewrittenLayerNormAbsSign`` strict or fast path as configured
+- use ``RewrittenLayerNorm`` strict or fast path as configured
 - use Gibbs Top-K with implicit replicated tail normalization
 - keep ``allow_matmul`` as an explicit escape hatch for speed/debug, distinct from strict demos
 - save real PyTorch checkpoints and human-readable ``logs/*.txt`` structure dumps

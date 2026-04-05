@@ -16,7 +16,7 @@ from surgery_utils import (
     MatMul,
     GELUUnaryPWL,
     PairwiseDotBySquare,
-    RewrittenLayerNormAbsSign,
+    RewrittenLayerNorm,
     SparseWeightedSumBySquare,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
@@ -140,8 +140,8 @@ class SurgeryBlock(nn.Module):
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
-            self.norm1 = RewrittenLayerNormAbsSign(dim, eps=eps_ln, allow_matmul=allow_matmul)
-            self.norm2 = RewrittenLayerNormAbsSign(dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.norm1 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.norm2 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul)
         else:
             self.norm1 = nn.LayerNorm(dim, eps=eps_ln)
             self.norm2 = nn.LayerNorm(dim, eps=eps_ln)
@@ -236,7 +236,7 @@ class DeiTTinySurgeryModel(nn.Module):
             ]
         )
         if use_surgery_layernorm:
-            self.fc_norm = RewrittenLayerNormAbsSign(embed_dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.fc_norm = RewrittenLayerNorm(embed_dim, eps=eps_ln, allow_matmul=allow_matmul)
         else:
             self.fc_norm = nn.LayerNorm(embed_dim, eps=eps_ln)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -308,7 +308,7 @@ class DeiTTinySurgeryModel(nn.Module):
         self.load_state_dict(sd, strict=False)
         with torch.no_grad():
             for i, rb in enumerate(ref.blocks):
-                if isinstance(self.blocks[i].norm1, RewrittenLayerNormAbsSign):
+                if isinstance(self.blocks[i].norm1, RewrittenLayerNorm):
                     copy_ln_params_to_rewritten(self.blocks[i].norm1, rb.norm1)
                     copy_ln_params_to_rewritten(self.blocks[i].norm2, rb.norm2)
                 else:
@@ -317,7 +317,7 @@ class DeiTTinySurgeryModel(nn.Module):
                     self.blocks[i].norm2.weight.copy_(rb.norm2.weight)
                     self.blocks[i].norm2.bias.copy_(rb.norm2.bias)
             if hasattr(ref, "norm"):
-                if isinstance(self.fc_norm, RewrittenLayerNormAbsSign):
+                if isinstance(self.fc_norm, RewrittenLayerNorm):
                     copy_ln_params_to_rewritten(self.fc_norm, ref.norm)
                 else:
                     self.fc_norm.weight.copy_(ref.norm.weight)
@@ -327,7 +327,7 @@ class DeiTTinySurgeryModel(nn.Module):
 
 def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
     for m in model.modules():
-        if isinstance(m, RewrittenLayerNormAbsSign):
+        if isinstance(m, RewrittenLayerNorm):
             if hasattr(m, "log_eps"):
                 m.log_eps.eps.requires_grad = False
             if hasattr(m, "inv_sqrt_var"):
