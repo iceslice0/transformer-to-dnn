@@ -74,6 +74,10 @@ class PTQSurgeryConfig:
     activation_bits: int = 8
     affine_activation_bits: Optional[int] = None
     matmul_activation_bits: Optional[int] = None
+    # Per-output-channel **weight** quantization for ``Linear``/``Conv`` (and similar) when True;
+    # per-tensor weight scale when False. For ``Linear``/``Conv2d``, output **scale** is analytical
+    # ``s_in * s_w`` (not fitted); only **bias** is calibrated as the mean residual. Other node kinds
+    # still use OLS for ``(out_scale, out_bias)`` when needed.
     per_output_channel: bool = True
     top_k: Optional[int] = None
     eps: Optional[float] = None
@@ -376,12 +380,17 @@ def _fit_affine_dequant(
     if not per_output_channel or channel_axis is None:
         x = torch.cat([a.reshape(-1).to(dtype=torch.float32) for a in acc_samples], dim=0)
         y = torch.cat([b.reshape(-1).to(dtype=torch.float32) for b in out_samples], dim=0)
+        assert x.numel() == y.numel(), "accumulator / output length mismatch in global affine dequant fit"
         mx = x.mean()
         my = y.mean()
         var = (x * x).mean() - mx * mx
         cov = (x * y).mean() - mx * my
         if float(var.abs().item()) < 1e-8:
-            return torch.tensor(0.0), my
+            # Pooled quantized acc nearly constant; avoid y ≈ constant(my).
+            denom = (x * x).mean().clamp_min(1e-12)
+            s = (x * y).mean() / denom
+            c = my - s * mx
+            return s.to(dtype=torch.float32), c.to(dtype=torch.float32)
         s = cov / var
         c = my - s * mx
         return s.to(dtype=torch.float32), c.to(dtype=torch.float32)
@@ -405,6 +414,51 @@ def _fit_affine_dequant(
     return s.to(dtype=torch.float32), c.to(dtype=torch.float32)
 
 
+def _linear_conv_out_scale_from_quant_scales(
+    kind: str,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Float output from quantized matmul/conv (symmetric): x ≈ s_in q_x, W ≈ s_w q_w ⇒ y ≈ s_in s_w acc.
+    No OLS on slope — only the product of input and weight quantization scales.
+    """
+    s_in = input_scale[0].to(dtype=torch.float32)
+    ws = weight_scale.to(dtype=torch.float32)
+    if ws.ndim == 0:
+        return s_in * ws
+    return (s_in * ws.reshape(-1)).to(dtype=torch.float32)
+
+
+def _calibrated_out_bias_fixed_scale(
+    acc_samples: Sequence[torch.Tensor],
+    out_samples: Sequence[torch.Tensor],
+    out_scale: torch.Tensor,
+    *,
+    channel_axis: Optional[int],
+    per_channel: bool,
+) -> torch.Tensor:
+    """Best constant(s) b minimizing mismatch: y ≈ out_scale * acc + b (mean residual per channel or global)."""
+    if not acc_samples:
+        return torch.tensor(0.0, dtype=torch.float32)
+    out_scale = out_scale.to(dtype=torch.float32)
+    if not per_channel or channel_axis is None or out_scale.ndim == 0:
+        os = out_scale.reshape(())
+        diffs: List[torch.Tensor] = []
+        for acc, out in zip(acc_samples, out_samples):
+            diffs.append((out.to(dtype=torch.float32) - os * acc.to(dtype=torch.float32)).reshape(-1))
+        return torch.cat(diffs, dim=0).mean()
+
+    vecs: List[torch.Tensor] = []
+    for acc, out in zip(acc_samples, out_samples):
+        pred = _broadcast_named_axis(out_scale, acc, channel_axis) * acc.to(dtype=torch.float32)
+        diff = out.to(dtype=torch.float32) - pred
+        axis = channel_axis if channel_axis >= 0 else acc.ndim + channel_axis
+        reduce_dims = tuple(i for i in range(diff.ndim) if i != axis)
+        vecs.append(diff.mean(dim=reduce_dims) if reduce_dims else diff)
+    return torch.stack(vecs, dim=0).mean(dim=0).to(dtype=torch.float32)
+
+
 def _tensor_stats(tensors: Sequence[torch.Tensor]) -> Dict[str, float]:
     if not tensors:
         return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
@@ -417,20 +471,15 @@ def _tensor_stats(tensors: Sequence[torch.Tensor]) -> Dict[str, float]:
     }
 
 
-def _calibrated_input_scales(
-    kind: str,
-    data: NodeCalibrationData,
-    activation_bits: int,
-    *,
-    per_output_channel: bool,
-    channel_axis: Optional[int],
-) -> torch.Tensor:
+def _calibrated_input_scales(data: NodeCalibrationData, activation_bits: int) -> torch.Tensor:
+    """One symmetric scale per input tensor: max |x| over all axes (channels share the quant step for dot-product / conv sums)."""
     qmax = float(max(_signed_qrange(activation_bits)[1], 1))
-    in_scales = []
+    in_scales: List[torch.Tensor] = []
     for input_idx in range(len(data.input_samples[0])):
         max_abs = torch.tensor(0.0, dtype=torch.float32)
         for sample in data.input_samples:
-            max_abs = torch.maximum(max_abs, sample[input_idx].abs().max())
+            cur = sample[input_idx].abs().max()
+            max_abs = torch.maximum(max_abs, cur.to(dtype=torch.float32))
         in_scales.append((max_abs / qmax).clamp_min(1e-8))
     return torch.stack(in_scales).to(dtype=torch.float32)
 
@@ -455,24 +504,17 @@ class CalibratedAffinePTQWrapper(nn.Module):
         self.groups = int(module.groups) if isinstance(module, nn.Conv2d) else 1
         out_example = data.output_samples[0]
         self.output_channel_axis = _preferred_output_channel_axis(self.kind, out_example)
-        self.per_output_channel = bool(cfg.per_output_channel and self.output_channel_axis is not None)
+        # Per-channel output *bias* when tensor has an output channel axis (linear/conv); scale is analytical for those kinds.
+        self.per_channel_output_affine = self.output_channel_axis is not None
+        self.per_output_channel_weights = bool(cfg.per_output_channel)
         self.input_arity = len(data.input_samples[0])
 
-        self.register_buffer(
-            "input_scale",
-            _calibrated_input_scales(
-                self.kind,
-                data,
-                self.activation_bits,
-                per_output_channel=self.per_output_channel,
-                channel_axis=self.output_channel_axis,
-            ),
-        )
+        self.register_buffer("input_scale", _calibrated_input_scales(data, self.activation_bits))
         self.register_buffer("input_zero_point", torch.zeros(self.input_arity, dtype=torch.float32))
 
         weight_fp = _extract_weight_tensor(module, self.kind)
         if weight_fp is not None:
-            weight_axis = _weight_output_axis(self.kind) if cfg.per_output_channel else None
+            weight_axis = _weight_output_axis(self.kind) if self.per_output_channel_weights else None
             weight_scale = _symmetric_scale(weight_fp, self.weight_bits, axis=weight_axis)
             q_weight = _quantize_proxy(weight_fp, weight_scale, self.weight_bits).to(dtype=torch.float32)
             self.register_buffer("weight_scale", weight_scale.to(dtype=torch.float32))
@@ -501,12 +543,24 @@ class CalibratedAffinePTQWrapper(nn.Module):
                 einsum_equation=self.einsum_equation,
             )
             acc_samples.append(acc.to(dtype=torch.float32))
-        out_scale, out_bias = _fit_affine_dequant(
-            acc_samples,
-            data.output_samples,
-            channel_axis=self.output_channel_axis,
-            per_output_channel=self.per_output_channel,
-        )
+        if self.kind in ("linear", "conv2d") and self.q_weight is not None:
+            out_scale = _linear_conv_out_scale_from_quant_scales(self.kind, self.input_scale, self.weight_scale)
+            out_bias = _calibrated_out_bias_fixed_scale(
+                acc_samples,
+                data.output_samples,
+                out_scale,
+                channel_axis=self.output_channel_axis,
+                per_channel=self.per_channel_output_affine,
+            )
+            self.out_scale_mode = "analytical_s_in_times_s_w"
+        else:
+            out_scale, out_bias = _fit_affine_dequant(
+                acc_samples,
+                data.output_samples,
+                channel_axis=self.output_channel_axis,
+                per_output_channel=self.per_channel_output_affine,
+            )
+            self.out_scale_mode = "ols_affine"
         self.register_buffer("out_scale", out_scale.to(dtype=torch.float32))
         self.register_buffer("out_bias", out_bias.to(dtype=torch.float32))
 
@@ -528,8 +582,8 @@ class CalibratedAffinePTQWrapper(nn.Module):
             groups=self.groups,
             einsum_equation=self.einsum_equation,
         )
-        out_scale = _broadcast_named_axis(self.out_scale, acc, self.output_channel_axis if self.per_output_channel else None)
-        out_bias = _broadcast_named_axis(self.out_bias, acc, self.output_channel_axis if self.per_output_channel else None)
+        out_scale = _broadcast_named_axis(self.out_scale, acc, self.output_channel_axis if self.per_channel_output_affine else None)
+        out_bias = _broadcast_named_axis(self.out_bias, acc, self.output_channel_axis if self.per_channel_output_affine else None)
         out = out_scale.to(device=acc.device, dtype=torch.float32) * acc + out_bias.to(device=acc.device, dtype=torch.float32)
         return out.to(dtype=fp_inputs[0].dtype)
 
@@ -540,12 +594,15 @@ class CalibratedAffinePTQWrapper(nn.Module):
             "activation_group": self.activation_group,
             "activation_bits": self.activation_bits,
             "weight_bits": self.weight_bits,
-            "per_output_channel": self.per_output_channel,
+            "per_output_channel_weights": self.per_output_channel_weights,
+            "per_channel_output_affine": self.per_channel_output_affine,
+            "per_output_channel": self.per_output_channel_weights,
             "output_channel_axis": self.output_channel_axis,
             "input_scale": self.input_scale.detach().cpu().tolist(),
             "input_zero_point": self.input_zero_point.detach().cpu().tolist(),
             "weight_scale": self.weight_scale.detach().cpu().tolist(),
             "weight_zero_point": self.weight_zero_point.detach().cpu().tolist(),
+            "out_scale_mode": self.out_scale_mode,
             "out_scale": self.out_scale.detach().cpu().tolist(),
             "out_bias": self.out_bias.detach().cpu().tolist(),
             "stride": list(self.stride) if self.stride is not None else None,
@@ -660,6 +717,7 @@ def _ptq_summary(
             "activation_bits": int(cfg.activation_bits),
             "affine_activation_bits": int(_activation_bits_for_kind("linear", cfg)),
             "matmul_activation_bits": int(_activation_bits_for_kind("matmul", cfg)),
+            "per_output_channel_weights": bool(cfg.per_output_channel),
             "per_output_channel": bool(cfg.per_output_channel),
         },
         "calibration": {
@@ -750,6 +808,7 @@ def main() -> None:
         "activation_bits": int(cfg.activation_bits),
         "affine_activation_bits": int(_activation_bits_for_kind("linear", cfg)),
         "matmul_activation_bits": int(_activation_bits_for_kind("matmul", cfg)),
+        "per_output_channel_weights": bool(cfg.per_output_channel),
         "per_output_channel": bool(cfg.per_output_channel),
         "calibration_batches": int(cfg.calibration_batches),
         "calibration_examples_per_node": int(cfg.calibration_examples_per_node),

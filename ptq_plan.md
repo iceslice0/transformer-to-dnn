@@ -34,7 +34,7 @@ JSON Config file with
 6. quantization config:
    - weight bits = 8
    - activation bits = 8
-   - per output channel or per-tensor 
+   - ``per_output_channel``: **weight** quantization only (per output filter vs per tensor for ``Linear``/``Conv``). For ``Linear``/``Conv2d``, output **scale** is fixed as ``s_in * s_w`` (product of input and weight quant scales); only **bias** is calibrated (mean residual). **Input** activations use one scale per input tensor (tensor-wide max). Setting ``per_output_channel: false`` only makes weight scales coarser (scalar ``s_w``).
 
 
 Outputs
