@@ -17,7 +17,7 @@ What the output of the work should be
 
 You should produce:
 
-- a transformed DeiT-Tiny model definition in Python (``deit_tiny_surgery_model.py``)
+- a transformed DeiT-Tiny model definition in Python (``src/transformer_surgery/model.py``)
 - scripts that perform surgery, optional distillation fine-tuning, and optional PTQ
 - a checkpoint after surgery, before fine-tuning
 - a checkpoint after short fine-tuning (optional pipeline step)
@@ -35,8 +35,8 @@ Do not add extra models or datasets at this stage.
 
 Allowed graph basis after surgery
 
-After the rewrite, the strict graph uses explicit modules in ``surgery_utils.py`` and
-``deit_tiny_surgery_model.py``. Conceptually:
+After the rewrite, the strict graph uses explicit modules in ``src/transformer_surgery/ops.py`` and
+``src/transformer_surgery/model.py``. Conceptually:
 
 A. Affine and fixed-linear nodes
 
@@ -92,7 +92,7 @@ Everything important must be explicit in the module tree. Optional flags may re-
 
 Main transform 1: LayerNorm rewrite — ``RewrittenLayerNorm``
 
-Implemented in ``surgery_utils.RewrittenLayerNorm``.
+Implemented in ``transformer_surgery.ops.RewrittenLayerNorm``.
 
 Given ``x``:
 
@@ -116,7 +116,7 @@ Requirements:
 - ``eps`` is explicit (buffers / constructor args); not trained in fine-tuning (see ``freeze_eps_parameters``)
 - ``gamma``/``beta`` copied from timm LayerNorm where applicable (``copy_ln_params_to_rewritten``)
 
-Validation (see ``run_deit_tiny_surgery.py`` / ``pet_reference_utils``): compare rewritten LN to
+Validation (see ``python -m transformer_surgery.cli.run_surgery`` / ``transformer_surgery.pet``): compare rewritten LN to
 reference LN on minibatches; metrics go into surgery metadata.
 
 Main transform 2: Replace variable matrix multiplication in attention (strict mode)
@@ -150,13 +150,13 @@ Normalization avoids raw ``/`` in the strict path (``exp(vals - log(z_tail+eps))
 ``allow_matmul=True``, reciprocal + ``MatMulHadamard`` may be used.
 
 Module: ``GibbsTopKSoftmax`` (selection uses ``torch.topk`` in ``forward``). A separate
-``SelectionRoutingTopK`` helper exists in ``surgery_utils`` but is not required by the current Gibbs path.
+``SelectionRoutingTopK`` helper exists in ``transformer_surgery.ops`` but is not required by the current Gibbs path.
 
-Validation: Jeffreys divergence metrics vs dense / naive top-k (see ``surgery_utils`` / run scripts).
+Validation: Jeffreys divergence metrics vs dense / naive top-k (see ``transformer_surgery.ops`` / run scripts).
 
 Concrete building blocks (current code)
 
-These are the main exported concepts; names match ``surgery_utils`` / ``deit_tiny_surgery_model``:
+These are the main exported concepts; names match ``transformer_surgery.ops`` / ``transformer_surgery.model``:
 
 - **Fixed affine:** ``AffineContract``, ``AffineFixedMix``, ``AffineScaleBias``
 - **Unary:** ``UnaryMean``, ``UnarySum``, ``UnaryScale``, ``UnarySquare``, ``UnaryExp``, ``UnaryLogPlusEps``,
@@ -174,11 +174,11 @@ There are **no** separate classes named ``ExplicitAdd``, ``ExplicitMean``, ``Set
 
 What the main scripts do (reference)
 
-- ``run_deit_tiny_surgery.py``: load Pet timm checkpoint, build surgery student, eval, write
-  ``surgery_pre_ft.pt``, ``surgery_meta.json``, and ``logs/model_{before,after}_surgery.txt``
+- ``python -m transformer_surgery.cli.run_surgery``: load Pet timm checkpoint, build surgery student, eval, write
+  ``surgery_pre_ft.pt``, ``surgery_meta.json``, and ``artifacts/logs/model_{before,after}_surgery.txt``
   (includes forward **output shape** traces via ``write_model_structure_txt``).
-- ``finetune_surgery_deit_tiny.py``: Jeffreys distillation / fine-tuning from config.
-- ``ptq_surgery_deit_tiny.py``: optional post-training quantization; writes ``logs/model_after_ptq.txt``.
+- ``python -m transformer_surgery.cli.distill``: Jeffreys distillation / fine-tuning from config.
+- ``python -m transformer_surgery.cli.ptq``: optional post-training quantization; writes ``artifacts/logs/model_after_ptq.txt``.
 
 Fine-tuning rule
 
@@ -199,7 +199,7 @@ Save:
 - post-finetune checkpoint (when run)
 - surgery / PTQ metadata JSON
 - optional calibration stats (LN MSE, Jeffreys metrics, top-k, GELU PWL knot positions in ``pwl``, eps)
-- text dumps under ``./logs/`` with model structure and per-layer forward output shapes
+- text dumps under ``artifacts/logs/`` with model structure and per-layer forward output shapes
 
 Acceptance criteria
 
@@ -230,7 +230,7 @@ Do:
 - use ``RewrittenLayerNorm`` strict or fast path as configured
 - use Gibbs Top-K with implicit replicated tail normalization
 - keep ``allow_matmul`` as an explicit escape hatch for speed/debug, distinct from strict demos
-- save real PyTorch checkpoints and human-readable ``logs/*.txt`` structure dumps
+- save real PyTorch checkpoints and human-readable ``artifacts/logs/*.txt`` structure dumps
 
 The final transformed model must be a real saved PyTorch model in this basis and suitable for
 later quantization of affine nodes (see PTQ script and ``ptq_plan.md``).

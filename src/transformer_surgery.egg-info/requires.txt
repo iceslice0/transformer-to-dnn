@@ -1,0 +1,4 @@
+torch>=2.1
+torchvision>=0.15
+timm>=0.9
+torchmetrics>=1.0.0

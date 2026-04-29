@@ -17,11 +17,11 @@ No training.
 No QAT.
 Only PTQ initialization and evaluation.
 
-Use run_deit_tiny_surgery.py as reference, reuse code if possible
+Use python -m transformer_surgery.cli.run_surgery as reference, reuse code if possible
 
 File to create
 
-ptq_surgery_deit_tiny.py
+python -m transformer_surgery.cli.ptq
 
 
 Inputs
@@ -34,7 +34,7 @@ JSON Config file with
 6. quantization config:
    - weight bits = 8
    - activation bits = 8
-   - ``per_output_channel``: **weight** quantization only (per output filter vs per tensor for ``Linear``/``Conv``). For ``Linear``/``Conv2d``, output **scale** is fixed as ``s_in * s_w`` (product of input and weight quant scales); only **bias** is calibrated (mean residual). **Input** activations use one scale per input tensor (tensor-wide max). Setting ``per_output_channel: false`` only makes weight scales coarser (scalar ``s_w``).
+   - ``per_output_channel``: for ``Linear``/``Conv2d`` only — **True** = per-output-channel weight scales, **False** = one global weight scale (usually very bad accuracy). Affine/unary/coeff always use one global weight scale; ``MatMul`` has no weights. Output **scale** for ``Linear``/``Conv2d`` is ``s_in * s_w``; only **bias** is calibrated. **Input** activations: one scale per input tensor (tensor-wide max).
 
 
 Outputs

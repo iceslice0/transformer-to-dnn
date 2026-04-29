@@ -1,0 +1,84 @@
+import glob
+import os
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class PackageSmokeTests(unittest.TestCase):
+    def test_imports(self) -> None:
+        import transformer_surgery
+        from transformer_surgery import model, ops, pet, ptq
+
+        self.assertTrue(transformer_surgery.__all__)
+        self.assertTrue(hasattr(model, "DeiTTinySurgeryModel"))
+        self.assertTrue(hasattr(ops, "AffineContract"))
+        self.assertTrue(hasattr(pet, "PretrainPetConfig"))
+        self.assertTrue(hasattr(ptq, "PTQSurgeryConfig"))
+
+    def test_configs_load(self) -> None:
+        from transformer_surgery.pet import (
+            CLI_JEFFREYS_CONFIG_DEFAULT,
+            CLI_PRETRAIN_CONFIG_DEFAULT,
+            CLI_SURGERY_RUN_CONFIG_DEFAULT,
+            JeffreysDistillConfig,
+            PretrainPetConfig,
+            SurgeryRunConfig,
+        )
+        from transformer_surgery.ptq import PTQSurgeryConfig
+
+        defaults = [
+            CLI_PRETRAIN_CONFIG_DEFAULT,
+            CLI_SURGERY_RUN_CONFIG_DEFAULT,
+            CLI_JEFFREYS_CONFIG_DEFAULT,
+            "configs/ptq/full_8bit.json",
+        ]
+        for path in defaults:
+            self.assertTrue((ROOT / path).is_file(), path)
+
+        for path in glob.glob(str(ROOT / "configs/pretrain/*.json")):
+            PretrainPetConfig.load(path)
+        for path in glob.glob(str(ROOT / "configs/surgery/*.json")):
+            SurgeryRunConfig.load(path)
+        for path in glob.glob(str(ROOT / "configs/distill/*.json")):
+            JeffreysDistillConfig.load(path)
+        for path in glob.glob(str(ROOT / "configs/ptq/*.json")):
+            PTQSurgeryConfig.load(path)
+
+    def test_cli_help(self) -> None:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(ROOT / "src")
+        modules = [
+            "transformer_surgery.cli.pretrain_pet",
+            "transformer_surgery.cli.run_surgery",
+            "transformer_surgery.cli.distill",
+            "transformer_surgery.cli.ptq",
+        ]
+        for module in modules:
+            with self.subTest(module=module):
+                proc = subprocess.run(
+                    [sys.executable, "-m", module, "--help"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("--config", proc.stdout)
+
+    def test_model_instantiates_on_cpu(self) -> None:
+        from transformer_surgery.model import DeiTTinySurgeryModel
+
+        model = DeiTTinySurgeryModel(num_classes=37).cpu()
+        self.assertEqual(model.num_classes, 37)
+        self.assertEqual(model.seq_len, 197)
+
+
+if __name__ == "__main__":
+    unittest.main()

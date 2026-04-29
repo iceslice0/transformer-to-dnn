@@ -1,0 +1,17 @@
+{
+  "data_dir": "./data",
+  "batch_size": 32,
+  "workers": 2,
+  "top_k": 48,
+  "eps": 1e-3,
+  "pet_ref_checkpoint": "artifacts/checkpoints/pet_timm_deit_tiny.pt",
+  "device": "cuda",
+  "surgery_dtype": "float16",
+  "disable_layernorm_replacement": false,
+  "disable_attention_surgery": false,
+  "disable_softmax_replacement": false,
+  "allow_matmul": true,
+  "meta_json": "artifacts/metadata/surgery_meta.json",
+  "pre_ft_checkpoint": "artifacts/checkpoints/surgery_pre_ft.pt",
+  "log_dir": "artifacts/logs"
+}

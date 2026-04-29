@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pet_reference_utils import (
+from transformer_surgery.pet import (
     PET_NUM_CLASSES,
     apply_device_from_config,
     apply_dtype_from_config,
@@ -37,7 +37,7 @@ from pet_reference_utils import (
     load_surgery_student_checkpoint,
     save_deit_checkpoint,
 )
-from surgery_utils import (
+from transformer_surgery.ops import (
     AffineContract,
     AffineFixedMix,
     AffineScaleBias,
@@ -53,9 +53,9 @@ from surgery_utils import (
 @dataclass
 class PTQSurgeryConfig:
     data_dir: str = "./data"
-    fp_checkpoint: str = "./surgery_pre_ft.pt"
-    output: str = "./surgery_ptq.pt"
-    meta_json: str = "./surgery_ptq_meta.json"
+    fp_checkpoint: str = "artifacts/checkpoints/surgery_post_ft.pt"
+    output: str = "artifacts/checkpoints/surgery_ptq.pt"
+    meta_json: str = "artifacts/metadata/surgery_ptq_meta.json"
     batch_size: int = 32
     workers: int = 2
     randaugment: bool = True
@@ -74,22 +74,25 @@ class PTQSurgeryConfig:
     activation_bits: int = 8
     affine_activation_bits: Optional[int] = None
     matmul_activation_bits: Optional[int] = None
-    # Per-output-channel **weight** quantization for ``Linear``/``Conv`` (and similar) when True;
-    # per-tensor weight scale when False. For ``Linear``/``Conv2d``, output **scale** is analytical
-    # ``s_in * s_w`` (not fitted); only **bias** is calibrated as the mean residual. Other node kinds
-    # still use OLS for ``(out_scale, out_bias)`` when needed.
+    # For ``Linear``/``Conv2d``: **True** = per-output-channel symmetric weight scales (axis 0);
+    # **False** = one global scale over the whole weight tensor (often destroys accuracy). Ignored for
+    # affine/unary/coeff (always one global weight scale) and for ``MatMul`` (no weights). Output
+    # ``out_scale``/``out_bias`` for Linear/Conv do not depend on this flag (analytical + residual bias).
     per_output_channel: bool = True
     top_k: Optional[int] = None
     eps: Optional[float] = None
     debug_node_stats: bool = True
     quiet: bool = False
+    log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
+    # Print effective quant policy + per-node table; set True or pass --quant-policy-debug.
+    quant_policy_debug: bool = False
 
     @classmethod
     def load(cls, json_path: str) -> "PTQSurgeryConfig":
         cfg = load_dataclass_from_json(cls, json_path, overrides=None)
         if not cfg.meta_json:
-            cfg.meta_json = "./surgery_ptq_meta.json"
+            cfg.meta_json = "artifacts/metadata/surgery_ptq_meta.json"
         return cfg
 
 
@@ -109,11 +112,19 @@ def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
     parser.add_argument(
         "--config",
         type=str,
-        default="conf/ptq_surgery_config.json",
+        default="configs/ptq/full_8bit.json",
         help="JSON config for PTQ wrapping and validation.",
     )
+    parser.add_argument(
+        "--quant-policy-debug",
+        action="store_true",
+        help="Print per-node weight scale mode (per_output_channel applies to Linear/Conv2d weights only).",
+    )
     args = parser.parse_args(argv)
-    return PTQSurgeryConfig.load(args.config)
+    cfg = PTQSurgeryConfig.load(args.config)
+    if args.quant_policy_debug:
+        cfg.quant_policy_debug = True
+    return cfg
 
 
 def _name_matches(name: str, patterns: Sequence[str]) -> bool:
@@ -293,9 +304,41 @@ def _preferred_output_channel_axis(kind: str, out: torch.Tensor) -> Optional[int
     return -1
 
 
-def _weight_output_axis(kind: str) -> Optional[int]:
-    if kind in {"linear", "conv2d", "affine_scale_bias", "affine_fixed_mix"}:
-        return 0
+def _diagnostic_linear_conv_max_s_global_over_s_pc(
+    model: nn.Module,
+    selected: Dict[str, str],
+    weight_bits: int,
+) -> Optional[float]:
+    """
+    Max over all output channels (all selected Linear/Conv) of ``s_global / s_per_channel``.
+    Same ``_symmetric_scale`` as PTQ; ≥1 when some channel uses a tighter scale than the global max.
+    """
+    chunks: List[torch.Tensor] = []
+    for name, kind in selected.items():
+        if kind not in ("linear", "conv2d"):
+            continue
+        mod = _get_module(model, name)
+        w = _extract_weight_tensor(mod, kind)
+        if w is None:
+            continue
+        s_g = _symmetric_scale(w, weight_bits, axis=None)
+        s_pc = _symmetric_scale(w, weight_bits, axis=0)
+        r = s_g.reshape(()) / s_pc.reshape(-1).clamp_min(1e-8)
+        chunks.append(r)
+    if not chunks:
+        return None
+    cat = torch.cat(chunks)
+    return float(cat.max().item())
+
+
+def _weight_quant_axis(kind: str, cfg: PTQSurgeryConfig) -> Optional[int]:
+    """
+    Symmetric weight quantization axis. ``Linear``/``Conv2d``: axis 0 (per output filter) when
+    ``cfg.per_output_channel`` else **None** (single global scale). Affine/unary/coeff: always
+    **None** (one scale over the whole tensor). ``MatMul`` / ``MatMulHadamard``: no weight tensor.
+    """
+    if kind in {"linear", "conv2d"}:
+        return 0 if cfg.per_output_channel else None
     return None
 
 
@@ -506,16 +549,17 @@ class CalibratedAffinePTQWrapper(nn.Module):
         self.output_channel_axis = _preferred_output_channel_axis(self.kind, out_example)
         # Per-channel output *bias* when tensor has an output channel axis (linear/conv); scale is analytical for those kinds.
         self.per_channel_output_affine = self.output_channel_axis is not None
-        self.per_output_channel_weights = bool(cfg.per_output_channel)
+        self.per_output_channel_weights_config = bool(cfg.per_output_channel)
         self.input_arity = len(data.input_samples[0])
 
         self.register_buffer("input_scale", _calibrated_input_scales(data, self.activation_bits))
         self.register_buffer("input_zero_point", torch.zeros(self.input_arity, dtype=torch.float32))
 
+        weight_axis_used: Optional[int] = None
         weight_fp = _extract_weight_tensor(module, self.kind)
         if weight_fp is not None:
-            weight_axis = _weight_output_axis(self.kind) if self.per_output_channel_weights else None
-            weight_scale = _symmetric_scale(weight_fp, self.weight_bits, axis=weight_axis)
+            weight_axis_used = _weight_quant_axis(self.kind, cfg)
+            weight_scale = _symmetric_scale(weight_fp, self.weight_bits, axis=weight_axis_used)
             q_weight = _quantize_proxy(weight_fp, weight_scale, self.weight_bits).to(dtype=torch.float32)
             self.register_buffer("weight_scale", weight_scale.to(dtype=torch.float32))
             self.register_buffer("weight_zero_point", torch.zeros_like(weight_scale, dtype=torch.float32))
@@ -524,6 +568,7 @@ class CalibratedAffinePTQWrapper(nn.Module):
             self.register_buffer("weight_scale", torch.tensor(1.0, dtype=torch.float32))
             self.register_buffer("weight_zero_point", torch.tensor(0.0, dtype=torch.float32))
             self.q_weight = None
+        self.per_output_channel_weights_effective = weight_axis_used is not None
 
         acc_samples: List[torch.Tensor] = []
         for input_sample in data.input_samples:
@@ -594,9 +639,10 @@ class CalibratedAffinePTQWrapper(nn.Module):
             "activation_group": self.activation_group,
             "activation_bits": self.activation_bits,
             "weight_bits": self.weight_bits,
-            "per_output_channel_weights": self.per_output_channel_weights,
+            "per_output_channel_weights_config": self.per_output_channel_weights_config,
+            "per_output_channel_weights_effective": self.per_output_channel_weights_effective,
             "per_channel_output_affine": self.per_channel_output_affine,
-            "per_output_channel": self.per_output_channel_weights,
+            "per_output_channel": self.per_output_channel_weights_config,
             "output_channel_axis": self.output_channel_axis,
             "input_scale": self.input_scale.detach().cpu().tolist(),
             "input_zero_point": self.input_zero_point.detach().cpu().tolist(),
@@ -640,6 +686,27 @@ def _node_debug_metadata(data: NodeCalibrationData) -> Dict[str, Any]:
         "input_stats": input_stats,
         "output_stats": output_stats,
     }
+
+
+def _print_quant_policy_report(cfg: PTQSurgeryConfig, node_meta: List[Dict[str, Any]]) -> None:
+    print("=== quant policy (per_output_channel) ===", flush=True)
+    print(
+        "per_output_channel applies to **Linear/Conv2d weight** quantization only: True = per-output-channel "
+        "scales, False = one global weight scale (usually catastrophic). Affine/unary/coeff always use one "
+        "global weight scale. MatMul: activations only.",
+        flush=True,
+    )
+    print(f"  Config: per_output_channel={cfg.per_output_channel}", flush=True)
+    print("  Wrapped nodes:", flush=True)
+    for meta in node_meta:
+        w_eff = "per-output-ch" if meta.get("per_output_channel_weights_effective") else "global"
+        applies = "yes" if meta["kind"] in ("linear", "conv2d") else "n/a (not linear/conv)"
+        print(
+            f"    {meta['name']}: kind={meta['kind']}  flag_applies={applies}  "
+            f"weight_scale_mode={w_eff}  out_scale_mode={meta.get('out_scale_mode')}",
+            flush=True,
+        )
+    print("=== end quant policy ===", flush=True)
 
 
 @torch.no_grad()
@@ -700,7 +767,19 @@ def _ptq_summary(
     ptq_acc: float,
     ptq_loss: float,
     node_meta: List[Dict[str, Any]],
+    *,
+    linear_conv_max_s_global_over_s_pc: Optional[float] = None,
 ) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "fp_val_acc": float(fp_acc),
+        "fp_val_loss": float(fp_loss),
+        "ptq_val_acc": float(ptq_acc),
+        "ptq_val_loss": float(ptq_loss),
+        "acc_delta": float(ptq_acc - fp_acc),
+        "loss_delta": float(ptq_loss - fp_loss),
+    }
+    if linear_conv_max_s_global_over_s_pc is not None:
+        metrics["linear_conv_max_s_global_over_s_pc"] = linear_conv_max_s_global_over_s_pc
     return {
         "source_checkpoint": os.path.abspath(cfg.fp_checkpoint),
         "output_checkpoint": os.path.abspath(cfg.output),
@@ -717,21 +796,19 @@ def _ptq_summary(
             "activation_bits": int(cfg.activation_bits),
             "affine_activation_bits": int(_activation_bits_for_kind("linear", cfg)),
             "matmul_activation_bits": int(_activation_bits_for_kind("matmul", cfg)),
-            "per_output_channel_weights": bool(cfg.per_output_channel),
             "per_output_channel": bool(cfg.per_output_channel),
+            "per_output_channel_weights": bool(cfg.per_output_channel),
+            "per_output_channel_linear_conv_weights": bool(cfg.per_output_channel),
+            "per_output_channel_note": (
+                "When true: per-output-channel weight scales for Linear/Conv2d. When false: global weight "
+                "scale for Linear/Conv2d. Affine/unary/coeff: always global weight scale. Ignored for MatMul."
+            ),
         },
         "calibration": {
             "batches": int(cfg.calibration_batches),
             "examples_per_node": int(cfg.calibration_examples_per_node),
         },
-        "metrics": {
-            "fp_val_acc": float(fp_acc),
-            "fp_val_loss": float(fp_loss),
-            "ptq_val_acc": float(ptq_acc),
-            "ptq_val_loss": float(ptq_loss),
-            "acc_delta": float(ptq_acc - fp_acc),
-            "loss_delta": float(ptq_loss - fp_loss),
-        },
+        "metrics": metrics,
         "wrapped_nodes": node_meta,
     }
 
@@ -745,7 +822,7 @@ def main() -> None:
     if not os.path.isfile(fp_path):
         raise SystemExit(
             f"Missing fp surgery checkpoint: {fp_path}\n"
-            "Run run_deit_tiny_surgery.py or finetune_surgery_deit_tiny.py first."
+            "Run python -m transformer_surgery.cli.run_surgery or python -m transformer_surgery.cli.distill first."
         )
 
     if not cfg.quiet:
@@ -788,15 +865,37 @@ def main() -> None:
     wrapped_model, node_meta = _build_wrapped_model(fp_model, selected, controller.cache, cfg)
     ptq_acc, ptq_loss = validate_model(wrapped_model, val_loader, criterion)
 
+    linear_conv_max_sg_over_spc = _diagnostic_linear_conv_max_s_global_over_s_pc(
+        fp_model, selected, int(cfg.weight_bits)
+    )
+
     if not cfg.quiet:
         print(f"Wrapped model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}", flush=True)
         print(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}", flush=True)
+        if linear_conv_max_sg_over_spc is not None:
+            print(
+                f"Linear/Conv weight_scale: max(s_global/s_per_channel)={linear_conv_max_sg_over_spc:.6g} "
+                f"(over all selected conv/linear output channels; same symmetric scales as PTQ)",
+                flush=True,
+            )
 
-    meta = _ptq_summary(cfg, selected, fp_acc, fp_loss, ptq_acc, ptq_loss, node_meta)
+    if cfg.quant_policy_debug:
+        _print_quant_policy_report(cfg, node_meta)
+
+    meta = _ptq_summary(
+        cfg,
+        selected,
+        fp_acc,
+        fp_loss,
+        ptq_acc,
+        ptq_loss,
+        node_meta,
+        linear_conv_max_s_global_over_s_pc=linear_conv_max_sg_over_spc,
+    )
 
     out_abs = os.path.abspath(cfg.output)
     meta_abs = os.path.abspath(cfg.meta_json)
-    log_dir = os.path.abspath("logs")
+    log_dir = os.path.abspath(cfg.log_dir)
     model_log_abs = os.path.join(log_dir, "model_after_ptq.txt")
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(meta_abs) or ".", exist_ok=True)

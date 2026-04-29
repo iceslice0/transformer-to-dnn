@@ -7,9 +7,11 @@ It only builds the surgery student from timm weights, runs **eval** accuracy/los
 ``surgery_pre_ft.pt`` / ``surgery_meta.json``. (The output name means “before optional Jeffreys distillation,”
 not that this step finetunes.)
 
-Run `pretrain_pet_deit_tiny.py` first for the Pet timm checkpoint. Defaults live in ``conf/surgery_run_config.json``;
+Run ``python -m transformer_surgery.cli.pretrain_pet`` first for the Pet timm checkpoint.
+Defaults live in ``configs/surgery/topk64_fast.json``;
 CLI overrides optional. Bisect with ``disable_layernorm_replacement``, ``disable_attention_surgery``,
-``disable_softmax_replacement``, ``allow_matmul``. Then run `finetune_surgery_deit_tiny.py` (``conf/surgery_distill_config.json``) **separately**
+``disable_softmax_replacement``, ``allow_matmul``. Then run
+``python -m transformer_surgery.cli.distill`` **separately**
 if you want Jeffreys distillation.
 """
 
@@ -22,8 +24,8 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
-from pet_reference_utils import (
+from transformer_surgery.model import DeiTTinySurgeryModel, freeze_eps_parameters
+from transformer_surgery.pet import (
     PET_NUM_CLASSES,
     SurgeryRunConfig,
     accuracy_and_loss,
@@ -36,11 +38,10 @@ from pet_reference_utils import (
     load_timm_deit_pet_checkpoint,
     parse_surgery_run_config,
     pre_ft_checkpoint_extra,
-    resolve_path_under_script,
     save_deit_checkpoint,
     surgery_meta_for_pre_ft,
 )
-from surgery_utils import (
+from transformer_surgery.ops import (
     RewrittenLayerNorm,
     build_surgery_pwl_meta,
     copy_ln_params_to_rewritten,
@@ -185,7 +186,7 @@ def main() -> None:
     if not os.path.isfile(pet_ref_path):
         raise SystemExit(
             f"Missing pet reference checkpoint: {pet_ref_path}\n"
-            "Run first: python pretrain_pet_deit_tiny.py --output ./pet_timm_deit_tiny.pt"
+            "Run first: python -m transformer_surgery.cli.pretrain_pet"
         )
 
     print(f"Using device: {describe_device(device)}", flush=True)
@@ -198,7 +199,7 @@ def main() -> None:
     print(f"Loading timm reference from {pet_ref_path} ...", flush=True)
     ref = load_timm_deit_pet_checkpoint(pet_ref_path)
     ref = ref.to(device=device, dtype=dtype)
-    log_dir = os.path.abspath("logs")
+    log_dir = os.path.abspath(cfg.log_dir)
     write_model_structure_txt(
         os.path.join(log_dir, "model_before_surgery.txt"),
         ref,
@@ -251,17 +252,19 @@ def main() -> None:
     meta.calibration["ref_val_loss"] = float(ref_loss)
     meta.calibration["student_pre_ft_val_acc"] = float(pre_acc)
     meta.calibration["student_pre_ft_mean_ce"] = float(pre_loss)
-    meta_path = resolve_path_under_script(cfg.meta_json, __file__)
+    meta_path = os.path.abspath(cfg.meta_json)
+    os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
     meta.to_json(meta_path)
 
-    pre_path = resolve_path_under_script(cfg.pre_ft_checkpoint, __file__)
+    pre_path = os.path.abspath(cfg.pre_ft_checkpoint)
+    os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
     save_deit_checkpoint(
         pre_path,
         model,
         extra=pre_ft_checkpoint_extra(cfg, mapping=mapping),
     )
     print(f"Wrote {pre_path} and {meta_path}")
-    print("Next: python finetune_surgery_deit_tiny.py", flush=True)
+    print("Next: python -m transformer_surgery.cli.distill", flush=True)
 
 
 if __name__ == "__main__":

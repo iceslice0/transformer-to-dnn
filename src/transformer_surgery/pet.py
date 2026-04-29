@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
-from surgery_utils import (
+from transformer_surgery.ops import (
     CALIBRATION_LEGEND_TEXT,
     SurgeryMeta,
     get_surgery_dtype,
@@ -964,7 +964,7 @@ def merge_post_distill_into_surgery_meta(
             "dataset": "Oxford-IIIT Pet",
             "calibration": {},
             "pwl": {
-                "note": "No surgery run meta on disk; run run_deit_tiny_surgery.py for GELU PWL knot_positions.",
+                "note": "No surgery run meta on disk; run python -m transformer_surgery.cli.run_surgery for GELU PWL knot_positions.",
             },
             "meta_note": "Stub created before distill (no prior surgery_meta at this path).",
         }
@@ -978,6 +978,7 @@ def merge_post_distill_into_surgery_meta(
     cal.pop("val_loss_post_ft", None)
     raw["calibration"] = cal
     raw["calibration_legend"] = CALIBRATION_LEGEND_TEXT
+    os.makedirs(os.path.dirname(os.path.abspath(meta_path)) or ".", exist_ok=True)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(raw, f, indent=2)
 
@@ -987,7 +988,7 @@ class PretrainPetConfig:
     """Pet classifier head training on timm DeiT-Tiny; JSON + CLI via :meth:`load`."""
 
     data_dir: str = "./data"
-    output: str = "./pet_timm_deit_tiny.pt"
+    output: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
     epochs: int = 50
     batch_size: int = 128
     workers: int = 2
@@ -1061,14 +1062,14 @@ def pretrain_train_config_record(
 
 @dataclass
 class SurgeryRunConfig:
-    """Surgery transform + calibration run (``run_deit_tiny_surgery.py``); JSON + CLI via :meth:`load`."""
+    """Surgery transform + calibration run; JSON + CLI via :meth:`load`."""
 
     data_dir: str = "./data"
     batch_size: int = 128
     workers: int = 2
     top_k: int = 32
     eps: float = 1e-5
-    pet_ref_checkpoint: str = "./pet_timm_deit_tiny.pt"
+    pet_ref_checkpoint: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
     disable_layernorm_replacement: bool = False
@@ -1078,8 +1079,9 @@ class SurgeryRunConfig:
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
-    meta_json: str = "surgery_meta.json"
-    pre_ft_checkpoint: str = "surgery_pre_ft.pt"
+    meta_json: str = "artifacts/metadata/surgery_meta.json"
+    pre_ft_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
+    log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
 
     @classmethod
@@ -1106,6 +1108,7 @@ FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
         "``torch.<name>`` compute dtype (e.g. bfloat16, float32). Default bfloat16; "
         "set via apply_dtype_from_config like device."
     ),
+    "log_dir": "Directory for model structure dumps.",
 }
 
 
@@ -1117,7 +1120,7 @@ def surgery_meta_for_pre_ft(
     pwl: Dict[str, Any],
     module_mapping: Dict[str, str],
 ) -> SurgeryMeta:
-    """Build :class:`surgery_utils.SurgeryMeta` for the pre–Jeffreys surgery run."""
+    """Build :class:`transformer_surgery.ops.SurgeryMeta` for the pre-Jeffreys surgery run."""
     return SurgeryMeta(
         eps=float(cfg.eps),
         top_k=int(cfg.top_k),
@@ -1167,10 +1170,10 @@ class JeffreysDistillConfig:
     distill_weight: float = 0.5
     max_train_batches: Optional[int] = None
     keep_best: bool = True
-    pet_ref_checkpoint: str = "./pet_timm_deit_tiny.pt"
-    pre_checkpoint: str = "./surgery_pre_ft.pt"
-    output: str = "./surgery_post_ft.pt"
-    meta_json: Optional[str] = "./surgery_meta.json"
+    pet_ref_checkpoint: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
+    pre_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
+    output: str = "artifacts/checkpoints/surgery_post_ft.pt"
+    meta_json: Optional[str] = "artifacts/metadata/surgery_meta.json"
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing: float = 0.0
@@ -1203,7 +1206,7 @@ def load_surgery_student_checkpoint(
     ``cfg`` may override ``top_k`` / ``eps`` when set. Runtime dtype comes from checkpoint metadata
     when present; ``cfg.surgery_dtype`` is only a fallback for older checkpoints without that field.
     """
-    from deit_tiny_surgery_model import DeiTTinySurgeryModel, freeze_eps_parameters
+    from transformer_surgery.model import DeiTTinySurgeryModel, freeze_eps_parameters
 
     device = get_device()
     try:
@@ -1236,13 +1239,13 @@ FIELD_HELP_JEFFREYS: Dict[str, str] = {
 
 # Default ``--config`` paths and parser descriptions (single source for all three CLIs).
 CLI_PRETRAIN_DESCRIPTION = "Pet head training on timm DeiT-Tiny"
-CLI_PRETRAIN_CONFIG_DEFAULT = "conf/pretrain_config.json"
+CLI_PRETRAIN_CONFIG_DEFAULT = "configs/pretrain/pet_deit_tiny.json"
 CLI_SURGERY_RUN_DESCRIPTION = (
     "DeiT-Tiny surgery: timm Pet checkpoint → surgery student + surgery_meta.json"
 )
-CLI_SURGERY_RUN_CONFIG_DEFAULT = "conf/surgery_run_config.json"
+CLI_SURGERY_RUN_CONFIG_DEFAULT = "configs/surgery/topk64_fast.json"
 CLI_JEFFREYS_DESCRIPTION = "Mixed CE + teacher matching: timm teacher → surgery student"
-CLI_JEFFREYS_CONFIG_DEFAULT = "conf/surgery_distill_config.json"
+CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/jeffreys_default.json"
 CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
 
 

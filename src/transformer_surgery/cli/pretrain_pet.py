@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from pet_reference_utils import (
+from transformer_surgery.pet import (
     PET_NUM_CLASSES,
     PretrainPetConfig,
     accuracy_and_loss,

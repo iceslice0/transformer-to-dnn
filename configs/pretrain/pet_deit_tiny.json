@@ -1,6 +1,6 @@
 {
   "data_dir": "./data",
-  "output": "./pet_timm_deit_tiny.pt",
+  "output": "artifacts/checkpoints/pet_timm_deit_tiny.pt",
   "epochs": 20,
   "batch_size": 32,
   "workers": 2,

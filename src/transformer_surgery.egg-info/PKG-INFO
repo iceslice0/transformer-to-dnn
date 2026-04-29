@@ -1,0 +1,72 @@
+Metadata-Version: 2.4
+Name: transformer-surgery
+Version: 0.1.0
+Summary: Demo code for Transformer to DNN surgery.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1
+Requires-Dist: torchvision>=0.15
+Requires-Dist: timm>=0.9
+Requires-Dist: torchmetrics>=1.0.0
+
+# Transformer Surgery Demo
+
+This repository contains demo code for rewriting a timm DeiT-Tiny classifier into an explicit "surgery" graph on Oxford-IIIT Pet, with optional Jeffreys distillation and post-training quantization.
+
+## Install
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+The dataset is expected under `data/oxford-iiit-pet/`. If it is missing, the torchvision loader will download it once into `data/`.
+
+## Pipeline
+
+Run commands from the repository root:
+
+```bash
+python -m transformer_surgery.cli.pretrain_pet
+python -m transformer_surgery.cli.run_surgery
+python -m transformer_surgery.cli.distill
+python -m transformer_surgery.cli.ptq
+```
+
+Equivalent console scripts are available after `pip install -e .`:
+
+```bash
+ts-pretrain-pet
+ts-run-surgery
+ts-distill
+ts-ptq
+```
+
+## Configs
+
+Default configs live under `configs/`:
+
+- `configs/pretrain/pet_deit_tiny.json`: Pet classifier-head training for the timm reference checkpoint.
+- `configs/surgery/topk64_fast.json`: default surgery demo with top-k 64 and matmul fast paths enabled.
+- `configs/surgery/topk64_strict.json`: strict top-k 64 surgery path without matmul fast paths.
+- `configs/distill/jeffreys_default.json`: mixed CE and Jeffreys teacher-matching fine-tune.
+- `configs/ptq/*.json`: PTQ variants for full, linear-only, no-matmul, and per-tensor quantization.
+
+Pass a different config with `--config path/to/config.json`. CLI flags override JSON fields where supported.
+
+## Artifacts
+
+Generated outputs are intentionally ignored by Git:
+
+- checkpoints: `artifacts/checkpoints/`
+- metadata JSON: `artifacts/metadata/`
+- model structure dumps: `artifacts/logs/`
+- previous run folders: `artifacts/runs/`
+
+The main expected files are `artifacts/checkpoints/pet_timm_deit_tiny.pt`, `artifacts/checkpoints/surgery_pre_ft.pt`, `artifacts/checkpoints/surgery_post_ft.pt`, `artifacts/checkpoints/surgery_ptq.pt`, plus metadata under `artifacts/metadata/`.
+
+## Method Notes
+
+See `docs/method.md` for the surgery graph design and `docs/ptq.md` for PTQ notes.

@@ -28,7 +28,7 @@ def get_surgery_dtype() -> torch.dtype:
 
 
 def set_surgery_dtype(dt: torch.dtype) -> None:
-    """Set global surgery dtype (mirrors process device pattern in ``pet_reference_utils``)."""
+    """Set global surgery dtype (mirrors process device pattern in ``transformer_surgery.pet``)."""
     global _SURGERY_DTYPE
     _SURGERY_DTYPE = dt
 
@@ -712,7 +712,7 @@ def write_model_structure_txt(
 ) -> None:
     """
     Write model repr, parameter counts, ``named_modules`` listing, and (by default) per-module
-    forward **output** tensor shapes from one ``eval`` pass with a dummy batch (for ``./logs`` dumps).
+    forward **output** tensor shapes from one ``eval`` pass with a dummy batch (for ``artifacts/logs`` dumps).
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     n_all = sum(p.numel() for p in model.parameters())

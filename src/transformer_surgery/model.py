@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from timm.layers import DropPath
 
-from surgery_utils import (
+from transformer_surgery.ops import (
     AffineContract,
     GibbsTopKSoftmax,
     MatMul,
@@ -247,7 +247,7 @@ class DeiTTinySurgeryModel(nn.Module):
 
     @classmethod
     def from_surgery_run_config(cls, cfg: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
-        """Build from :class:`pet_reference_utils.SurgeryRunConfig` (or same fields)."""
+        """Build from :class:`transformer_surgery.pet.SurgeryRunConfig` (or same fields)."""
         return cls(
             num_classes=num_classes,
             top_k=int(cfg.top_k),

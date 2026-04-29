@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 CLI for mixed CE + teacher matching fine-tuning of the surgery student. Config:
-:class:`pet_reference_utils.JeffreysDistillConfig`;
-training loop: :func:`pet_reference_utils.distill_surgery_from_teacher_jeffreys`.
+:class:`transformer_surgery.pet.JeffreysDistillConfig`;
+training loop: :func:`transformer_surgery.pet.distill_surgery_from_teacher_jeffreys`.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from surgery_utils import get_surgery_dtype
+from transformer_surgery.ops import get_surgery_dtype
 
-from pet_reference_utils import (
+from transformer_surgery.pet import (
     CLI_JEFFREYS_CONFIG_DEFAULT,
     CLI_JEFFREYS_CONFIG_HELP,
     CLI_JEFFREYS_DESCRIPTION,
@@ -39,7 +39,7 @@ def require_pre_student_checkpoint_path(c: JeffreysDistillConfig) -> str:
     p = os.path.abspath(c.pre_checkpoint)
     if not os.path.isfile(p):
         raise FileNotFoundError(
-            f"Missing student checkpoint: {p} (run run_deit_tiny_surgery.py first)"
+            f"Missing student checkpoint: {p} (run python -m transformer_surgery.cli.run_surgery first)"
         )
     return p
 
@@ -49,7 +49,7 @@ def require_pet_teacher_checkpoint_path(c: JeffreysDistillConfig) -> str:
     p = os.path.abspath(c.pet_ref_checkpoint)
     if not os.path.isfile(p):
         raise FileNotFoundError(
-            f"Missing teacher checkpoint: {p} (run pretrain_pet_deit_tiny.py first)"
+            f"Missing teacher checkpoint: {p} (run python -m transformer_surgery.cli.pretrain_pet first)"
         )
     return p
 
