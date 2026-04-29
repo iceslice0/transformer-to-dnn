@@ -246,8 +246,8 @@ class DeiTTinySurgeryModel(nn.Module):
         self.top_k = top_k
 
     @classmethod
-    def from_surgery_run_config(cls, cfg: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
-        """Build from :class:`transformer_surgery.cli.surgery_config.SurgeryRunConfig` (or same fields)."""
+    def from_surgery_config(cls, cfg: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
+        """Build from :class:`transformer_surgery.cli.surgery_config.SurgeryConfig` (or same fields)."""
         return cls(
             num_classes=num_classes,
             top_k=int(cfg.top_k),
@@ -260,7 +260,7 @@ class DeiTTinySurgeryModel(nn.Module):
 
     @classmethod
     def from_pretrained_extra(cls, ex: Dict[str, Any], *, num_classes: int) -> "DeiTTinySurgeryModel":
-        """Restore architecture from a checkpoint ``extra`` dict (e.g. ``surgery_pre_ft.pt``)."""
+        """Restore architecture from a checkpoint ``extra`` dict (e.g. ``surgery.pt``)."""
         return cls(
             num_classes=num_classes,
             top_k=int(ex["top_k"]),

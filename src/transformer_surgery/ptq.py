@@ -32,7 +32,10 @@ from transformer_surgery.pipeline import (
     describe_device,
     describe_dtype,
     get_device,
+    metadata_path_for_checkpoint,
     save_model_checkpoint,
+    traceable_artifact_path,
+    traceable_log_path,
 )
 from transformer_surgery.ops import (
     AffineContract,
@@ -728,6 +731,10 @@ def main() -> None:
     device = apply_device_from_config(cfg)
     dtype = apply_dtype_from_config(cfg)
     fp_path = os.path.abspath(cfg.fp_checkpoint)
+    out_abs = traceable_artifact_path(cfg.output, cfg, "ts-ptq", "wrapped", ".pt")
+    meta_abs = metadata_path_for_checkpoint(out_abs)
+    model_log_abs = traceable_log_path(cfg.log_dir, cfg, "ts-ptq", "model_after_ptq")
+    cfg.output = out_abs
 
     print(f"Using device: {describe_device(device)}", flush=True)
     print(f"Requested surgery dtype: {describe_dtype(dtype)}", flush=True)
@@ -791,10 +798,6 @@ def main() -> None:
         linear_conv_max_s_global_over_s_pc=linear_conv_max_sg_over_spc,
     )
 
-    out_abs = os.path.abspath(cfg.output)
-    meta_abs = os.path.abspath(cfg.meta_json)
-    log_dir = os.path.abspath(cfg.log_dir)
-    model_log_abs = os.path.join(log_dir, "model_after_ptq.txt")
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(meta_abs) or ".", exist_ok=True)
 

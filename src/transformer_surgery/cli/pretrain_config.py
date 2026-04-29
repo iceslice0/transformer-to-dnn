@@ -13,7 +13,7 @@ class PretrainPetConfig:
     """Pet classifier head training on timm DeiT-Tiny; JSON + CLI via :meth:`load`."""
 
     data_dir: str = "./data"
-    output: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
+    output: str = "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt"
     epochs: int = 50
     batch_size: int = 128
     workers: int = 2

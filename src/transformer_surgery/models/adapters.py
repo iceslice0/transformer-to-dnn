@@ -98,13 +98,13 @@ class SurgeryModelAdapter:
             allow_matmul=bool(cfg.allow_matmul),
         )
 
-    def pre_ft_checkpoint_extra(self, cfg: Any, *, mapping: Dict[str, Any]) -> Dict[str, Any]:
+    def pre_ft_checkpoint_extra(self, cfg: Any, *, mapping: Dict[str, Any], metadata_path: str) -> Dict[str, Any]:
         return {
             "model_key": self.key,
             "patient": self.patient_name,
             "dataset": self.dataset_name,
             "reference_checkpoint": self.reference_checkpoint_path(cfg),
-            "meta_ref": os.path.basename(cfg.meta_json),
+            "meta_ref": os.path.basename(metadata_path),
             "mapping": mapping,
             "top_k": int(cfg.top_k),
             "eps_ln": float(cfg.eps),
@@ -137,7 +137,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
         from transformer_surgery.models.pet import PET_NUM_CLASSES
 
-        return DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES)
+        return DeiTTinySurgeryModel.from_surgery_config(cfg, num_classes=PET_NUM_CLASSES)
 
     def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
         from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel

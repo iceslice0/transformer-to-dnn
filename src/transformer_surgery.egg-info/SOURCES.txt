@@ -17,7 +17,7 @@ src/transformer_surgery/cli/pretrain_config.py
 src/transformer_surgery/cli/pretrain_pet.py
 src/transformer_surgery/cli/ptq.py
 src/transformer_surgery/cli/ptq_config.py
-src/transformer_surgery/cli/run_surgery.py
+src/transformer_surgery/cli/surgery.py
 src/transformer_surgery/cli/surgery_config.py
 src/transformer_surgery/models/__init__.py
 src/transformer_surgery/models/adapters.py

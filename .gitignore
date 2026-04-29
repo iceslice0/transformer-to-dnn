@@ -11,6 +11,5 @@ models/
 !src/transformer_surgery/models/
 !src/transformer_surgery/models/*.py
 artifacts/
-*.pt
 *_meta.json
 .codex

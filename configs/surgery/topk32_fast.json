@@ -5,14 +5,13 @@
   "workers": 2,
   "top_k": 32,
   "eps": 1e-3,
-  "reference_checkpoint": "artifacts/checkpoints/pet_timm_deit_tiny.pt",
+  "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "device": "cuda",
   "surgery_dtype": "float16",
   "disable_layernorm_replacement": false,
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": true,
-  "meta_json": "artifacts/metadata/surgery_meta.json",
-  "pre_ft_checkpoint": "artifacts/checkpoints/surgery_pre_ft.pt",
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk32_fast.pt",
   "log_dir": "artifacts/logs"
 }

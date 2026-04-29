@@ -17,7 +17,7 @@ No training.
 No QAT.
 Only PTQ initialization and evaluation.
 
-Use python -m transformer_surgery.cli.run_surgery as reference, reuse code if possible
+Use python -m transformer_surgery.cli.surgery as reference, reuse code if possible
 
 File to create
 

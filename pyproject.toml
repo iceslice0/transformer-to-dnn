@@ -17,7 +17,7 @@ dependencies = [
 
 [project.scripts]
 ts-pretrain-pet = "transformer_surgery.cli.pretrain_pet:main"
-ts-run-surgery = "transformer_surgery.cli.run_surgery:main"
+ts-surgery = "transformer_surgery.cli.surgery:main"
 ts-distill = "transformer_surgery.cli.distill:main"
 ts-ptq = "transformer_surgery.cli.ptq:main"
 

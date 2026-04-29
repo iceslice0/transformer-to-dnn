@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+Surgery pipeline: load an adapter reference checkpoint, transform, calibrate, save pre-finetune weights.
+
+This script does **not** run distillation or any finetuning: no teacher–student loss, no optimizer, no ``backward``.
+It only builds the surgery student from reference weights, runs **eval** accuracy/loss for reporting, and saves
+traceable ``ts_surgery_<config>_*`` artifacts. ``pre_ft`` means “before optional Jeffreys distillation,”
+not that this step finetunes.
+
+The default adapter is ``deit_tiny_pet``; its reference checkpoint is produced by
+``python -m transformer_surgery.cli.pretrain_pet``. Other models can participate by registering an adapter
+and setting ``model_key`` in the config.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import torch.nn as nn
+
+from transformer_surgery.cli.surgery_config import SurgeryConfig, parse_surgery_config
+from transformer_surgery.models.adapters import get_model_adapter
+from transformer_surgery.pipeline import (
+    accuracy_and_loss,
+    apply_device_from_config,
+    apply_dtype_from_config,
+    describe_device,
+    describe_dtype,
+    metadata_path_for_checkpoint,
+    save_model_checkpoint,
+    traceable_artifact_path,
+    traceable_log_path,
+)
+from transformer_surgery.ops import (
+    build_surgery_pwl_meta,
+    write_model_structure_txt,
+)
+
+
+def main() -> None:
+    cfg = parse_surgery_config()
+    adapter = get_model_adapter(cfg)
+
+    device = apply_device_from_config(cfg)
+    dtype = apply_dtype_from_config(cfg)
+
+    reference_path = adapter.reference_checkpoint_path(cfg)
+    print(f"Using device: {describe_device(device)}", flush=True)
+    print(f"Using surgery dtype: {describe_dtype(dtype)}", flush=True)
+    print(f"Using model adapter: {adapter.key}", flush=True)
+    if cfg.config_json_path:
+        print(f"config_json={cfg.config_json_path}", flush=True)
+
+    _, val_loader = adapter.build_loaders(cfg)
+
+    print(f"Loading reference from {reference_path} ...", flush=True)
+    ref = adapter.load_reference_checkpoint(reference_path)
+    ref = ref.to(device=device, dtype=dtype)
+    before_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_before_surgery")
+    write_model_structure_txt(
+        before_log_path,
+        ref,
+        "Reference Model (before surgery transform)",
+    )
+    print(f"wrote {before_log_path}", flush=True)
+
+    criterion = nn.CrossEntropyLoss()
+    ref.eval()
+    ref_acc, ref_loss = accuracy_and_loss(ref, val_loader, criterion)
+    print(f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f}")
+
+    cal = adapter.calibrate_reference(ref, val_loader, cfg)
+    print("Calibration:", json.dumps(cal, indent=2))
+
+    print("Building surgery model...", flush=True)
+    print(
+        f"  disable_layernorm_replacement={cfg.disable_layernorm_replacement}  "
+        f"disable_attention_surgery={cfg.disable_attention_surgery}  "
+        f"disable_softmax_replacement={cfg.disable_softmax_replacement}  allow_matmul={cfg.allow_matmul}",
+        flush=True,
+    )
+    model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
+    mapping = adapter.copy_reference_weights(model, ref)
+    adapter.freeze_surgery_parameters(model)
+    print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
+
+    after_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_after_surgery")
+    write_model_structure_txt(
+        after_log_path,
+        model,
+        "Surgery Model (after transform, pre-finetune checkpoint)",
+    )
+    print(f"wrote {after_log_path}", flush=True)
+
+    pre_acc, pre_loss = accuracy_and_loss(model, val_loader, criterion)
+    print(f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f}")
+
+    pwl_meta = build_surgery_pwl_meta()
+    mod_map = adapter.build_module_mapping(cfg, model)
+    meta = adapter.build_surgery_meta(
+        cfg,
+        calibration=cal,
+        reference_checkpoint_abs=reference_path,
+        pwl=pwl_meta,
+        module_mapping=mod_map,
+    )
+    meta.calibration["ref_val_acc"] = float(ref_acc)
+    meta.calibration["ref_val_loss"] = float(ref_loss)
+    meta.calibration["student_pre_ft_val_acc"] = float(pre_acc)
+    meta.calibration["student_pre_ft_mean_ce"] = float(pre_loss)
+    pre_path = traceable_artifact_path(cfg.pre_ft_checkpoint, cfg, "ts-surgery", extension=".pt")
+    cfg.pre_ft_checkpoint = pre_path
+    meta_path = metadata_path_for_checkpoint(pre_path)
+    os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+    meta.to_json(meta_path)
+
+    os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
+    save_model_checkpoint(
+        pre_path,
+        model,
+        extra=adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path),
+    )
+    print(f"Wrote {pre_path} and {meta_path}")
+    print("Next: python -m transformer_surgery.cli.distill", flush=True)
+
+
+if __name__ == "__main__":
+    main()

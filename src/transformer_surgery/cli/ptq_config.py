@@ -13,9 +13,8 @@ from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_
 class PTQSurgeryConfig:
     model_key: str = DEFAULT_MODEL_KEY
     data_dir: str = "./data"
-    fp_checkpoint: str = "artifacts/checkpoints/surgery_post_ft.pt"
-    output: str = "artifacts/checkpoints/surgery_ptq.pt"
-    meta_json: str = "artifacts/metadata/surgery_ptq_meta.json"
+    fp_checkpoint: str = "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt"
+    output: str = "artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit_wrapped.pt"
     batch_size: int = 32
     workers: int = 2
     randaugment: bool = True
@@ -46,10 +45,7 @@ class PTQSurgeryConfig:
 
     @classmethod
     def load(cls, json_path: str) -> "PTQSurgeryConfig":
-        cfg = load_dataclass_from_json(cls, json_path, overrides=None)
-        if not cfg.meta_json:
-            cfg.meta_json = "artifacts/metadata/surgery_ptq_meta.json"
-        return cfg
+        return load_dataclass_from_json(cls, json_path, overrides=None)
 
 
 def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
@@ -57,7 +53,7 @@ def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/ptq/full_8bit.json",
+        default="configs/ptq/64_fast_jeffreys_8bit.json",
         help="JSON config for PTQ wrapping and validation.",
     )
     args = parser.parse_args(argv)

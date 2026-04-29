@@ -25,8 +25,10 @@ from transformer_surgery.pipeline import (
     describe_dtype,
     distill_student_from_teacher_jeffreys,
     get_device,
+    metadata_path_for_checkpoint,
     merge_post_distill_into_surgery_meta,
     save_model_checkpoint,
+    traceable_artifact_path,
 )
 
 
@@ -66,20 +68,17 @@ def log_wrote_checkpoint(path: str) -> None:
     print(f"wrote {path}", flush=True)
 
 
-def log_wrote_meta_json(path: str) -> None:
+def log_wrote_metadata(path: str) -> None:
     print(f"wrote {path}", flush=True)
 
 
-def merge_meta_after_distill_if_configured(
-    c: JeffreysDistillConfig,
+def write_distill_metadata(
+    meta_out: str,
     adapter,
     val_acc: float,
     val_ce: float,
     val_j: float,
 ) -> None:
-    if not c.meta_json:
-        return
-    meta_out = os.path.abspath(str(c.meta_json).strip())
     merge_post_distill_into_surgery_meta(
         meta_out,
         val_acc,
@@ -89,7 +88,7 @@ def merge_meta_after_distill_if_configured(
         patient=adapter.patient_name,
         dataset=adapter.dataset_name,
     )
-    log_wrote_meta_json(meta_out)
+    log_wrote_metadata(meta_out)
 
 
 def main() -> None:
@@ -108,6 +107,9 @@ def main() -> None:
     apply_device_from_config(c)
     apply_dtype_from_config(c)
     pre_path = os.path.abspath(c.pre_checkpoint)
+    out_abs = traceable_artifact_path(c.output, c, "ts-distill", extension=".pt")
+    meta_abs = metadata_path_for_checkpoint(out_abs)
+    c.output = out_abs
 
     student, student_extra = load_surgery_student_checkpoint(pre_path, c)
     adapter = get_model_adapter(student_extra.get("model_key", getattr(c, "model_key", None)))
@@ -128,7 +130,6 @@ def main() -> None:
     )
     log_distill_final_metrics(val_acc, val_ce, val_j, best_ep, c)
 
-    out_abs = os.path.abspath(c.output)
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
     out_extra = dict(student_extra)
     out_extra.update(
@@ -153,7 +154,7 @@ def main() -> None:
         extra=out_extra,
     )
     log_wrote_checkpoint(out_abs)
-    merge_meta_after_distill_if_configured(c, adapter, val_acc, val_ce, val_j)
+    write_distill_metadata(meta_abs, adapter, val_acc, val_ce, val_j)
 
 
 if __name__ == "__main__":

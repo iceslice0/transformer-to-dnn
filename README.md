@@ -19,18 +19,18 @@ Run commands from the repository root:
 
 ```bash
 python -m transformer_surgery.cli.pretrain_pet
-python -m transformer_surgery.cli.run_surgery
+python -m transformer_surgery.cli.surgery
 python -m transformer_surgery.cli.distill
 python -m transformer_surgery.cli.ptq
 ```
 
-`pretrain_pet` is the concrete DeiT-Tiny/Pet pretraining step. The later `run_surgery`, `distill`, and `ptq` stages go through a model adapter (`model_key`, default `deit_tiny_pet`) so those processing stages do not need Pet- or DeiT-specific code.
+`pretrain_pet` is the concrete DeiT-Tiny/Pet pretraining step. The later `surgery`, `distill`, and `ptq` stages go through a model adapter (`model_key`, default `deit_tiny_pet`) so those processing stages do not need Pet- or DeiT-specific code.
 
 Equivalent console scripts are available after `pip install -e .`:
 
 ```bash
 ts-pretrain-pet
-ts-run-surgery
+ts-surgery
 ts-distill
 ts-ptq
 ```
@@ -42,11 +42,12 @@ Default configs live under `configs/`:
 - `configs/pretrain/pet_deit_tiny.json`: Pet classifier-head training for the timm reference checkpoint.
 - `configs/surgery/topk64_fast.json`: default surgery demo with top-k 64 and matmul fast paths enabled.
 - `configs/surgery/topk64_strict.json`: strict top-k 64 surgery path without matmul fast paths.
-- `configs/distill/jeffreys_default.json`: mixed CE and Jeffreys teacher-matching fine-tune.
+- `configs/distill/64_fast_jeffreys.json`: mixed CE and Jeffreys teacher-matching fine-tune.
 - `configs/ptq/*.json`: PTQ variants for full, linear-only, no-matmul, and per-tensor quantization.
 
 Pass a different config with `--config path/to/config.json`. CLI flags override JSON fields where supported.
 For adapter-based stages, `reference_checkpoint` is the teacher/reference checkpoint field.
+Generated checkpoints and log files use `<tool>_<config>[_stage]` stems, e.g. `ts_surgery_topk64_fast.pt`, so artifacts are traceable to the CLI and config that produced them. Metadata JSON is derived from the checkpoint basename under `artifacts/metadata/`.
 
 ## Artifacts
 
@@ -57,7 +58,7 @@ Generated outputs are intentionally ignored by Git:
 - model structure dumps: `artifacts/logs/`
 - previous run folders: `artifacts/runs/`
 
-The main expected files are `artifacts/checkpoints/pet_timm_deit_tiny.pt`, `artifacts/checkpoints/surgery_pre_ft.pt`, `artifacts/checkpoints/surgery_post_ft.pt`, `artifacts/checkpoints/surgery_ptq.pt`, plus metadata under `artifacts/metadata/`.
+The default e2e files are `artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt`, `artifacts/checkpoints/ts_surgery_topk64_fast.pt`, `artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt`, and `artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit_wrapped.pt`, plus matching metadata and logs.
 
 ## Method Notes
 

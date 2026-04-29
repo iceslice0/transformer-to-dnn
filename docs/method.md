@@ -117,7 +117,7 @@ Requirements:
 - ``eps`` is explicit (buffers / constructor args); not trained in fine-tuning (see ``freeze_eps_parameters``)
 - ``gamma``/``beta`` copied from timm LayerNorm where applicable (``copy_ln_params_to_rewritten``)
 
-Validation (see ``python -m transformer_surgery.cli.run_surgery`` / ``transformer_surgery.models.pet``): compare rewritten LN to
+Validation (see ``python -m transformer_surgery.cli.surgery`` / ``transformer_surgery.models.pet``): compare rewritten LN to
 reference LN on minibatches; metrics go into surgery metadata.
 
 Main transform 2: Replace variable matrix multiplication in attention (strict mode)
@@ -175,11 +175,13 @@ There are **no** separate classes named ``ExplicitAdd``, ``ExplicitMean``, ``Set
 
 What the main scripts do (reference)
 
-- ``python -m transformer_surgery.cli.run_surgery``: load Pet timm checkpoint, build surgery student, eval, write
-  ``surgery_pre_ft.pt``, ``surgery_meta.json``, and ``artifacts/logs/model_{before,after}_surgery.txt``
+- ``python -m transformer_surgery.cli.surgery``: load Pet timm checkpoint, build surgery student, eval, write
+  ``ts_surgery_<config>.pt``, ``artifacts/metadata/ts_surgery_<config>.json``, and
+  ``artifacts/logs/ts_surgery_<config>_model_{before,after}_surgery.txt``
   (includes forward **output shape** traces via ``write_model_structure_txt``).
 - ``python -m transformer_surgery.cli.distill``: Jeffreys distillation / fine-tuning from config.
-- ``python -m transformer_surgery.cli.ptq``: optional post-training quantization; writes ``artifacts/logs/model_after_ptq.txt``.
+- ``python -m transformer_surgery.cli.ptq``: optional post-training quantization; writes
+  ``artifacts/logs/ts_ptq_<config>_model_after_ptq.txt``.
 
 Fine-tuning rule
 

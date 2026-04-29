@@ -1,4 +1,4 @@
-"""CLI config for ``ts-run-surgery`` / ``python -m transformer_surgery.cli.run_surgery``."""
+"""CLI config for ``ts-surgery`` / ``python -m transformer_surgery.cli.surgery``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_
 
 
 @dataclass
-class SurgeryRunConfig:
+class SurgeryConfig:
     """Surgery transform + calibration run; JSON + CLI via :meth:`load`."""
 
     model_key: str = DEFAULT_MODEL_KEY
@@ -28,17 +28,16 @@ class SurgeryRunConfig:
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
-    meta_json: str = "artifacts/metadata/surgery_meta.json"
-    pre_ft_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
+    pre_ft_checkpoint: str = "artifacts/checkpoints/ts_surgery_topk64_fast.pt"
     log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
 
     @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "SurgeryRunConfig":
+    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "SurgeryConfig":
         return load_dataclass_from_json(cls, json_path, overrides)
 
 
-FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
+FIELD_HELP_SURGERY: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "reference_checkpoint": "Reference/teacher checkpoint path.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
@@ -49,15 +48,15 @@ FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
     "log_dir": "Directory for model structure dumps.",
 }
 
-CLI_SURGERY_RUN_DESCRIPTION = "Model-adapter surgery: reference checkpoint -> surgery student + metadata"
-CLI_SURGERY_RUN_CONFIG_DEFAULT = "configs/surgery/topk64_fast.json"
+CLI_SURGERY_DESCRIPTION = "Model-adapter surgery: reference checkpoint -> surgery student + metadata"
+CLI_SURGERY_CONFIG_DEFAULT = "configs/surgery/topk64_fast.json"
 
 
-def parse_surgery_run_config(argv: Optional[Sequence[str]] = None) -> SurgeryRunConfig:
+def parse_surgery_config(argv: Optional[Sequence[str]] = None) -> SurgeryConfig:
     return parse_cli_config(
-        SurgeryRunConfig,
-        description=CLI_SURGERY_RUN_DESCRIPTION,
-        config_default=CLI_SURGERY_RUN_CONFIG_DEFAULT,
-        field_help=FIELD_HELP_SURGERY_RUN,
+        SurgeryConfig,
+        description=CLI_SURGERY_DESCRIPTION,
+        config_default=CLI_SURGERY_CONFIG_DEFAULT,
+        field_help=FIELD_HELP_SURGERY,
         argv=argv,
     )

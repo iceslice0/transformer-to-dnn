@@ -26,6 +26,7 @@ from transformer_surgery.pipeline import (
     apply_device_from_config,
     describe_device,
     set_seed,
+    traceable_artifact_path,
 )
 
 
@@ -105,7 +106,8 @@ def main() -> None:
     set_seed(cfg.seed)
     device = apply_device_from_config(cfg)
 
-    out_abs = os.path.abspath(cfg.output)
+    out_abs = traceable_artifact_path(cfg.output, cfg, "ts-pretrain-pet", extension=".pt")
+    cfg.output = out_abs
     train_loader, val_loader = build_pet_loaders(cfg)
 
     model, _, best_acc_ref = load_pretrain_model(cfg, out_abs, device)

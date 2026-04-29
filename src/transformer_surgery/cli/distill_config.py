@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from transformer_surgery.cli.surgery_config import FIELD_HELP_SURGERY_RUN
+from transformer_surgery.cli.surgery_config import FIELD_HELP_SURGERY
 from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_json
 
 
@@ -28,9 +28,8 @@ class JeffreysDistillConfig:
     max_train_batches: Optional[int] = None
     keep_best: bool = True
     reference_checkpoint: Optional[str] = None
-    pre_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
-    output: str = "artifacts/checkpoints/surgery_post_ft.pt"
-    meta_json: Optional[str] = "artifacts/metadata/surgery_meta.json"
+    pre_checkpoint: str = "artifacts/checkpoints/ts_surgery_topk64_fast.pt"
+    output: str = "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt"
     randaugment: bool = True
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
@@ -44,21 +43,16 @@ class JeffreysDistillConfig:
 
     @classmethod
     def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "JeffreysDistillConfig":
-        cfg = load_dataclass_from_json(cls, json_path, overrides)
-        mj = cfg.meta_json
-        if mj is not None and isinstance(mj, str) and not mj.strip():
-            cfg = replace(cfg, meta_json=None)
-        return cfg
+        return load_dataclass_from_json(cls, json_path, overrides)
 
 
 FIELD_HELP_JEFFREYS: Dict[str, str] = {
-    "model_key": FIELD_HELP_SURGERY_RUN["model_key"],
-    "reference_checkpoint": FIELD_HELP_SURGERY_RUN["reference_checkpoint"],
-    "meta_json": "Path to surgery_meta.json; empty string disables merge.",
+    "model_key": FIELD_HELP_SURGERY["model_key"],
+    "reference_checkpoint": FIELD_HELP_SURGERY["reference_checkpoint"],
     "distill_weight": "Mixing weight for teacher matching vs hard-label CE.",
-    "surgery_dtype": FIELD_HELP_SURGERY_RUN["surgery_dtype"],
+    "surgery_dtype": FIELD_HELP_SURGERY["surgery_dtype"],
 }
 
 CLI_JEFFREYS_DESCRIPTION = "Model-adapter CE + Jeffreys teacher matching"
-CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/jeffreys_default.json"
+CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/64_fast_jeffreys.json"
 CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
