@@ -247,7 +247,7 @@ class DeiTTinySurgeryModel(nn.Module):
 
     @classmethod
     def from_surgery_run_config(cls, cfg: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
-        """Build from :class:`transformer_surgery.pet.SurgeryRunConfig` (or same fields)."""
+        """Build from :class:`transformer_surgery.cli.surgery_config.SurgeryRunConfig` (or same fields)."""
         return cls(
             num_classes=num_classes,
             top_k=int(cfg.top_k),

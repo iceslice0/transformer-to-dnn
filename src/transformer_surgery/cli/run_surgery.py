@@ -1,218 +1,79 @@
 #!/usr/bin/env python3
 """
-DeiT-Tiny surgery pipeline: load a Pet-pretrained timm checkpoint, transform, calibrate, save pre-finetune weights.
+Surgery pipeline: load an adapter reference checkpoint, transform, calibrate, save pre-finetune weights.
 
 This script does **not** run distillation or any finetuning: no teacher–student loss, no optimizer, no ``backward``.
-It only builds the surgery student from timm weights, runs **eval** accuracy/loss for reporting, and saves
+It only builds the surgery student from reference weights, runs **eval** accuracy/loss for reporting, and saves
 ``surgery_pre_ft.pt`` / ``surgery_meta.json``. (The output name means “before optional Jeffreys distillation,”
 not that this step finetunes.)
 
-Run ``python -m transformer_surgery.cli.pretrain_pet`` first for the Pet timm checkpoint.
-Defaults live in ``configs/surgery/topk64_fast.json``;
-CLI overrides optional. Bisect with ``disable_layernorm_replacement``, ``disable_attention_surgery``,
-``disable_softmax_replacement``, ``allow_matmul``. Then run
-``python -m transformer_surgery.cli.distill`` **separately**
-if you want Jeffreys distillation.
+The default adapter is ``deit_tiny_pet``; its reference checkpoint is produced by
+``python -m transformer_surgery.cli.pretrain_pet``. Other models can participate by registering an adapter
+and setting ``model_key`` in the config.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Dict
 
-import torch
 import torch.nn as nn
 
-from transformer_surgery.model import DeiTTinySurgeryModel, freeze_eps_parameters
-from transformer_surgery.pet import (
-    PET_NUM_CLASSES,
-    SurgeryRunConfig,
+from transformer_surgery.cli.surgery_config import SurgeryRunConfig, parse_surgery_run_config
+from transformer_surgery.model_adapters import get_model_adapter
+from transformer_surgery.pipeline import (
     accuracy_and_loss,
     apply_device_from_config,
     apply_dtype_from_config,
-    build_pet_loaders,
     describe_device,
     describe_dtype,
-    get_device,
-    load_timm_deit_pet_checkpoint,
-    parse_surgery_run_config,
-    pre_ft_checkpoint_extra,
-    save_deit_checkpoint,
-    surgery_meta_for_pre_ft,
+    save_model_checkpoint,
 )
 from transformer_surgery.ops import (
-    RewrittenLayerNorm,
     build_surgery_pwl_meta,
-    copy_ln_params_to_rewritten,
-    get_surgery_dtype,
-    jeffreys_distance_sparse_teacher,
-    jeffreys_naive_topk,
     write_model_structure_txt,
 )
 
 
-@torch.no_grad()
-def calibration_ln_and_softmax(
-    ref: nn.Module,
-    loader,
-    cfg: SurgeryRunConfig,
-) -> Dict[str, float]:
-    """
-    Read-only diagnostics for ``surgery_meta.json``: LN-rewrite MSE vs timm, and Jeffreys **metrics** comparing
-    dense vs sparse top-k softmax (not distillation training—no student model, no gradients).
-    """
-    device = get_device()
-    dt = get_surgery_dtype()
-    ref.eval()
-    stats: Dict[str, float] = {}
-    eps = float(cfg.eps)
-    top_k = int(cfg.top_k)
-    use_cuda = device.type == "cuda"
-    batch, _ = next(iter(loader))
-    batch = batch.to(device, dtype=dt, non_blocking=use_cuda)
-
-    b = batch.shape[0]
-    x = ref.patch_embed(batch)
-    x = torch.cat((ref.cls_token.expand(b, -1, -1), x), dim=1) + ref.pos_embed
-    x = ref.pos_drop(x)
-    h0 = x
-    y_ref0 = ref.blocks[0].norm1(h0)
-    rw0 = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-        device=device, dtype=dt
-    )
-    copy_ln_params_to_rewritten(rw0, ref.blocks[0].norm1)
-    y_rw0 = rw0(h0)
-    stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
-
-    h = x
-    mse_acc = 0.0
-    n_ln = 0
-    for blk in ref.blocks:
-        n1 = blk.norm1(h)
-        rw = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-            device=device, dtype=dt
-        )
-        copy_ln_params_to_rewritten(rw, blk.norm1)
-        mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
-        n_ln += 1
-        h = h + blk.attn(n1)
-        n2 = blk.norm2(h)
-        rw2 = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-            device=device, dtype=dt
-        )
-        copy_ln_params_to_rewritten(rw2, blk.norm2)
-        mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
-        n_ln += 1
-        h = h + blk.mlp(n2)
-    h_pre = h
-    h_out = ref.norm(h_pre)
-    rwf = RewrittenLayerNorm(ref.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-        device=device, dtype=dt
-    )
-    copy_ln_params_to_rewritten(rwf, ref.norm)
-    mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
-    n_ln += 1
-    stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
-
-    attn = ref.blocks[0].attn
-    qkv = attn.qkv(h0).reshape(b, h0.shape[1], 3, attn.num_heads, ref.embed_dim // attn.num_heads).permute(
-        2, 0, 3, 1, 4
-    )
-    q, k = qkv[0], qkv[1]
-    scores = (q @ k.transpose(-2, -1)) * float(attn.scale)
-    flat = scores.reshape(-1, scores.shape[-1])
-    R = min(flat.shape[0], 4096)
-    teacher = flat[:R].clone()
-    t = teacher - teacher.max(dim=-1, keepdim=True).values
-    nk = t.shape[-1]
-    k = min(top_k, nk)
-    vals, idx = torch.topk(t, k=k, dim=-1, largest=True, sorted=True)
-    j_gibbs = jeffreys_distance_sparse_teacher(teacher, vals, idx, nk, k).mean()
-    j_naive = jeffreys_naive_topk(teacher, vals, idx, nk, k).mean()
-    stats["jeffreys_gibbs_mean_cached"] = float(j_gibbs.cpu())
-    stats["jeffreys_naive_mean_cached"] = float(j_naive.cpu())
-    stats["jeffreys_improvement_naive_minus_gibbs_cached"] = float((j_naive - j_gibbs).cpu())
-
-    teacher2 = torch.randn(4096, nk, device=device, dtype=dt)
-    t2 = teacher2 - teacher2.max(dim=-1, keepdim=True).values
-    vals2, idx2 = torch.topk(t2, k=k, dim=-1, largest=True, sorted=True)
-    j_gibbs2 = jeffreys_distance_sparse_teacher(teacher2, vals2, idx2, nk, k).mean()
-    j_naive2 = jeffreys_naive_topk(teacher2, vals2, idx2, nk, k).mean()
-    stats["jeffreys_gibbs_mean_synthetic"] = float(j_gibbs2.cpu())
-    stats["jeffreys_naive_mean_synthetic"] = float(j_naive2.cpu())
-    stats["jeffreys_improvement_naive_minus_gibbs_synthetic"] = float((j_naive2 - j_gibbs2).cpu())
-
-    return stats
-
-
-def build_module_mapping(cfg: SurgeryRunConfig) -> Dict[str, str]:
-    if cfg.disable_layernorm_replacement:
-        ln = "nn.LayerNorm"
-    elif cfg.allow_matmul:
-        ln = "RewrittenLayerNorm(rsqrt·mul)"
-    else:
-        ln = "RewrittenLayerNorm(log/sqrt_exp)"
-    if cfg.disable_attention_surgery:
-        attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
-    else:
-        dot = "PairwiseDotBySquare(QK^T matmul)" if cfg.allow_matmul else "PairwiseDotBySquare(square identity)"
-        if cfg.disable_softmax_replacement:
-            attn = f"SurgeryAttention({dot}+full_softmax+dense@V)"
-        else:
-            mix = (
-                "SparseWeightedSumBySquare(elementwise p*v)"
-                if cfg.allow_matmul
-                else "SparseWeightedSumBySquare(square identity)"
-            )
-            attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax+{mix})"
-    m: Dict[str, str] = {}
-    for i in range(12):
-        m[f"blocks.{i}.norm1"] = ln
-        m[f"blocks.{i}.attn"] = attn
-        m[f"blocks.{i}.norm2"] = ln
-        m[f"blocks.{i}.mlp.act"] = "GELUUnaryPWL"
-    m["fc_norm"] = ln
-    return m
-
-
 def main() -> None:
     cfg = parse_surgery_run_config()
+    adapter = get_model_adapter(cfg)
 
     device = apply_device_from_config(cfg)
     dtype = apply_dtype_from_config(cfg)
 
-    pet_ref_path = os.path.abspath(cfg.pet_ref_checkpoint)
-    if not os.path.isfile(pet_ref_path):
+    reference_path = adapter.reference_checkpoint_path(cfg)
+    if not os.path.isfile(reference_path):
+        hint = f"\nRun first: {adapter.pretrain_command}" if adapter.pretrain_command else ""
         raise SystemExit(
-            f"Missing pet reference checkpoint: {pet_ref_path}\n"
-            "Run first: python -m transformer_surgery.cli.pretrain_pet"
+            f"Missing reference checkpoint for model adapter {adapter.key!r}: {reference_path}{hint}"
         )
 
     print(f"Using device: {describe_device(device)}", flush=True)
     print(f"Using surgery dtype: {describe_dtype(dtype)}", flush=True)
+    print(f"Using model adapter: {adapter.key}", flush=True)
     if cfg.config_json_path:
         print(f"config_json={cfg.config_json_path}", flush=True)
 
-    _, val_loader = build_pet_loaders(cfg)
+    _, val_loader = adapter.build_loaders(cfg)
 
-    print(f"Loading timm reference from {pet_ref_path} ...", flush=True)
-    ref = load_timm_deit_pet_checkpoint(pet_ref_path)
+    print(f"Loading reference from {reference_path} ...", flush=True)
+    ref = adapter.load_reference_checkpoint(reference_path)
     ref = ref.to(device=device, dtype=dtype)
     log_dir = os.path.abspath(cfg.log_dir)
     write_model_structure_txt(
         os.path.join(log_dir, "model_before_surgery.txt"),
         ref,
-        "Timm DeiT-Tiny (Pet reference, before surgery transform)",
+        adapter.reference_log_title,
     )
     print(f"wrote {os.path.join(log_dir, 'model_before_surgery.txt')}", flush=True)
 
     criterion = nn.CrossEntropyLoss()
     ref.eval()
     ref_acc, ref_loss = accuracy_and_loss(ref, val_loader, criterion)
-    print(f"Reference timm (Pet) val acc={ref_acc:.4f} loss={ref_loss:.4f}")
+    print(f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f}")
 
-    cal = calibration_ln_and_softmax(ref, val_loader, cfg)
+    cal = adapter.calibrate_reference(ref, val_loader, cfg)
     print("Calibration:", json.dumps(cal, indent=2))
 
     print("Building surgery model...", flush=True)
@@ -222,17 +83,15 @@ def main() -> None:
         f"disable_softmax_replacement={cfg.disable_softmax_replacement}  allow_matmul={cfg.allow_matmul}",
         flush=True,
     )
-    model = DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES).to(
-        device=device, dtype=dtype
-    )
-    mapping = model.load_from_timm(ref)
-    freeze_eps_parameters(model)
+    model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
+    mapping = adapter.copy_reference_weights(model, ref)
+    adapter.freeze_surgery_parameters(model)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
 
     write_model_structure_txt(
         os.path.join(log_dir, "model_after_surgery.txt"),
         model,
-        "DeiTTinySurgeryModel (after surgery, pre-finetune checkpoint)",
+        adapter.surgery_log_title,
     )
     print(f"wrote {os.path.join(log_dir, 'model_after_surgery.txt')}", flush=True)
 
@@ -240,11 +99,11 @@ def main() -> None:
     print(f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f}")
 
     pwl_meta = build_surgery_pwl_meta()
-    mod_map = build_module_mapping(cfg)
-    meta = surgery_meta_for_pre_ft(
+    mod_map = adapter.build_module_mapping(cfg, model)
+    meta = adapter.build_surgery_meta(
         cfg,
         calibration=cal,
-        pet_ref_checkpoint_abs=pet_ref_path,
+        reference_checkpoint_abs=reference_path,
         pwl=pwl_meta,
         module_mapping=mod_map,
     )
@@ -258,10 +117,10 @@ def main() -> None:
 
     pre_path = os.path.abspath(cfg.pre_ft_checkpoint)
     os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
-    save_deit_checkpoint(
+    save_model_checkpoint(
         pre_path,
         model,
-        extra=pre_ft_checkpoint_extra(cfg, mapping=mapping),
+        extra=adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping),
     )
     print(f"Wrote {pre_path} and {meta_path}")
     print("Next: python -m transformer_surgery.cli.distill", flush=True)

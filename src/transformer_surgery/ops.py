@@ -798,6 +798,7 @@ def write_model_structure_txt(
 
 @dataclass
 class SurgeryMeta:
+    model_key: str = "deit_tiny_pet"
     patient: str = "DeiT-Tiny"
     dataset: str = "Oxford-IIIT Pet"
     eps: float = 1e-5
@@ -806,6 +807,7 @@ class SurgeryMeta:
     pwl: Dict[str, Any] = field(default_factory=dict)
     calibration: Dict[str, float] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
+    reference_checkpoint: str = ""
     pet_ref_checkpoint: str = ""
     allow_matmul: bool = False
 
@@ -813,6 +815,7 @@ class SurgeryMeta:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
                 {
+                    "model_key": self.model_key,
                     "patient": self.patient,
                     "dataset": self.dataset,
                     "eps": self.eps,
@@ -822,6 +825,7 @@ class SurgeryMeta:
                     "calibration": self.calibration,
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,
                     "module_mapping": self.module_mapping,
+                    "reference_checkpoint": self.reference_checkpoint,
                     "pet_ref_checkpoint": self.pet_ref_checkpoint,
                     "allow_matmul": self.allow_matmul,
                 },

@@ -1,4 +1,5 @@
 {
+  "model_key": "deit_tiny_pet",
   "data_dir": "./data",
   "fp_checkpoint": "artifacts/checkpoints/surgery_pre_ft.pt",
   "output": "artifacts/checkpoints/surgery_ptq.pt",

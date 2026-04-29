@@ -12,24 +12,30 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackageSmokeTests(unittest.TestCase):
     def test_imports(self) -> None:
         import transformer_surgery
-        from transformer_surgery import model, ops, pet, ptq
+        from transformer_surgery import model, model_adapters, ops, pet, pipeline, ptq
 
         self.assertTrue(transformer_surgery.__all__)
         self.assertTrue(hasattr(model, "DeiTTinySurgeryModel"))
+        self.assertEqual(model_adapters.get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
         self.assertTrue(hasattr(ops, "AffineContract"))
         self.assertTrue(hasattr(pet, "PretrainPetConfig"))
+        self.assertTrue(hasattr(pipeline, "parse_cli_config"))
         self.assertTrue(hasattr(ptq, "PTQSurgeryConfig"))
 
     def test_configs_load(self) -> None:
-        from transformer_surgery.pet import (
+        from transformer_surgery.cli.distill_config import (
             CLI_JEFFREYS_CONFIG_DEFAULT,
-            CLI_PRETRAIN_CONFIG_DEFAULT,
-            CLI_SURGERY_RUN_CONFIG_DEFAULT,
             JeffreysDistillConfig,
+        )
+        from transformer_surgery.cli.pretrain_config import (
+            CLI_PRETRAIN_CONFIG_DEFAULT,
             PretrainPetConfig,
+        )
+        from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
+        from transformer_surgery.cli.surgery_config import (
+            CLI_SURGERY_RUN_CONFIG_DEFAULT,
             SurgeryRunConfig,
         )
-        from transformer_surgery.ptq import PTQSurgeryConfig
 
         defaults = [
             CLI_PRETRAIN_CONFIG_DEFAULT,

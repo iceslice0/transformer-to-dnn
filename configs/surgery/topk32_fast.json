@@ -1,10 +1,11 @@
 {
+  "model_key": "deit_tiny_pet",
   "data_dir": "./data",
   "batch_size": 32,
   "workers": 2,
   "top_k": 32,
   "eps": 1e-3,
-  "pet_ref_checkpoint": "artifacts/checkpoints/pet_timm_deit_tiny.pt",
+  "reference_checkpoint": "artifacts/checkpoints/pet_timm_deit_tiny.pt",
   "device": "cuda",
   "surgery_dtype": "float16",
   "disable_layernorm_replacement": false,

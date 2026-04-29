@@ -1,7 +1,7 @@
 
 What this project is trying to do
 
-Take a pretrained DeiT-Tiny model and rewrite it into a graph that uses
+Take a pretrained classifier model and rewrite it into a graph that uses
 only three kinds of things:
 
 1. affine nodes (including fixed-coefficient ``einsum`` contracts and standard ``Linear`` / ``Conv``)
@@ -17,13 +17,13 @@ What the output of the work should be
 
 You should produce:
 
-- a transformed DeiT-Tiny model definition in Python (``src/transformer_surgery/model.py``)
+- a transformed model definition in Python (the included adapter uses ``src/transformer_surgery/model.py``)
 - scripts that perform surgery, optional distillation fine-tuning, and optional PTQ
 - a checkpoint after surgery, before fine-tuning
 - a checkpoint after short fine-tuning (optional pipeline step)
 - metadata describing the surgery choices and validation results
 
-Use exactly one patient and one dataset
+Default patient and dataset
 
 Patient:
 - DeiT-Tiny from timm, pretrained
@@ -31,7 +31,8 @@ Patient:
 Dataset:
 - Oxford-IIIT Pet classification
 
-Do not add extra models or datasets at this stage.
+Surgery, distillation, and PTQ are adapter-driven. Extra models or datasets should be added by
+registering a model adapter rather than by adding model-specific branches to those processing CLIs.
 
 Allowed graph basis after surgery
 

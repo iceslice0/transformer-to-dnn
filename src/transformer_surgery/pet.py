@@ -42,8 +42,6 @@ from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
 from transformer_surgery.ops import (
-    CALIBRATION_LEGEND_TEXT,
-    SurgeryMeta,
     get_surgery_dtype,
     jeffreys_divergence_dense,
     set_surgery_dtype,
@@ -938,334 +936,50 @@ def distill_surgery_from_teacher_jeffreys(
     return acc_f, ce_f, j_f, best_i
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint I/O (shared by surgery run + distillation)
-# ---------------------------------------------------------------------------
-
-
-def save_deit_checkpoint(path: str, model: nn.Module, extra: Optional[Dict[str, Any]] = None) -> None:
-    """Save ``{model_state_dict, extra}`` in the same format as legacy ``save_surgery_checkpoint``."""
-    torch.save({"model_state_dict": model.state_dict(), "extra": extra or {}}, path)
-
-
-def merge_post_distill_into_surgery_meta(
-    meta_path: str,
-    val_acc: float,
-    val_ce: float,
-    val_jeffreys: float,
-) -> None:
-    """Merge post-distill metrics into ``surgery_meta.json`` (create stub if missing)."""
-    if os.path.isfile(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            raw = json.load(f)
-    else:
-        raw = {
-            "patient": "DeiT-Tiny",
-            "dataset": "Oxford-IIIT Pet",
-            "calibration": {},
-            "pwl": {
-                "note": "No surgery run meta on disk; run python -m transformer_surgery.cli.run_surgery for GELU PWL knot_positions.",
-            },
-            "meta_note": "Stub created before distill (no prior surgery_meta at this path).",
-        }
-    cal = raw.get("calibration") or {}
-    cal["student_post_distill_val_acc"] = float(val_acc)
-    cal["student_post_distill_mean_ce"] = float(val_ce)
-    cal["student_post_distill_mean_jeffreys"] = float(val_jeffreys)
-    cal["val_acc_post_ft"] = float(val_acc)
-    cal["val_ce_post_ft"] = float(val_ce)
-    cal["val_jeffreys_post_ft"] = float(val_jeffreys)
-    cal.pop("val_loss_post_ft", None)
-    raw["calibration"] = cal
-    raw["calibration_legend"] = CALIBRATION_LEGEND_TEXT
-    os.makedirs(os.path.dirname(os.path.abspath(meta_path)) or ".", exist_ok=True)
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
-
-
-@dataclass
-class PretrainPetConfig:
-    """Pet classifier head training on timm DeiT-Tiny; JSON + CLI via :meth:`load`."""
-
-    data_dir: str = "./data"
-    output: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
-    epochs: int = 50
-    batch_size: int = 128
-    workers: int = 2
-    lr: float = 1e-3
-    weight_decay: float = 0.05
-    warmup_epochs: int = 5
-    grad_clip: float = 1.0
-    label_smoothing: float = 0.05
-    seed: int = 42
-    max_train_batches: Optional[int] = None
-    device: str = "cuda"
-    cosine_eta_min: float = 1e-6
-    gap_th: Optional[float] = None
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing_prob: float = 0.0
-    config_json_path: Optional[str] = None
-
-    @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "PretrainPetConfig":
-        """Defaults merged with required JSON file, then ``overrides``; sets ``config_json_path``."""
-        return load_dataclass_from_json(cls, json_path, overrides)
-
-
-FIELD_HELP_PRETRAIN: Dict[str, str] = {
-    "gap_th": (
-        "During training: after each epoch, if val acc is more than this far below the best-so-far "
-        "val acc, restore model weights to that best checkpoint only (optimizer state unchanged)."
-    ),
-}
-
-
-def pretrain_train_config_record(
-    cfg: PretrainPetConfig,
-    *,
-    output_abs: str,
-    best_val_epoch: Optional[int] = None,
-    best_acc_reference: Optional[float] = None,
-    gap_revert_count: int = 0,
-) -> Dict[str, Any]:
-    """JSON-serializable ``train_config`` block for the Pet head checkpoint."""
-    rec: Dict[str, Any] = {
-        "data_dir": cfg.data_dir,
-        "output": output_abs,
-        "epochs": cfg.epochs,
-        "lr": cfg.lr,
-        "weight_decay": cfg.weight_decay,
-        "batch_size": cfg.batch_size,
-        "warmup_epochs": cfg.warmup_epochs,
-        "grad_clip": cfg.grad_clip,
-        "label_smoothing": cfg.label_smoothing,
-        "seed": cfg.seed,
-        "workers": cfg.workers,
-        "device": cfg.device,
-        "cosine_eta_min": cfg.cosine_eta_min,
-    }
-    if cfg.config_json_path:
-        rec["config_json"] = cfg.config_json_path
-    if cfg.max_train_batches is not None:
-        rec["max_train_batches"] = cfg.max_train_batches
-    if best_val_epoch is not None:
-        rec["best_val_epoch"] = best_val_epoch
-    if cfg.gap_th is not None:
-        rec["gap_th"] = float(cfg.gap_th)
-    if best_acc_reference is not None:
-        rec["best_acc_reference"] = best_acc_reference
-    if gap_revert_count > 0:
-        rec["gap_revert_count"] = gap_revert_count
-    return rec
-
-
-@dataclass
-class SurgeryRunConfig:
-    """Surgery transform + calibration run; JSON + CLI via :meth:`load`."""
-
-    data_dir: str = "./data"
-    batch_size: int = 128
-    workers: int = 2
-    top_k: int = 32
-    eps: float = 1e-5
-    pet_ref_checkpoint: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
-    device: str = "cuda"
-    surgery_dtype: str = "bfloat16"
-    disable_layernorm_replacement: bool = False
-    disable_attention_surgery: bool = False
-    disable_softmax_replacement: bool = False
-    allow_matmul: bool = False
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing_prob: float = 0.0
-    meta_json: str = "artifacts/metadata/surgery_meta.json"
-    pre_ft_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
-    log_dir: str = "artifacts/logs"
-    config_json_path: Optional[str] = None
-
-    @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "SurgeryRunConfig":
-        """Defaults merged with required JSON file, then ``overrides``; sets ``config_json_path``."""
-        return load_dataclass_from_json(cls, json_path, overrides)
-
-
-FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
-    "disable_layernorm_replacement": (
-        "Debug: use nn.LayerNorm instead of RewrittenLayerNorm (isolates LN PWL path)."
-    ),
-    "disable_attention_surgery": (
-        "Debug: timm-like attention (scaled QK^T, full softmax, dense @ V); no PairwiseDotBySquare."
-    ),
-    "disable_softmax_replacement": (
-        "Debug: when attention surgery is on, full softmax @ V instead of Gibbs top-k + sparse mix."
-    ),
-    "allow_matmul": (
-        "Debug: fast paths — attention: matmul QK and elementwise p*v sparse mix; "
-        "RewrittenLayerNorm: z=u*rsqrt(r2+eps) instead of log/sqrt_exp+out_contract (not identical numerically)."
-    ),
-    "surgery_dtype": (
-        "``torch.<name>`` compute dtype (e.g. bfloat16, float32). Default bfloat16; "
-        "set via apply_dtype_from_config like device."
-    ),
-    "log_dir": "Directory for model structure dumps.",
-}
-
-
-def surgery_meta_for_pre_ft(
-    cfg: SurgeryRunConfig,
-    *,
-    calibration: Dict[str, float],
-    pet_ref_checkpoint_abs: str,
-    pwl: Dict[str, Any],
-    module_mapping: Dict[str, str],
-) -> SurgeryMeta:
-    """Build :class:`transformer_surgery.ops.SurgeryMeta` for the pre-Jeffreys surgery run."""
-    return SurgeryMeta(
-        eps=float(cfg.eps),
-        top_k=int(cfg.top_k),
-        surgery_dtype=str(cfg.surgery_dtype),
-        pwl=pwl,
-        calibration=dict(calibration),
-        module_mapping=module_mapping,
-        pet_ref_checkpoint=pet_ref_checkpoint_abs,
-        allow_matmul=cfg.allow_matmul,
-    )
-
-
-def pre_ft_checkpoint_extra(
-    cfg: SurgeryRunConfig,
-    *,
-    mapping: Dict[str, Any],
-) -> Dict[str, Any]:
-    """``extra`` dict for :func:`save_deit_checkpoint` after surgery transform."""
-    return {
-        "meta_ref": os.path.basename(cfg.meta_json),
-        "mapping": mapping,
-        "top_k": int(cfg.top_k),
-        "eps_ln": float(cfg.eps),
-        "config_json": cfg.config_json_path,
-        "disable_layernorm_replacement": cfg.disable_layernorm_replacement,
-        "disable_attention_surgery": cfg.disable_attention_surgery,
-        "disable_softmax_replacement": cfg.disable_softmax_replacement,
-        "allow_matmul": cfg.allow_matmul,
-        "surgery_dtype": str(cfg.surgery_dtype),
-    }
-
-
-@dataclass
-class JeffreysDistillConfig:
-    """Single container for Jeffreys distillation (JSON file + optional CLI overrides)."""
-
-    data_dir: str = "./data"
-    epochs: int = 2
-    batch_size: int = 128
-    workers: int = 2
-    lr: float = 5e-4
-    weight_decay: float = 0.05
-    warmup_epochs: Optional[int] = None
-    grad_clip: float = 1.0
-    cosine_eta_min: float = 0.0
-    temperature: float = 1.0
-    distill_weight: float = 0.5
-    max_train_batches: Optional[int] = None
-    keep_best: bool = True
-    pet_ref_checkpoint: str = "artifacts/checkpoints/pet_timm_deit_tiny.pt"
-    pre_checkpoint: str = "artifacts/checkpoints/surgery_pre_ft.pt"
-    output: str = "artifacts/checkpoints/surgery_post_ft.pt"
-    meta_json: Optional[str] = "artifacts/metadata/surgery_meta.json"
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing: float = 0.0
-    device: str = "cuda"
-    surgery_dtype: str = "bfloat16"
-    train_progress_interval: int = 10
-    val_progress_batches: int = 20
-    top_k: Optional[int] = None
-    eps: Optional[float] = None
-    config_json_path: Optional[str] = None
-    quiet: bool = False
-
-    @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "JeffreysDistillConfig":
-        """Defaults merged with required JSON file, then ``overrides`` (e.g. CLI). Sets ``config_json_path``."""
-        cfg = load_dataclass_from_json(cls, json_path, overrides)
-        mj = cfg.meta_json
-        if mj is not None and isinstance(mj, str) and not mj.strip():
-            cfg = replace(cfg, meta_json=None)
-        return cfg
-
-
-def load_surgery_student_checkpoint(
-    path: str,
-    cfg: JeffreysDistillConfig,
-) -> Tuple[Any, Dict[str, Any]]:
-    """
-    Load a surgery DeiT student from ``surgery_pre_ft.pt`` (or compatible) for distillation / eval.
-    Checkpoint ``extra`` must list all architecture fields (see ``pre_ft_checkpoint_extra``).
-    ``cfg`` may override ``top_k`` / ``eps`` when set. Runtime dtype comes from checkpoint metadata
-    when present; ``cfg.surgery_dtype`` is only a fallback for older checkpoints without that field.
-    """
-    from transformer_surgery.model import DeiTTinySurgeryModel, freeze_eps_parameters
-
-    device = get_device()
-    try:
-        payload = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location=device)
-    ex = dict(payload["extra"])
-    if cfg.top_k is not None:
-        ex["top_k"] = int(cfg.top_k)
-    if cfg.eps is not None:
-        ex["eps_ln"] = float(cfg.eps)
-    dtype_name = str(ex.get("surgery_dtype", getattr(cfg, "surgery_dtype", "bfloat16"))).strip()
-    runtime_dtype = getattr(torch, dtype_name)
-    set_surgery_dtype(runtime_dtype)
-    ex["surgery_dtype"] = describe_dtype(runtime_dtype)
-    model = DeiTTinySurgeryModel.from_pretrained_extra(ex, num_classes=PET_NUM_CLASSES).to(
-        device=device, dtype=get_surgery_dtype()
-    )
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    freeze_eps_parameters(model)
-    return model, ex
-
-
-FIELD_HELP_JEFFREYS: Dict[str, str] = {
-    "meta_json": "Path to surgery_meta.json; empty string disables merge.",
-    "quiet": "Less pipeline logging.",
-    "distill_weight": "Mixing weight for teacher matching vs hard-label CE (0 = pure CE, 1 = pure distill).",
-    "surgery_dtype": FIELD_HELP_SURGERY_RUN["surgery_dtype"],
-}
-
-# Default ``--config`` paths and parser descriptions (single source for all three CLIs).
-CLI_PRETRAIN_DESCRIPTION = "Pet head training on timm DeiT-Tiny"
-CLI_PRETRAIN_CONFIG_DEFAULT = "configs/pretrain/pet_deit_tiny.json"
-CLI_SURGERY_RUN_DESCRIPTION = (
-    "DeiT-Tiny surgery: timm Pet checkpoint → surgery student + surgery_meta.json"
+# Backward-compatible aliases for generic runtime and processing helpers.
+#
+# Pretraining remains the concrete Pet/DeiT recipe in this module. Surgery, distillation, and PTQ
+# use the adapter-aware implementations from ``pipeline`` / ``model_adapters``; the aliases keep
+# existing imports from ``transformer_surgery.pet`` working.
+from transformer_surgery.cli.distill_config import (
+    CLI_JEFFREYS_CONFIG_DEFAULT as CLI_JEFFREYS_CONFIG_DEFAULT,
+    CLI_JEFFREYS_CONFIG_HELP as CLI_JEFFREYS_CONFIG_HELP,
+    CLI_JEFFREYS_DESCRIPTION as CLI_JEFFREYS_DESCRIPTION,
+    FIELD_HELP_JEFFREYS as FIELD_HELP_JEFFREYS,
+    JeffreysDistillConfig as JeffreysDistillConfig,
 )
-CLI_SURGERY_RUN_CONFIG_DEFAULT = "configs/surgery/topk64_fast.json"
-CLI_JEFFREYS_DESCRIPTION = "Mixed CE + teacher matching: timm teacher → surgery student"
-CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/jeffreys_default.json"
-CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
-
-
-def parse_pretrain_pet_config(argv: Optional[Sequence[str]] = None) -> PretrainPetConfig:
-    """Parse argv (default ``sys.argv``) into a merged :class:`PretrainPetConfig`."""
-    return parse_cli_config(
-        PretrainPetConfig,
-        description=CLI_PRETRAIN_DESCRIPTION,
-        config_default=CLI_PRETRAIN_CONFIG_DEFAULT,
-        field_help=FIELD_HELP_PRETRAIN,
-        argv=argv,
-    )
-
-
-def parse_surgery_run_config(argv: Optional[Sequence[str]] = None) -> SurgeryRunConfig:
-    """Parse argv into a merged :class:`SurgeryRunConfig`."""
-    return parse_cli_config(
-        SurgeryRunConfig,
-        description=CLI_SURGERY_RUN_DESCRIPTION,
-        config_default=CLI_SURGERY_RUN_CONFIG_DEFAULT,
-        field_help=FIELD_HELP_SURGERY_RUN,
-        argv=argv,
-    )
+from transformer_surgery.cli.pretrain_config import (
+    CLI_PRETRAIN_CONFIG_DEFAULT as CLI_PRETRAIN_CONFIG_DEFAULT,
+    CLI_PRETRAIN_DESCRIPTION as CLI_PRETRAIN_DESCRIPTION,
+    FIELD_HELP_PRETRAIN as FIELD_HELP_PRETRAIN,
+    PretrainPetConfig as PretrainPetConfig,
+    parse_pretrain_pet_config as parse_pretrain_pet_config,
+    pretrain_train_config_record as pretrain_train_config_record,
+)
+from transformer_surgery.cli.surgery_config import (
+    CLI_SURGERY_RUN_CONFIG_DEFAULT as CLI_SURGERY_RUN_CONFIG_DEFAULT,
+    CLI_SURGERY_RUN_DESCRIPTION as CLI_SURGERY_RUN_DESCRIPTION,
+    FIELD_HELP_SURGERY_RUN as FIELD_HELP_SURGERY_RUN,
+    SurgeryRunConfig as SurgeryRunConfig,
+    parse_surgery_run_config as parse_surgery_run_config,
+)
+from transformer_surgery.model_adapters import load_surgery_student_checkpoint as load_surgery_student_checkpoint
+from transformer_surgery.pipeline import (
+    accuracy_and_loss as accuracy_and_loss,
+    add_dataclass_cli_args as add_dataclass_cli_args,
+    apply_device_from_config as apply_device_from_config,
+    apply_dtype_from_config as apply_dtype_from_config,
+    build_config_cli_parser as build_config_cli_parser,
+    cli_overrides_from_namespace as cli_overrides_from_namespace,
+    describe_device as describe_device,
+    describe_dtype as describe_dtype,
+    distill_student_from_teacher_jeffreys as distill_surgery_from_teacher_jeffreys,
+    eval_distillation_metrics as eval_distillation_metrics,
+    get_device as get_device,
+    load_dataclass_from_json as load_dataclass_from_json,
+    merge_post_distill_into_surgery_meta as merge_post_distill_into_surgery_meta,
+    parse_cli_config as parse_cli_config,
+    save_model_checkpoint as save_deit_checkpoint,
+    set_default_device as set_default_device,
+    set_seed as set_seed,
+)

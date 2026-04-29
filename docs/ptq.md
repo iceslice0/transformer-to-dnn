@@ -2,7 +2,7 @@ LEAN CUT-PASTE AGENT PLAN FOR STANDALONE PTQ SCRIPT
 
 Goal
 
-Create one standalone Python + PyTorch script that performs PTQ on a selected subset of affine nodes in an already surged fp model.
+Create one standalone Python + PyTorch script that performs PTQ on a selected subset of affine nodes in an already surged fp model. Model-specific reconstruction and validation loaders come from the configured model adapter.
 
 The script should:
 
@@ -59,7 +59,7 @@ Affine/Matmul nodes means explicit modules of the form:
 High-level flow
 
 Step 1
-Load fp model definition and checkpoint.
+Load fp model definition and checkpoint through the model adapter recorded in the checkpoint or selected by config.
 
 Step 2
 Select affine/matmul nodes to calibrate/wrap.

@@ -11,7 +11,7 @@ Requires-Dist: torchmetrics>=1.0.0
 
 # Transformer Surgery Demo
 
-This repository contains demo code for rewriting a timm DeiT-Tiny classifier into an explicit "surgery" graph on Oxford-IIIT Pet, with optional Jeffreys distillation and post-training quantization.
+This repository contains demo code for rewriting a classifier into an explicit "surgery" graph, with optional Jeffreys distillation and post-training quantization. The included model adapter is timm DeiT-Tiny on Oxford-IIIT Pet.
 
 ## Install
 
@@ -35,6 +35,8 @@ python -m transformer_surgery.cli.distill
 python -m transformer_surgery.cli.ptq
 ```
 
+`pretrain_pet` is the concrete DeiT-Tiny/Pet pretraining step. The later `run_surgery`, `distill`, and `ptq` stages go through a model adapter (`model_key`, default `deit_tiny_pet`) so those processing stages do not need Pet- or DeiT-specific code.
+
 Equivalent console scripts are available after `pip install -e .`:
 
 ```bash
@@ -55,6 +57,7 @@ Default configs live under `configs/`:
 - `configs/ptq/*.json`: PTQ variants for full, linear-only, no-matmul, and per-tensor quantization.
 
 Pass a different config with `--config path/to/config.json`. CLI flags override JSON fields where supported.
+For adapter-based stages, `reference_checkpoint` is the generic teacher/reference checkpoint field; legacy configs may still use `pet_ref_checkpoint`.
 
 ## Artifacts
 

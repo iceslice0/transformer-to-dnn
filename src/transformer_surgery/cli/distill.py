@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-CLI for mixed CE + teacher matching fine-tuning of the surgery student. Config:
-:class:`transformer_surgery.pet.JeffreysDistillConfig`;
-training loop: :func:`transformer_surgery.pet.distill_surgery_from_teacher_jeffreys`.
-"""
+"""CLI for model-adapter mixed CE + teacher matching fine-tuning of a surgery student."""
 
 from __future__ import annotations
 
@@ -12,25 +8,25 @@ from typing import Optional
 
 from transformer_surgery.ops import get_surgery_dtype
 
-from transformer_surgery.pet import (
+from transformer_surgery.cli.distill_config import (
     CLI_JEFFREYS_CONFIG_DEFAULT,
     CLI_JEFFREYS_CONFIG_HELP,
     CLI_JEFFREYS_DESCRIPTION,
     FIELD_HELP_JEFFREYS,
     JeffreysDistillConfig,
+)
+from transformer_surgery.model_adapters import get_model_adapter, load_surgery_student_checkpoint
+from transformer_surgery.pipeline import (
     apply_device_from_config,
     apply_dtype_from_config,
     build_config_cli_parser,
-    build_pet_loaders,
     cli_overrides_from_namespace,
     describe_device,
     describe_dtype,
-    distill_surgery_from_teacher_jeffreys,
+    distill_student_from_teacher_jeffreys,
     get_device,
-    load_surgery_student_checkpoint,
-    load_timm_deit_pet_checkpoint,
     merge_post_distill_into_surgery_meta,
-    save_deit_checkpoint,
+    save_model_checkpoint,
 )
 
 
@@ -44,12 +40,13 @@ def require_pre_student_checkpoint_path(c: JeffreysDistillConfig) -> str:
     return p
 
 
-def require_pet_teacher_checkpoint_path(c: JeffreysDistillConfig) -> str:
-    """Absolute path to Pet timm teacher checkpoint; raises if missing."""
-    p = os.path.abspath(c.pet_ref_checkpoint)
+def require_reference_checkpoint_path(c: JeffreysDistillConfig, adapter) -> str:
+    """Absolute path to the adapter reference checkpoint; raises if missing."""
+    p = adapter.reference_checkpoint_path(c)
     if not os.path.isfile(p):
+        hint = f" (run {adapter.pretrain_command} first)" if adapter.pretrain_command else ""
         raise FileNotFoundError(
-            f"Missing teacher checkpoint: {p} (run python -m transformer_surgery.cli.pretrain_pet first)"
+            f"Missing teacher checkpoint for model adapter {adapter.key!r}: {p}{hint}"
         )
     return p
 
@@ -65,11 +62,11 @@ def log_distill_device_and_config_json(c: JeffreysDistillConfig) -> None:
         print(f"config_json={c.config_json_path}", flush=True)
 
 
-def log_distill_session_line(c: JeffreysDistillConfig, pet_teacher_path: str) -> None:
+def log_distill_session_line(c: JeffreysDistillConfig, teacher_path: str) -> None:
     if c.quiet:
         return
     print(
-        f"fine-tune CE+distill | teacher={pet_teacher_path} mix={c.distill_weight} "
+        f"fine-tune CE+distill | teacher={teacher_path} mix={c.distill_weight} "
         f"epochs={c.epochs} lr={c.lr} wd={c.weight_decay} "
         f"train_progress_interval={c.train_progress_interval} val_progress_batches={c.val_progress_batches}",
         flush=True,
@@ -106,6 +103,7 @@ def log_wrote_meta_json(path: str, c: JeffreysDistillConfig) -> None:
 
 def merge_meta_after_distill_if_configured(
     c: JeffreysDistillConfig,
+    adapter,
     val_acc: float,
     val_ce: float,
     val_j: float,
@@ -113,7 +111,15 @@ def merge_meta_after_distill_if_configured(
     if not c.meta_json:
         return
     meta_out = os.path.abspath(str(c.meta_json).strip())
-    merge_post_distill_into_surgery_meta(meta_out, val_acc, val_ce, val_j)
+    merge_post_distill_into_surgery_meta(
+        meta_out,
+        val_acc,
+        val_ce,
+        val_j,
+        model_key=adapter.key,
+        patient=adapter.patient_name,
+        dataset=adapter.dataset_name,
+    )
     log_wrote_meta_json(meta_out, c)
 
 
@@ -133,17 +139,18 @@ def main() -> None:
     apply_device_from_config(c)
     apply_dtype_from_config(c)
     pre_path = require_pre_student_checkpoint_path(c)
-    pet_path = require_pet_teacher_checkpoint_path(c)
 
     student, student_extra = load_surgery_student_checkpoint(pre_path, c)
+    adapter = get_model_adapter(student_extra.get("model_key", getattr(c, "model_key", None)))
+    teacher_path = require_reference_checkpoint_path(c, adapter)
     log_distill_device_and_config_json(c)
-    teacher = load_timm_deit_pet_checkpoint(pet_path).to(
+    teacher = adapter.load_reference_checkpoint(teacher_path).to(
         device=get_device(), dtype=get_surgery_dtype()
     )
-    train_loader, val_loader = build_pet_loaders(c)
+    train_loader, val_loader = adapter.build_loaders(c)
 
-    log_distill_session_line(c, pet_path)
-    val_acc, val_ce, val_j, best_ep = distill_surgery_from_teacher_jeffreys(
+    log_distill_session_line(c, teacher_path)
+    val_acc, val_ce, val_j, best_ep = distill_student_from_teacher_jeffreys(
         student,
         teacher,
         train_loader,
@@ -158,9 +165,11 @@ def main() -> None:
     out_extra.update(
         {
             "distill": "mix_ce_jeffreys",
+            "model_key": adapter.key,
             "temperature": float(c.temperature),
             "distill_weight": float(c.distill_weight),
-            "teacher_checkpoint": pet_path,
+            "teacher_checkpoint": teacher_path,
+            "reference_checkpoint": teacher_path,
             "student_pre_checkpoint": pre_path,
             "val_acc": val_acc,
             "val_ce_mean": val_ce,
@@ -170,13 +179,13 @@ def main() -> None:
             "surgery_dtype": describe_dtype(get_surgery_dtype()),
         }
     )
-    save_deit_checkpoint(
+    save_model_checkpoint(
         out_abs,
         student,
         extra=out_extra,
     )
     log_wrote_checkpoint(out_abs, c)
-    merge_meta_after_distill_if_configured(c, val_acc, val_ce, val_j)
+    merge_meta_after_distill_if_configured(c, adapter, val_acc, val_ce, val_j)
 
 
 if __name__ == "__main__":

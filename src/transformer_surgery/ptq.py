@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone PTQ for a surgery DeiT-Tiny checkpoint.
+Standalone PTQ for a surgery checkpoint.
 
 The script:
 1. loads a floated surgery checkpoint,
@@ -14,7 +14,6 @@ The script:
 
 from __future__ import annotations
 
-import argparse
 import copy
 import json
 import os
@@ -25,17 +24,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformer_surgery.pet import (
-    PET_NUM_CLASSES,
+from transformer_surgery.cli.ptq_config import PTQSurgeryConfig, parse_ptq_config
+from transformer_surgery.model_adapters import get_model_adapter, load_surgery_student_checkpoint
+from transformer_surgery.pipeline import (
     apply_device_from_config,
     apply_dtype_from_config,
-    build_pet_loaders,
     describe_device,
     describe_dtype,
     get_device,
-    load_dataclass_from_json,
-    load_surgery_student_checkpoint,
-    save_deit_checkpoint,
+    save_model_checkpoint,
 )
 from transformer_surgery.ops import (
     AffineContract,
@@ -50,52 +47,6 @@ from transformer_surgery.ops import (
 )
 
 
-@dataclass
-class PTQSurgeryConfig:
-    data_dir: str = "./data"
-    fp_checkpoint: str = "artifacts/checkpoints/surgery_post_ft.pt"
-    output: str = "artifacts/checkpoints/surgery_ptq.pt"
-    meta_json: str = "artifacts/metadata/surgery_ptq_meta.json"
-    batch_size: int = 32
-    workers: int = 2
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing: float = 0.0
-    device: str = "cuda"
-    surgery_dtype: str = "bfloat16"
-    calibration_batches: int = 4
-    calibration_examples_per_node: int = 4
-    wrap_linear_conv: bool = True
-    wrap_affine: bool = False
-    wrap_matmul: bool = False
-    include_names: List[str] = field(default_factory=list)
-    exclude_names: List[str] = field(default_factory=list)
-    weight_bits: int = 8
-    activation_bits: int = 8
-    affine_activation_bits: Optional[int] = None
-    matmul_activation_bits: Optional[int] = None
-    # For ``Linear``/``Conv2d``: **True** = per-output-channel symmetric weight scales (axis 0);
-    # **False** = one global scale over the whole weight tensor (often destroys accuracy). Ignored for
-    # affine/unary/coeff (always one global weight scale) and for ``MatMul`` (no weights). Output
-    # ``out_scale``/``out_bias`` for Linear/Conv do not depend on this flag (analytical + residual bias).
-    per_output_channel: bool = True
-    top_k: Optional[int] = None
-    eps: Optional[float] = None
-    debug_node_stats: bool = True
-    quiet: bool = False
-    log_dir: str = "artifacts/logs"
-    config_json_path: Optional[str] = None
-    # Print effective quant policy + per-node table; set True or pass --quant-policy-debug.
-    quant_policy_debug: bool = False
-
-    @classmethod
-    def load(cls, json_path: str) -> "PTQSurgeryConfig":
-        cfg = load_dataclass_from_json(cls, json_path, overrides=None)
-        if not cfg.meta_json:
-            cfg.meta_json = "artifacts/metadata/surgery_ptq_meta.json"
-        return cfg
-
-
 SUPPORTED_LINEAR_CONV_TYPES = (nn.Linear, nn.Conv2d)
 SUPPORTED_AFFINE_TYPES = (
     UnaryScale,
@@ -105,26 +56,6 @@ SUPPORTED_AFFINE_TYPES = (
 )
 SUPPORTED_MATMUL_TYPES = (MatMul, MatMulHadamard)
 MATMUL_KINDS = {"matmul", "matmul_hadamard"}
-
-
-def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
-    parser = argparse.ArgumentParser(description="Standalone PTQ for surgery DeiT-Tiny checkpoints")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/ptq/full_8bit.json",
-        help="JSON config for PTQ wrapping and validation.",
-    )
-    parser.add_argument(
-        "--quant-policy-debug",
-        action="store_true",
-        help="Print per-node weight scale mode (per_output_channel applies to Linear/Conv2d weights only).",
-    )
-    args = parser.parse_args(argv)
-    cfg = PTQSurgeryConfig.load(args.config)
-    if args.quant_policy_debug:
-        cfg.quant_policy_debug = True
-    return cfg
 
 
 def _name_matches(name: str, patterns: Sequence[str]) -> bool:
@@ -831,11 +762,13 @@ def main() -> None:
         if cfg.config_json_path:
             print(f"config_json={cfg.config_json_path}", flush=True)
 
-    _train_loader, val_loader = build_pet_loaders(cfg)
     criterion = nn.CrossEntropyLoss()
 
     fp_model, fp_extra = load_surgery_student_checkpoint(fp_path, cfg)
+    adapter = get_model_adapter(fp_extra.get("model_key", getattr(cfg, "model_key", None)))
+    _train_loader, val_loader = adapter.build_loaders(cfg)
     if not cfg.quiet:
+        print(f"Using model adapter: {adapter.key}", flush=True)
         print(f"Loaded checkpoint dtype: {describe_dtype(get_surgery_dtype())}", flush=True)
     selected = _build_node_selection(fp_model, cfg)
     if not selected:
@@ -912,8 +845,8 @@ def main() -> None:
         "calibration_batches": int(cfg.calibration_batches),
         "calibration_examples_per_node": int(cfg.calibration_examples_per_node),
     }
-    write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped DeiT-Tiny Surgery Model")
-    save_deit_checkpoint(out_abs, wrapped_model, extra=out_extra)
+    write_model_structure_txt(model_log_abs, wrapped_model, adapter.ptq_log_title)
+    save_model_checkpoint(out_abs, wrapped_model, extra=out_extra)
     with open(meta_abs, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
