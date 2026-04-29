@@ -1,220 +1,250 @@
 # Surgery
 
-Take a pretrained classifier model and rewrite it into a graph that uses
-only three kinds of things:
+Surgery is the first stage of the pipeline. It loads a pretrained classifier through a model
+adapter, builds a surgery student in a restricted op vocabulary (affine + local unary + selection
+/routing), copies reference weights into the student, runs a calibration pass, and saves the
+pre-finetune checkpoint with metadata and model-structure logs.
 
-1. affine nodes (including fixed-coefficient ``einsum`` contracts and standard ``Linear`` / ``Conv``)
-2. local unary PWL epilogues (and exact unary ops like ``log``, ``exp``, ``sqrt`` where used)
-3. selection/routing ops
+The core code lives in [src/transformer_surgery/surgery.py](src/transformer_surgery/surgery.py)
+and the op vocabulary in [src/transformer_surgery/ops.py](src/transformer_surgery/ops.py). The CLI
+wrapper is `python -m transformer_surgery.cli.surgery` or `ts-surgery`.
 
-The rewritten model should stay close to the original model immediately
-after surgery, should be saved as a real PyTorch model and checkpoint,
-and should later be ready for quantization of affine nodes (PTQ tooling
-exists separately; QAT may follow).
+## Inputs
 
-What the output of the work should be
+- `reference_checkpoint`: pretrained teacher checkpoint, resolved through the model adapter.
+- `model_key`: adapter key, default `deit_tiny_pet`.
+- dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
+  `randaugment`, `ra_magnitude`, `random_erasing_prob`.
+- surgery shape fields: `top_k`, `eps`, `surgery_dtype`.
+- transform flags: `disable_layernorm_replacement`, `disable_attention_surgery`,
+  `disable_softmax_replacement`, `allow_matmul`.
+- output paths: `pre_ft_checkpoint`, `log_dir`.
 
-The surgery stage should produce:
+Surgery must not import model-specific code directly. It uses `get_model_adapter` so dataset
+loaders, reference loading, surgery-model construction, weight copy, and calibration diagnostics
+stay inside the adapter layer. Default adapter:
 
-- a transformed model definition in Python (the included adapter uses ``src/transformer_surgery/models/deit_tiny.py``)
-- a checkpoint after surgery, before fine-tuning
-- metadata describing the surgery choices and validation results
+- patient: DeiT-Tiny from timm, fine-tuned on Oxford-IIIT Pet.
+- dataset: Oxford-IIIT Pet classification (37 classes).
+- surgery model: `DeiTTinySurgeryModel` in
+  [src/transformer_surgery/models/deit_tiny.py](src/transformer_surgery/models/deit_tiny.py).
 
-Default patient and dataset
+Extra models or datasets are added by registering a new adapter, not by branching the surgery
+driver.
 
-Patient:
-- DeiT-Tiny from timm, pretrained
+## Op Vocabulary
 
-Dataset:
-- Oxford-IIIT Pet classification
+The surgery student is built only from explicit `nn.Module` classes in three groups. All names
+match exports from `transformer_surgery.ops`.
 
-Surgery is adapter-driven. Extra models or datasets should be added by registering a model adapter
-rather than by adding model-specific branches to the processing CLI.
+### Affine
 
-Allowed graph basis after surgery
+Everything linear, including parameterized layers, fixed-coefficient contractions, and linear
+unary reductions/scalings:
 
-After the rewrite, the strict graph uses explicit modules in ``src/transformer_surgery/ops.py`` and
-``src/transformer_surgery/models/deit_tiny.py``. Conceptually:
+- `nn.Linear`, `nn.Conv2d` (patch embed) — standard parameterized layers.
+- `AffineScaleBias` — per-channel `y = x * weight + bias`; carries LayerNorm `gamma`/`beta`.
+- `AffineContract(einsum_equation, coeffs)` — fixed coefficient contraction over operand or head
+  dims via `torch.einsum` on a registered `coeff` buffer. One graph node per logical affine.
+- `AffineFixedMix(einsum_equation, matrix)` — fixed 2×2 mix on the operand axis (default builds
+  plus/minus combinations for the square identity).
+- Linear unary reductions and scalings: `AffineMean`, `AffineSum`, `AffineScale`.
+- Variable bilinear ops (`allow_matmul` only): `AffineMatMul` (`torch.matmul(a, b)`) and
+  `AffineHadamard` (elementwise `a * b`). Both are linear in each operand separately and so
+  belong to the affine group; they are gated by `allow_matmul` and not registered on the
+  strict path.
 
-A. Affine and fixed-linear nodes
+Binary mixes (residual, positional embedding, centering, Gibbs intermediates) have no separate
+"add module". Callers route operands with `torch.broadcast_tensors` followed by
+`torch.stack(..., dim=-1)` and feed the result into `AffineContract("i,...i->...", [w0, w1])`.
+The graph shows an `AffineContract` child; the stack is plain tensor wiring in `forward`.
 
-- **Standard layers:** ``nn.Linear``, ``nn.Conv2d`` (patch embed).
-- **Per-channel scale+bias:** ``AffineScaleBias`` (LayerNorm ``gamma``/``beta`` in the rewrite).
-- **Fixed coefficient contraction:** ``AffineContract(einsum_equation, coeff)`` — one ``nn.Module``
-  per logical affine; ``torch.einsum`` over a registered ``coeff`` buffer.
-- **Fixed 2×2 mixes on an operand axis:** ``AffineFixedMix`` (used inside the square-identity chain
-  to form plus/minus combinations before ``UnarySquare``).
-- **Unary reductions / scalings:** ``UnaryMean``, ``UnarySum``, ``UnaryScale``, etc., implemented
-  as small ``nn.Module``s so they appear in ``named_modules``.
+### Nonlinear Unary
 
-**Binary mixes (residual, pos-embed, centering, Gibbs intermediates):** there is *no* separate
-“add module”. Callers use **routing only** — ``torch.broadcast_tensors`` then
-``torch.stack(..., dim=-1)`` — and pass the result into ``AffineContract("i,...i->...", [w0, w1])``.
-The graph shows an ``AffineContract`` child; the stack is plain tensor wiring in ``forward``.
+Strictly nonlinear scalar maps:
 
-B. Local unary nonlinearities
+- Exact unaries: `NLSquare`, `NLExp`, `NLLogPlusEps`, `NLSqrtExp`,
+  `NLRsqrtPlusEps`, `NLReciprocalPlusEps`.
+- Trainable PWL: `NLScalarPWL` (learnable knot values, fixed knot positions);
+  `NLGELU` wraps it with default knots on `linspace(-4, 4, PWL_NUM_KNOTS)` initialized to
+  `F.gelu(knots)`.
 
-- **Scalar PWL:** ``UnaryScalarPWL``, ``GELUUnaryPWL`` (trainable knot values where applicable).
-- **Exact unaries used in strict paths:** ``UnaryLogPlusEps``, ``UnaryExp``, ``UnarySqrtExp``,
-  ``UnarySquare``, ``UnaryRsqrtPlusEps``, ``UnaryReciprocalPlusEps``, etc., as documented on each class.
+`NLLogPlusEps`, `NLRsqrtPlusEps`, and `NLReciprocalPlusEps` carry a fixed `eps` buffer
+set from the run config and frozen at training time by `freeze_eps_parameters`.
 
-Rules (conceptual):
+### Routing
 
-- one affine or fixed-linear node may feed one or more unary tails locally
-- no unspecified global fan-out of “accumulator buses” beyond what the explicit module tree shows
+Pure tensor wiring and discrete selection — no arithmetic, no parameters:
 
-C. Selection/routing ops
+- Shape and layout: `reshape`/`view`, `transpose`, `expand`, `cat`, `stack`,
+  `broadcast_tensors`, `unsqueeze`.
+- Discrete selection: `torch.topk`, `torch.gather`, `torch.max` for row max (Gibbs
+  stabilization), `F.relu` (sign split in the LN strict path), `Dropout`/`DropPath`.
 
-Non-arithmetic wiring and discrete choices: ``reshape``/view, transpose, expand, concat,
-``torch.topk``, ``F.relu``, ``torch.max`` for row max (Gibbs stabilization), gather-style indexing
-for sparse attention, ``Dropout``/``DropPath``, etc.
+`F.relu` and `torch.max` are classified as routing — they choose between operands or zero
+rather than computing a smooth nonlinearity, so they live with `topk` and `gather`, not with
+`NLSquare`/`NLExp`.
 
-**Convention:** anything that is pure tensor routing or discrete selection stays *outside* the
-``AffineContract`` / ``Linear`` nodes; arithmetic uses the explicit modules above.
+The routing surface is also re-exported from `transformer_surgery.ops` under `Routing*`
+aliases (`RoutingReshape`, `RoutingTranspose`, `RoutingCat`, `RoutingStack`,
+`RoutingUnsqueeze`, `RoutingBroadcastTensors`, `RoutingTopK`, `RoutingGather`, `RoutingMax`,
+`RoutingReLU`, `RoutingDropout`, `RoutingDropPath`) so the routing vocabulary is discoverable
+alongside the `Affine*` and `NL*` classes.
 
-**Debug / fast path:** run configs may set ``allow_matmul=True`` to use ``MatMul`` (``@``) or
-``MatMulHadamard`` (elementwise ``*``) where implemented (e.g. QK dot, attn×V, LN inverse-std path).
-That path is **not** the strict demonstration graph; strict mode keeps the explicit decompositions.
+## Transform 1: LayerNorm Rewrite
 
-What must be removed from the original model
+`RewrittenLayerNorm` (in `transformer_surgery.ops`) replaces `nn.LayerNorm`.
 
-After transformation (in **strict** surgery mode), there should be no implicit:
+Common prefix:
 
-- ``torch.nn.LayerNorm`` in blocks that use ``RewrittenLayerNorm``
-- dense softmax over full key length when ``use_surgery_softmax`` is enabled
-- variable ``torch.matmul`` for attention **score** computation or for **sparse value mixing**
-  when ``allow_matmul=False``
+- `mu = AffineMean(-1, keepdim=True)(x)`.
+- `u = AffineContract("i,...i->...", [1, -1])(stack(x, mu, dim=-1))` (centering, no add module).
+- `r2 = AffineMean(-1, keepdim=True)(NLSquare()(u))`.
 
-Everything important must be explicit in the module tree. Optional flags may re-enable library
-``LayerNorm``, dense softmax, or matmul for debugging (see run configs).
+Strict path (`allow_matmul=False`, default):
 
-Main transform 1: LayerNorm rewrite — ``RewrittenLayerNorm``
+- `au = stack(F.relu(u), F.relu(-u), dim=-2)` — magnitude split, no `abs`.
+- `log_num = NLLogPlusEps(eps)(au)`.
+- `log_den = NLLogPlusEps(eps)(r2)` broadcast to match `log_num`.
+- `t = AffineContract("q,...qpc->...pc", [2, -1])(stack(log_num, log_den, dim=2))`.
+- `a_mag = NLSqrtExp()(t)` (= `sqrt(exp(t))`, equivalent to `exp(log_num - ½·log_den)`).
+- `z = AffineContract("p,...pc->...c", [1, -1])(a_mag)`.
 
-Implemented in ``transformer_surgery.ops.RewrittenLayerNorm``.
+Fast path (`allow_matmul=True`):
 
-Given ``x``:
+- `inv_std = NLRsqrtPlusEps(eps)(r2)`.
+- `z = AffineHadamard()(u, inv_std)`.
 
-- ``mu = mean(x, dim=-1, keepdim=True)`` via ``UnaryMean``
-- ``u = x - mu`` via **routing** + ``AffineContract("i,...i->...", [1, -1])`` (submodule ``u_center_contract``)
-- ``r2 = mean(u*u, dim=-1, keepdim=True)`` via ``UnarySquare`` and ``UnaryMean``
+Final affine: `AffineScaleBias(normalized_shape)` carries `gamma`/`beta`. Weights are copied
+from the timm `nn.LayerNorm` by `copy_ln_params_to_rewritten`. `eps` is fixed at construction
+from `cfg.eps` and frozen by `freeze_eps_parameters` (it is not copied from `src.eps`).
 
-**Strict path (``allow_matmul=False``):** magnitude in log domain using a **relu± split**, not a
-single ``abs`` tensor op:
+## Transform 2: Variable Matrix-Multiplication Replacement in Attention
 
-- ``au = stack(relu(u), relu(-u), dim=-2)``; ``log_num = log(au + eps)`` via ``UnaryLogPlusEps``
-- ``log_den = log(r2 + eps)`` broadcast; combine with ``AffineContract`` on stacked logs
-  (coeffs ``[2, -1]``) then ``UnarySqrtExp`` for the magnitude factor
-- final channel mix with another ``AffineContract`` and ``AffineScaleBias`` for ``gamma``/``beta``
+Attention is implemented in `SurgeryAttention` (in
+[src/transformer_surgery/models/deit_tiny.py](src/transformer_surgery/models/deit_tiny.py)).
 
-**Fast path (``allow_matmul=True``):** ``inv_std = rsqrt(r2 + eps)``, then ``u * inv_std`` via
-``UnaryRsqrtPlusEps`` and ``MatMulHadamard`` (not the log-domain chain).
+In strict mode (`allow_matmul=False`) there is no variable `matmul` for QKᵀ score computation
+or for sparse value mixing PV. Both use the identity `a*b = ((a+b)² - (a-b)²)/4` through
+`SquareIdentityOperandChain`:
 
-Requirements:
+```
+stack((a, b), dim=-2)
+    -> AffineFixedMix(plus/minus 2x2)
+    -> NLSquare()
+    -> AffineContract(coeffs)
+```
 
-- ``eps`` is explicit (buffers / constructor args); not trained in fine-tuning (see ``freeze_eps_parameters``)
-- ``gamma``/``beta`` copied from timm LayerNorm where applicable (``copy_ln_params_to_rewritten``)
+Two attention modules use the chain with different einsum equations and coefficients:
 
-Validation (see ``python -m transformer_surgery.cli.surgery`` / ``transformer_surgery.models.pet``): compare rewritten LN to
-reference LN on minibatches; metrics go into surgery metadata.
+- `PairwiseDotBySquare(head_dim)` — Q/K grid → scores. Mix `pq,...qd->...pd`,
+  contract `p,...pd->...`, coeffs `±1/(4√d)`. Operands are broadcast Q/K.
+- `SparseWeightedSumBySquare()` — sparse probs and gathered values → output. Mix
+  `pq,...kqd->...kpd`, contract `p,...kpd->...d`, coeffs `(¼, −¼)`. Operands are expanded probs
+  and `torch.gather`-ed values per top-k slot.
 
-Main transform 2: Replace variable matrix multiplication in attention (strict mode)
-
-There should be no variable ``matmul`` for:
-
-- score computation ``Q K^T`` (when ``allow_matmul=False``)
-- sparse value mixing ``P V`` (when ``allow_matmul=False``)
-
-Use the identity ``a * b = ((a+b)^2 - (a-b)^2) / 4``.
-
-**Implementation:** ``SquareIdentityOperandChain`` — operands ``stack((a,b), dim=-2)`` → ``AffineFixedMix``
-→ ``UnarySquare`` → ``AffineContract`` with coeffs ``±1/(4√d)`` (QK) or ``±1/4`` (sparse mix), with
-equations chosen per use case.
-
-Modules:
-
-- ``PairwiseDotBySquare`` — QK grid → scores (or ``MatMul`` when ``allow_matmul=True``)
-- ``SparseWeightedSumBySquare`` — sparse probs + gathered values → output (or Hadamard path when allowed)
-
-Main transform 3: Replace softmax by Gibbs Top-K — ``GibbsTopKSoftmax``
-
-Same geometric construction as before (top-k support, tail mass at ``s_(k)``, partition function
-``Z_tail``, sparse probs, tail mass ``q_tail``). **Implementation detail:** score stabilization
-``scores - row_max``, tail sum ``sum_exp + (N-k)*exp(s_K)``, and logit normalization use
-**``broadcast_tensors`` + ``stack`` + ``AffineContract``** submodules (e.g. ``scores_stable_contract``,
-``z_tail_contract``, ``logit_logz_contract``) so the graph lists ``AffineContract`` nodes rather than
-opaque binary ops.
-
-Normalization avoids raw ``/`` in the strict path (``exp(vals - log(z_tail+eps))`` style); with
-``allow_matmul=True``, reciprocal + ``MatMulHadamard`` may be used.
-
-Module: ``GibbsTopKSoftmax`` (selection uses ``torch.topk`` in ``forward``).
-
-Validation: Jeffreys divergence metrics vs dense / naive top-k (see ``transformer_surgery.ops`` / run scripts).
-
-Concrete building blocks (current code)
-
-These are the main exported concepts; names match ``transformer_surgery.ops`` / ``transformer_surgery.models``:
-
-- **Fixed affine:** ``AffineContract``, ``AffineFixedMix``, ``AffineScaleBias``
-- **Unary:** ``UnaryMean``, ``UnarySum``, ``UnaryScale``, ``UnarySquare``, ``UnaryExp``, ``UnaryLogPlusEps``,
-  ``UnarySqrtExp``, ``UnaryRsqrtPlusEps``, ``UnaryReciprocalPlusEps``, …
-- **Chains:** ``SquareIdentityOperandChain``, ``PairwiseDotBySquare``, ``SparseWeightedSumBySquare``
-- **LayerNorm replacement:** ``RewrittenLayerNorm``
-- **Attention softmax:** ``GibbsTopKSoftmax``
-- **GELU:** ``GELUUnaryPWL``
-- **Optional matmul wrappers:** ``MatMul``, ``MatMulHadamard``
-- **Model:** ``DeiTTinySurgeryModel`` with ``residual_contract`` / ``pos_embed_contract`` as
-  ``AffineContract("i,...i->...", (1,1))`` plus stack routing in ``forward``
-
-There are **no** separate classes named ``ExplicitAdd``, ``ExplicitMean``, ``SetSign``, ``AbsOp``,
-``MultiTailPWLEpilogue`` — those ideas are expressed with the modules above.
-
-What the surgery CLI does
-
-- ``python -m transformer_surgery.cli.surgery``: load Pet timm checkpoint, build surgery student, eval, write
-  ``ts_surgery_<config>.pt``, ``artifacts/metadata/ts_surgery_<config>.json``, and
-  ``artifacts/logs/ts_surgery_<config>_model_{before,after}_surgery.txt``
-  (includes forward **output shape** traces via ``write_model_structure_txt``).
-
-Artifacts to save
-
-Save:
-- transformed model Python code
-- pre-finetune checkpoint
-- surgery metadata JSON
-- optional calibration stats (LN MSE, Jeffreys metrics, top-k, GELU PWL knot positions in ``pwl``, eps)
-- text dumps under ``artifacts/logs/`` with model structure and per-layer forward output shapes
-
-Acceptance criteria
-
-The surgery is acceptable only if:
-
-1. Immediate post-transform validation is reasonably close to the original (under chosen flags).
-2. LayerNorm rewrite matches the reference LN closely on held-out data (see MSE metrics).
-3. Gibbs Top-K improves over naive top-k in Jeffreys distance where measured.
-4. The transformed **strict** graph exposes explicit affine and unary modules as above; binary
-   mixes appear as ``AffineContract`` after ``stack``, not hidden inside custom “add” modules.
-5. No ``torch.nn.LayerNorm`` remains in blocks that are configured for surgery LN.
-6. No dense softmax over full keys when surgery softmax is enabled.
-7. No variable ``torch.matmul`` in attention score or sparse value paths when ``allow_matmul=False``.
-8. Checkpoint, metadata, and logs are produced for the surgery config.
-
-Final instruction
-
-Implement the transform completely and explicitly in the **current** abstraction: routing
-(``broadcast``, ``stack``, indexing) is separate; fixed linear maps are ``AffineContract`` /
-``AffineFixedMix`` / ``Linear`` / ``Conv``; unary nonlinearities are explicit submodule classes.
-
-Do not:
-- hide affine structure inside opaque binary “add/sub” modules (use ``AffineContract`` + routing)
-- use naive hard top-k softmax when Gibbs replacement is enabled
-- rely on undocumented black-box shortcuts in strict mode
-
-Do:
-- use ``RewrittenLayerNorm`` strict or fast path as configured
-- use Gibbs Top-K with implicit replicated tail normalization
-- keep ``allow_matmul`` as an explicit escape hatch for speed/debug, distinct from strict demos
-- save real PyTorch checkpoints and human-readable ``artifacts/logs/*.txt`` structure dumps
-
-The final transformed model must be a real saved PyTorch model in this basis and suitable for
-later distillation and quantization of affine nodes (see ``docs/distill.md`` and ``docs/ptq.md``).
+When `allow_matmul=True`, `PairwiseDotBySquare` falls back to `(q/√d) @ kᵀ` via `AffineMatMul`, and
+`SparseWeightedSumBySquare` falls back to `probs.unsqueeze(-2) @ v_g` via `AffineMatMul`. Only the
+modules for the chosen mode are registered.
+
+## Transform 3: Softmax Replacement
+
+`GibbsTopKSoftmax(seq_len, top_k, eps, allow_matmul)` replaces dense softmax. It returns sparse
+probabilities on the top-k indices, the index tensor, and a tail-mass scalar `q_tail`.
+
+Score stabilization, tail-sum aggregation, and logit normalization are exposed as
+`AffineContract` submodules so the graph lists explicit affine nodes:
+
+- `scores_stable_contract` (`[1, -1]`) implements `scores - row_max` over a stacked operand.
+- `z_tail_contract` (`[1, 1]`) sums `sum_exp` and `tail_term` to form
+  `Z_tail = Σ_k exp(s_k) + (N - K) · exp(s_K)`.
+- `logit_logz_contract` (`[1, 1]`) implements `vals + (-log_z)` and `s_K + (-log_z)`.
+
+Tail term:
+
+- Strict (`allow_matmul=False`): `tail_mass_mul = AffineScale(N - K)` applied to `exp(s_K)`. The
+  multiplicand is fixed at construction from `seq_len`/`top_k`.
+- Fast (`allow_matmul=True`): `AffineHadamard()` on `exp(s_K)` and a broadcast `(N - K)` tensor.
+
+Normalization:
+
+- Strict: `probs = exp(vals - log(Z_tail + eps))` via `NLLogPlusEps` + `AffineContract`
+  + `NLExp`. No `/` operator.
+- Fast: `probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(eps)(Z_tail))`.
+
+`eps` matches the LayerNorm floor and is frozen by `freeze_eps_parameters`.
+
+## Transform Flags
+
+The CLI config (in
+[src/transformer_surgery/cli/surgery_config.py](src/transformer_surgery/cli/surgery_config.py))
+exposes four debug flags that selectively bypass the rewrites:
+
+- `disable_layernorm_replacement` — keep `nn.LayerNorm` instead of `RewrittenLayerNorm`.
+- `disable_attention_surgery` — keep dense scaled-dot QKᵀ + softmax + dense `@V`.
+- `disable_softmax_replacement` — keep `PairwiseDotBySquare` for QKᵀ but use full softmax then
+  dense `@V` (or a Hadamard expansion when `allow_matmul=True`).
+- `allow_matmul` — switch the strict subgraphs to the matmul/Hadamard fast paths in
+  `RewrittenLayerNorm`, `PairwiseDotBySquare`, `SparseWeightedSumBySquare`, and
+  `GibbsTopKSoftmax`.
+
+`build_module_mapping` records the resulting per-block module choices (`norm1`, `attn`,
+`norm2`, `mlp.act`, `fc_norm`) into the surgery metadata.
+
+## Calibration
+
+`adapter.calibrate_reference` runs once on a single validation minibatch and reports adapter
+diagnostics. For `deit_tiny_pet` these are:
+
+- `ln_rewrite_mse_layer0_minibatch` — MSE of `RewrittenLayerNorm` against the reference LN at
+  block 0 on the cached batch.
+- `ln_rewrite_mse_all_norms_mean` — mean MSE across all `norm1`/`norm2` and the final `norm`
+  while replaying the residual stream of the reference model.
+- `jeffreys_gibbs_mean_cached` and `jeffreys_naive_mean_cached` — mean Jeffreys divergence of
+  the Gibbs Top-K and naive Top-K approximations against the dense softmax on cached attention
+  scores from block 0.
+- `jeffreys_improvement_naive_minus_gibbs_cached` — non-negative gap; the Gibbs replacement is
+  expected to be closer to dense softmax than naive top-k.
+- Synthetic `*_synthetic` variants on a Gaussian score tensor of the same shape, for
+  cross-checking.
+
+The surgery driver then runs full-validation passes on both the reference (`ref_val_acc`,
+`ref_val_loss`) and the freshly built surgery student (`student_pre_ft_val_acc`,
+`student_pre_ft_mean_ce`) and adds them to the calibration block.
+
+## Outputs
+
+The CLI writes:
+
+- `artifacts/checkpoints/ts_surgery_<config>.pt` — pre-finetune surgery checkpoint
+  (`save_model_checkpoint` with adapter-supplied `extra`).
+- `artifacts/metadata/ts_surgery_<config>.json` — `SurgeryMeta` JSON with `model_key`,
+  `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `pwl`, `calibration`, `module_mapping`,
+  `reference_checkpoint`, and `allow_matmul`.
+- `artifacts/logs/ts_surgery_<config>_model_before_surgery.txt` and `_model_after_surgery.txt`
+  — `write_model_structure_txt` dumps with `repr(model)`, parameter counts, the
+  `named_modules` listing, and per-module forward output tensor shapes from one `eval` pass on
+  a dummy batch.
+
+Checkpoint `extra` records the adapter key, reference checkpoint, metadata basename, mapping,
+top_k, eps_ln, config JSON path, all transform flags, and the surgery dtype, so the surgery
+student can be reconstructed by `build_surgery_model_from_extra` without the original config.
+
+## Acceptance Criteria
+
+The surgery stage is acceptable only if:
+
+1. It loads the reference and builds the student through the adapter and does not depend on a
+   concrete model module.
+2. With strict flags (no `disable_*`, `allow_matmul=False`), the student contains no
+   `nn.LayerNorm` in surgery-configured blocks, no dense softmax in attention, and no variable
+   `torch.matmul` or `AffineHadamard` in attention score or value paths.
+3. Binary mixes (residual, positional embedding, centering, Gibbs intermediates) appear as
+   `AffineContract` after `stack`, not inside opaque add modules.
+4. Calibration reports LN MSE and Gibbs-vs-naive Jeffreys metrics; the Gibbs replacement is no
+   worse than naive top-k in Jeffreys distance.
+5. `eps` is a fixed scalar, frozen for fine-tuning by `freeze_eps_parameters`.
+6. The post-transform student validates reasonably close to the reference under the chosen
+   flags.
+7. The CLI writes the checkpoint, metadata JSON, and before/after structure logs for the run
+   config.

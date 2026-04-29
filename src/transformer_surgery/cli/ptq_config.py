@@ -35,7 +35,7 @@ class PTQSurgeryConfig:
     matmul_activation_bits: Optional[int] = None
     # For ``Linear``/``Conv2d``: **True** = per-output-channel symmetric weight scales (axis 0);
     # **False** = one global scale over the whole weight tensor (often destroys accuracy). Ignored for
-    # affine/unary/coeff (always one global weight scale) and for ``MatMul`` (no weights). Output
+    # affine/coeff (always one global weight scale) and for ``AffineMatMul``/``AffineHadamard`` (no weights). Output
     # ``out_scale``/``out_bias`` for Linear/Conv do not depend on this flag (analytical + residual bias).
     per_output_channel: bool = True
     top_k: Optional[int] = None

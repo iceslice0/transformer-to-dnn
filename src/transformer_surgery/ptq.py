@@ -37,10 +37,10 @@ from transformer_surgery.util import (
 from transformer_surgery.ops import (
     AffineContract,
     AffineFixedMix,
+    AffineHadamard,
+    AffineMatMul,
+    AffineScale,
     AffineScaleBias,
-    MatMul,
-    MatMulHadamard,
-    UnaryScale,
     get_surgery_dtype,
     write_model_structure_txt,
 )
@@ -48,12 +48,12 @@ from transformer_surgery.ops import (
 
 SUPPORTED_LINEAR_CONV_TYPES = (nn.Linear, nn.Conv2d)
 SUPPORTED_AFFINE_TYPES = (
-    UnaryScale,
+    AffineScale,
     AffineScaleBias,
     AffineFixedMix,
     AffineContract,
 )
-SUPPORTED_MATMUL_TYPES = (MatMul, MatMulHadamard)
+SUPPORTED_MATMUL_TYPES = (AffineMatMul, AffineHadamard)
 MATMUL_KINDS = {"matmul", "matmul_hadamard"}
 
 
@@ -70,17 +70,17 @@ def _module_kind(module: nn.Module) -> Optional[str]:
         return "linear"
     if isinstance(module, nn.Conv2d):
         return "conv2d"
-    if isinstance(module, UnaryScale):
-        return "unary_scale"
+    if isinstance(module, AffineScale):
+        return "affine_scale"
     if isinstance(module, AffineScaleBias):
         return "affine_scale_bias"
     if isinstance(module, AffineFixedMix):
         return "affine_fixed_mix"
     if isinstance(module, AffineContract):
         return "affine_contract"
-    if isinstance(module, MatMul):
+    if isinstance(module, AffineMatMul):
         return "matmul"
-    if isinstance(module, MatMulHadamard):
+    if isinstance(module, AffineHadamard):
         return "matmul_hadamard"
     return None
 
@@ -264,8 +264,8 @@ def _diagnostic_linear_conv_max_s_global_over_s_pc(
 def _weight_quant_axis(kind: str, cfg: Any) -> Optional[int]:
     """
     Symmetric weight quantization axis. ``Linear``/``Conv2d``: axis 0 (per output filter) when
-    ``cfg.per_output_channel`` else **None** (single global scale). Affine/unary/coeff: always
-    **None** (one scale over the whole tensor). ``MatMul`` / ``MatMulHadamard``: no weight tensor.
+    ``cfg.per_output_channel`` else **None** (single global scale). Affine/coeff: always
+    **None** (one scale over the whole tensor). ``AffineMatMul`` / ``AffineHadamard``: no weight tensor.
     """
     if kind in {"linear", "conv2d"}:
         return 0 if cfg.per_output_channel else None
@@ -277,7 +277,7 @@ def _extract_weight_tensor(module: nn.Module, kind: str) -> Optional[torch.Tenso
         return module.weight.detach().to(dtype=torch.float32, device="cpu")
     if kind == "conv2d":
         return module.weight.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "unary_scale":
+    if kind == "affine_scale":
         return module.scale.detach().to(dtype=torch.float32, device="cpu")
     if kind == "affine_scale_bias":
         return module.weight.detach().to(dtype=torch.float32, device="cpu")
@@ -326,7 +326,7 @@ def _simulate_accumulator(
             dilation=dilation,
             groups=groups,
         )
-    if kind == "unary_scale":
+    if kind == "affine_scale":
         return q_inputs[0] * q_weight
     if kind == "affine_scale_bias":
         return q_inputs[0] * _broadcast_last_dim(q_weight.reshape(-1), q_inputs[0])
@@ -709,7 +709,7 @@ def _ptq_summary(
             "per_output_channel_linear_conv_weights": bool(cfg.per_output_channel),
             "per_output_channel_note": (
                 "When true: per-output-channel weight scales for Linear/Conv2d. When false: global weight "
-                "scale for Linear/Conv2d. Affine/unary/coeff: always global weight scale. Ignored for MatMul."
+                "scale for Linear/Conv2d. Affine/coeff: always global weight scale. Ignored for AffineMatMul/AffineHadamard."
             ),
         },
         "calibration": {

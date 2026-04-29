@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.layers import DropPath as _TimmDropPath
 
 # Default number of PWL knots (log, exp, GELU, Gibbs exp epilogue); cap at 17.
 PWL_NUM_KNOTS = 17
@@ -32,9 +33,38 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
     global _SURGERY_DTYPE
     _SURGERY_DTYPE = dt
 
+
 # ---------------------------------------------------------------------------
-# Op vocabulary: Affine* (fixed coeff einsum, channel scale+bias, fixed matrix mixes), Unary* (maps & reductions),
-# MatMul* (contracting ``matmul`` + Hadamard ``a*b`` with two variable tensors). Routing helpers below.
+# Routing vocabulary: aliases to torch / F / nn ops that carry no parameters and do no
+# arithmetic — pure tensor wiring and discrete selection. Defined here, before the op classes,
+# so internal call sites in this module use ``Routing*`` names rather than ``torch.*``/``F.*``
+# directly. External callers may import them to make the routing surface explicit.
+# ---------------------------------------------------------------------------
+
+RoutingReshape = torch.reshape
+RoutingTranspose = torch.transpose
+RoutingCat = torch.cat
+RoutingStack = torch.stack
+RoutingUnsqueeze = torch.unsqueeze
+RoutingBroadcastTensors = torch.broadcast_tensors
+RoutingTopK = torch.topk
+RoutingGather = torch.gather
+RoutingMax = torch.max
+RoutingReLU = F.relu
+RoutingDropout = nn.Dropout
+RoutingDropPath = _TimmDropPath
+
+
+# ---------------------------------------------------------------------------
+# Op vocabulary: three groups.
+#   Affine*  — linear in each operand: parameterized layers, fixed-coeff einsum, per-channel
+#              scale+bias, fixed 2x2 mixes, linear unary reductions/scalings, and the variable
+#              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul.
+#   NL*      — strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
+#              reciprocal+eps, scalar PWL, GELU-as-PWL).
+#   Routing* — pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
+#              broadcast_tensors, topk/gather, F.relu, torch.max, Dropout/DropPath); see the
+#              ``Routing*`` aliases above.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -42,7 +72,7 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
 # ---------------------------------------------------------------------------
 
 
-class UnaryScale(nn.Module):
+class AffineScale(nn.Module):
     def __init__(self, scale: float) -> None:
         super().__init__()
         self.register_buffer("scale", torch.tensor(float(scale)))
@@ -54,14 +84,14 @@ class UnaryScale(nn.Module):
         return x * s.to(dtype=x.dtype)
 
 
-class MatMulHadamard(nn.Module):
-    """Elementwise / broadcast product ``a * b``; both operands are tensors (MatMul group, not ``@``)."""
+class AffineHadamard(nn.Module):
+    """Elementwise / broadcast product ``a * b``; both operands are tensors (bilinear, no ``@``)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a * b
 
 
-class MatMul(nn.Module):
+class AffineMatMul(nn.Module):
     """Contracting product ``torch.matmul(a, b)`` (when ``allow_matmul`` enables batched @)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -80,7 +110,7 @@ class AffineScaleBias(nn.Module):
         return x * self.weight + self.bias
 
 
-class UnaryLogPlusEps(nn.Module):
+class NLLogPlusEps(nn.Module):
     """``log(x + eps)`` with fixed scalar ``eps`` (LayerNorm-style floor), exact ``torch.log``."""
 
     def __init__(self, eps: float) -> None:
@@ -92,14 +122,14 @@ class UnaryLogPlusEps(nn.Module):
         return torch.log(x + e)
 
 
-class UnarySquare(nn.Module):
+class NLSquare(nn.Module):
     """Unary square ``x * x`` (e.g. variance and (a+b)²−(a−b)² identities)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * x
 
 
-class UnaryRsqrtPlusEps(nn.Module):
+class NLRsqrtPlusEps(nn.Module):
     """``1/sqrt(x + eps)`` via ``torch.rsqrt`` (e.g. LayerNorm inv-std from variance)."""
 
     def __init__(self, eps: float) -> None:
@@ -111,8 +141,8 @@ class UnaryRsqrtPlusEps(nn.Module):
         return torch.rsqrt(x + e)
 
 
-class UnaryReciprocalPlusEps(nn.Module):
-    """``1 / (x + eps)`` (pair with :class:`MatMulHadamard`, not ``/``)."""
+class NLReciprocalPlusEps(nn.Module):
+    """``1 / (x + eps)`` (pair with :class:`AffineHadamard`, not ``/``)."""
 
     def __init__(self, eps: float) -> None:
         super().__init__()
@@ -123,8 +153,8 @@ class UnaryReciprocalPlusEps(nn.Module):
         return torch.reciprocal(x + e)
 
 
-class UnarySum(nn.Module):
-    """Sum reduction (unlike :class:`UnaryMean`, no ``1/n`` scaling)."""
+class AffineSum(nn.Module):
+    """Sum reduction (unlike :class:`AffineMean`, no ``1/n`` scaling)."""
 
     def __init__(self, dim: int, keepdim: bool = False) -> None:
         super().__init__()
@@ -135,14 +165,14 @@ class UnarySum(nn.Module):
         return x.sum(dim=self.dim, keepdim=self.keepdim)
 
 
-class UnaryExp(nn.Module):
+class NLExp(nn.Module):
     """``torch.exp`` (Gibbs softmax, LN magnitude, etc.)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x)
 
 
-class UnarySqrtExp(nn.Module):
+class NLSqrtExp(nn.Module):
     """``sqrt(exp(x))`` — use in strict LN as ``SqrtExp(2·log|u| - log(r2))`` instead of ``exp(x - ½·y)``."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -191,7 +221,7 @@ class AffineContract(nn.Module):
 class SquareIdentityOperandChain(nn.Module):
     """
     ``((a+b)²-(a-b)²)/4`` implemented as ``torch.stack((a,b), dim=-2)`` (operand layout only) →
-    fixed 2×2 mix → :class:`UnarySquare` → coeff contraction. :class:`PairwiseDotBySquare` and
+    fixed 2×2 mix → :class:`NLSquare` → coeff contraction. :class:`PairwiseDotBySquare` and
     :class:`SparseWeightedSumBySquare` share this chain; they differ only in how ``a`` and ``b`` are
     formed (QK broadcast vs gathered ``p``/``v``) and in the ``einsum`` equations / coefficient
     vector (attention includes ``1/√d``, value mix does not).
@@ -205,18 +235,18 @@ class SquareIdentityOperandChain(nn.Module):
     ) -> None:
         super().__init__()
         self.operand_mix = AffineFixedMix(mix_einsum)
-        self.square = UnarySquare()
+        self.square = NLSquare()
         self.out_contract = AffineContract(contract_einsum, coeffs)
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        stacked = torch.stack((a, b), dim=-2)
+        stacked = RoutingStack((a, b), dim=-2)
         pm = self.operand_mix(stacked)
         pm = pm.to(torch.result_type(a, b))
         sq = self.square(pm)
         return self.out_contract(sq)
 
 
-class UnaryMean(nn.Module):
+class AffineMean(nn.Module):
     """Mean as sum followed by fixed scalar ``1/n``."""
 
     def __init__(self, dim: int, keepdim: bool = False) -> None:
@@ -250,7 +280,7 @@ def _pwl_eval(x: torch.Tensor, knots: torch.Tensor, values: torch.Tensor) -> tor
     return y.reshape_as(x)
 
 
-class UnaryScalarPWL(nn.Module):
+class NLScalarPWL(nn.Module):
     """Univariate PWL with learnable knot values (knot positions fixed)."""
 
     def __init__(self, knots: torch.Tensor, init_values: Optional[torch.Tensor] = None) -> None:
@@ -267,7 +297,7 @@ class UnaryScalarPWL(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: relu± stack + affine reductions + UnarySqrtExp (no log PWL)
+# LayerNorm rewrite: relu± stack + affine reductions + NLSqrtExp (no log PWL)
 # ---------------------------------------------------------------------------
 
 
@@ -278,11 +308,11 @@ class RewrittenLayerNorm(nn.Module):
     **``allow_matmul=False`` (default, strict):** ``au = stack(relu(u),relu(-u))`` (dim ``-2``);
     ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
     ``t = AffineContract([2,-1])(stack(log_num, log_den))`` (= ``2·log_num - log_den``);
-    ``a_mag = UnarySqrtExp(t)`` (= ``sqrt(exp(t))``, same value as ``exp(log_num - ½·log_den)``);
+    ``a_mag = NLSqrtExp(t)`` (= ``sqrt(exp(t))``, same value as ``exp(log_num - ½·log_den)``);
     ``z = out_contract(a_mag)``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
-    ``inv_std = 1/sqrt(r2+eps)`` via :class:`UnaryRsqrtPlusEps` and :class:`MatMulHadamard`, not the
+    ``inv_std = 1/sqrt(r2+eps)`` via :class:`NLRsqrtPlusEps` and :class:`AffineHadamard`, not the
     log-domain path.
     """
 
@@ -291,37 +321,37 @@ class RewrittenLayerNorm(nn.Module):
         self.normalized_shape = (normalized_shape,)
         e = float(eps)
         self.allow_matmul = allow_matmul
-        self.mean_u = UnaryMean(-1, keepdim=True)
-        self.mean_r2 = UnaryMean(-1, keepdim=True)
-        self.square = UnarySquare()
+        self.mean_u = AffineMean(-1, keepdim=True)
+        self.mean_r2 = AffineMean(-1, keepdim=True)
+        self.square = NLSquare()
         self.u_center_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
         )
         self.affine = AffineScaleBias(normalized_shape)
         if allow_matmul:
-            self.inv_sqrt_var = UnaryRsqrtPlusEps(e)
-            self.u_mul_invstd = MatMulHadamard()
+            self.inv_sqrt_var = NLRsqrtPlusEps(e)
+            self.u_mul_invstd = AffineHadamard()
         else:
             self.out_contract = AffineContract("p,...pc->...c", torch.tensor([1.0, -1.0]))
             self.log_a_contract = AffineContract("q,...qpc->...pc", torch.tensor([2.0, -1.0]))
-            self.log_eps = UnaryLogPlusEps(e)
-            self.sqrt_exp = UnarySqrtExp()
+            self.log_eps = NLLogPlusEps(e)
+            self.sqrt_exp = NLSqrtExp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
-        _x, _m = torch.broadcast_tensors(x, mu)
-        u = self.u_center_contract(torch.stack((_x, _m), dim=-1))
+        _x, _m = RoutingBroadcastTensors(x, mu)
+        u = self.u_center_contract(RoutingStack((_x, _m), dim=-1))
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
         if self.allow_matmul:
             inv_std = self.inv_sqrt_var(r2)
             z = self.u_mul_invstd(u, inv_std)
         else:
-            au = torch.stack((F.relu(u), F.relu(-u)), dim=-2)
+            au = RoutingStack((RoutingReLU(u), RoutingReLU(-u)), dim=-2)
             log_num = self.log_eps(au)
             log_den = self.log_eps(r2).unsqueeze(-2).expand_as(log_num)
-            lin_log = self.log_a_contract(torch.stack((log_num, log_den), dim=2))
+            lin_log = self.log_a_contract(RoutingStack((log_num, log_den), dim=2))
             a_mag = self.sqrt_exp(lin_log)
             z = self.out_contract(a_mag)
         return self.affine(z)
@@ -362,8 +392,8 @@ class PairwiseDotBySquare(nn.Module):
         self.head_dim = head_dim
         self.allow_matmul = allow_matmul
         if allow_matmul:
-            self.q_scale = UnaryScale(1.0 / math.sqrt(float(head_dim)))
-            self.qk_matmul = MatMul()
+            self.q_scale = AffineScale(1.0 / math.sqrt(float(head_dim)))
+            self.qk_matmul = AffineMatMul()
         else:
             w = 0.25 / math.sqrt(float(head_dim))
             self.square_chain = SquareIdentityOperandChain(
@@ -396,11 +426,11 @@ class GibbsTopKSoftmax(nn.Module):
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
-    :class:`UnaryReciprocalPlusEps` and :class:`MatMulHadamard`; with
+    :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; with
     ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
 
-    **z_tail**: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`UnarySum`,
-    tail mass as :class:`MatMulHadamard` (``allow_matmul=True``) or :class:`UnaryScale` with
+    **z_tail**: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`AffineSum`,
+    tail mass as :class:`AffineHadamard` (``allow_matmul=True``) or :class:`AffineScale` with
     fixed ``(N_k - K)`` from ``seq_len``/``top_k`` (strict — no Hadamard in graph), then
     ``stack`` (routing) and :class:`AffineContract` ``(1,1)`` on the last dim.
 
@@ -421,8 +451,8 @@ class GibbsTopKSoftmax(nn.Module):
         self.top_k = top_k
         self.allow_matmul = allow_matmul
         e = float(eps)
-        self.exp = UnaryExp()
-        self.sum_exp_vals = UnarySum(-1, keepdim=True)
+        self.exp = NLExp()
+        self.sum_exp_vals = AffineSum(-1, keepdim=True)
         self.z_tail_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
@@ -432,14 +462,14 @@ class GibbsTopKSoftmax(nn.Module):
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
         )
         if allow_matmul:
-            self.tail_mass_mul = MatMulHadamard()
-            self.inv_z = UnaryReciprocalPlusEps(e)
-            self.mul_by_inv_z = MatMulHadamard()
+            self.tail_mass_mul = AffineHadamard()
+            self.inv_z = NLReciprocalPlusEps(e)
+            self.mul_by_inv_z = AffineHadamard()
         else:
             nk = seq_len
             kk = min(top_k, nk)
-            self.tail_mass_mul = UnaryScale(float(max(0, nk - kk)))
-            self.log_z = UnaryLogPlusEps(e)
+            self.tail_mass_mul = AffineScale(float(max(0, nk - kk)))
+            self.log_z = NLLogPlusEps(e)
             self.logit_logz_contract = AffineContract(
                 "i,...i->...",
                 torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
@@ -453,10 +483,10 @@ class GibbsTopKSoftmax(nn.Module):
         _b, _h, _nq, nk = scores.shape
         k = min(self.top_k, nk)
         tail_coeff = float(nk - k)
-        row_max = scores.max(dim=-1, keepdim=True).values
-        _s, _r = torch.broadcast_tensors(scores, row_max)
-        scores_stable = self.scores_stable_contract(torch.stack((_s, _r), dim=-1))
-        vals, idx = torch.topk(scores_stable, k=k, dim=-1, largest=True, sorted=True)
+        row_max = RoutingMax(scores, dim=-1, keepdim=True).values
+        _s, _r = RoutingBroadcastTensors(scores, row_max)
+        scores_stable = self.scores_stable_contract(RoutingStack((_s, _r), dim=-1))
+        vals, idx = RoutingTopK(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
         exp_tail = self.exp(s_k)
@@ -465,8 +495,8 @@ class GibbsTopKSoftmax(nn.Module):
             tail_term = self.tail_mass_mul(exp_tail, torch.full_like(exp_tail, tail_coeff))
         else:
             tail_term = self.tail_mass_mul(exp_tail)
-        _se, _tt = torch.broadcast_tensors(sum_exp, tail_term)
-        z_tail = self.z_tail_contract(torch.stack((_se, _tt), dim=-1))
+        _se, _tt = RoutingBroadcastTensors(sum_exp, tail_term)
+        z_tail = self.z_tail_contract(RoutingStack((_se, _tt), dim=-1))
 
         if self.allow_matmul:
             inv_z = self.inv_z(z_tail)
@@ -475,11 +505,11 @@ class GibbsTopKSoftmax(nn.Module):
         else:
             log_z = self.log_z(z_tail)
             neg_log_z = -log_z
-            _v, _nlz = torch.broadcast_tensors(vals, neg_log_z)
-            logits_norm = self.logit_logz_contract(torch.stack((_v, _nlz), dim=-1))
+            _v, _nlz = RoutingBroadcastTensors(vals, neg_log_z)
+            logits_norm = self.logit_logz_contract(RoutingStack((_v, _nlz), dim=-1))
             probs = self.exp(logits_norm)
-            _sk, _nlz2 = torch.broadcast_tensors(s_k, neg_log_z)
-            sk_norm = self.logit_logz_contract(torch.stack((_sk, _nlz2), dim=-1))
+            _sk, _nlz2 = RoutingBroadcastTensors(s_k, neg_log_z)
+            sk_norm = self.logit_logz_contract(RoutingStack((_sk, _nlz2), dim=-1))
             q_tail = self.tail_mass_mul(self.exp(sk_norm))
 
         return probs, idx, q_tail
@@ -505,7 +535,7 @@ class SparseWeightedSumBySquare(nn.Module):
         super().__init__()
         self.allow_matmul = allow_matmul
         if allow_matmul:
-            self.pv_matmul = MatMul()
+            self.pv_matmul = AffineMatMul()
         else:
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
@@ -529,7 +559,7 @@ class SparseWeightedSumBySquare(nn.Module):
         _, _, nk, d = v.shape
         idx_e = idx.unsqueeze(-1).expand(-1, -1, -1, -1, d)
         v_h = v.unsqueeze(2).expand(-1, -1, nq, -1, -1)
-        v_g = torch.gather(v_h, 3, idx_e)
+        v_g = RoutingGather(v_h, 3, idx_e)
         if self.allow_matmul:
             # [B,H,Nq,1,K] @ [B,H,Nq,K,D] -> [B,H,Nq,1,D]
             return self.pv_matmul(probs.unsqueeze(-2), v_g).squeeze(-2)
@@ -543,13 +573,13 @@ class SparseWeightedSumBySquare(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class GELUUnaryPWL(nn.Module):
+class NLGELU(nn.Module):
     def __init__(self, knots: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         if knots is None:
             knots = torch.linspace(-4.0, 4.0, PWL_NUM_KNOTS)
         ref = F.gelu(knots)
-        self.pwl = UnaryScalarPWL(knots, init_values=ref)
+        self.pwl = NLScalarPWL(knots, init_values=ref)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.pwl(x)
@@ -665,7 +695,7 @@ CALIBRATION_LEGEND_TEXT = (
 def build_surgery_pwl_meta() -> Dict[str, Any]:
     """
     JSON-safe summary of **live** PWL in the surgery model. Gibbs / LN use exact ``exp`` /
-    ``log`` on buffers — no PWL grids there. Only :class:`GELUUnaryPWL` uses scalar PWL; knot
+    ``log`` on buffers — no PWL grids there. Only :class:`NLGELU` uses scalar PWL; knot
     positions match its default (values are trainable parameters in the checkpoint).
     """
     k = torch.linspace(-4.0, 4.0, PWL_NUM_KNOTS)
@@ -674,7 +704,7 @@ def build_surgery_pwl_meta() -> Dict[str, Any]:
             "knot_positions": [float(x) for x in k],
             "num_knots": int(PWL_NUM_KNOTS),
             "note": (
-                "Default knot x-positions for GELUUnaryPWL; knot values are "
+                "Default knot x-positions for NLGELU; knot values are "
                 "``blocks.*.mlp.act.pwl.values`` in the state dict."
             ),
         },

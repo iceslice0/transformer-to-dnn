@@ -8,15 +8,14 @@ from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
-from timm.layers import DropPath
-
 from transformer_surgery.ops import (
     AffineContract,
+    AffineMatMul,
     GibbsTopKSoftmax,
-    MatMul,
-    GELUUnaryPWL,
+    NLGELU,
     PairwiseDotBySquare,
     RewrittenLayerNorm,
+    RoutingDropPath,
     SparseWeightedSumBySquare,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
@@ -57,7 +56,7 @@ class SurgeryAttention(nn.Module):
         self.use_surgery_softmax = use_surgery_softmax
         self.allow_matmul = allow_matmul
         if use_attention_surgery and not use_surgery_softmax and allow_matmul:
-            self.matmul = MatMul()
+            self.matmul = AffineMatMul()
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -108,7 +107,7 @@ class SurgeryMlp(nn.Module):
     def __init__(self, in_features: int, hidden_features: int, drop: float = 0.0) -> None:
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = GELUUnaryPWL()
+        self.act = NLGELU()
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(drop)
 
@@ -159,7 +158,7 @@ class SurgeryBlock(nn.Module):
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
-        self.drop_path = DropPath(drop_path)
+        self.drop_path = RoutingDropPath(drop_path)
         self.residual_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),

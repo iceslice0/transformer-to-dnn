@@ -268,7 +268,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
             mapping[f"blocks.{i}.norm1"] = ln
             mapping[f"blocks.{i}.attn"] = attn
             mapping[f"blocks.{i}.norm2"] = ln
-            mapping[f"blocks.{i}.mlp.act"] = "GELUUnaryPWL"
+            mapping[f"blocks.{i}.mlp.act"] = "NLGELU"
         mapping["fc_norm"] = ln
         return mapping
 
