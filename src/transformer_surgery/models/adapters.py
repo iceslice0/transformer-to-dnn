@@ -124,24 +124,24 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
     pretrain_command = "python -m transformer_surgery.cli.pretrain_pet"
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
-        from transformer_surgery.pet import build_pet_loaders
+        from transformer_surgery.models.pet import build_pet_loaders
 
         return build_pet_loaders(cfg)
 
     def load_reference_checkpoint(self, path: str) -> nn.Module:
-        from transformer_surgery.pet import load_timm_deit_pet_checkpoint
+        from transformer_surgery.models.pet import load_timm_deit_pet_checkpoint
 
         return load_timm_deit_pet_checkpoint(path)
 
     def build_surgery_model(self, cfg: Any) -> nn.Module:
         from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.pet import PET_NUM_CLASSES
+        from transformer_surgery.models.pet import PET_NUM_CLASSES
 
         return DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES)
 
     def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
         from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.pet import PET_NUM_CLASSES
+        from transformer_surgery.models.pet import PET_NUM_CLASSES
 
         return DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=PET_NUM_CLASSES)
 

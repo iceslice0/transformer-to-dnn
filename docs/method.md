@@ -117,7 +117,7 @@ Requirements:
 - ``eps`` is explicit (buffers / constructor args); not trained in fine-tuning (see ``freeze_eps_parameters``)
 - ``gamma``/``beta`` copied from timm LayerNorm where applicable (``copy_ln_params_to_rewritten``)
 
-Validation (see ``python -m transformer_surgery.cli.run_surgery`` / ``transformer_surgery.pet``): compare rewritten LN to
+Validation (see ``python -m transformer_surgery.cli.run_surgery`` / ``transformer_surgery.models.pet``): compare rewritten LN to
 reference LN on minibatches; metrics go into surgery metadata.
 
 Main transform 2: Replace variable matrix multiplication in attention (strict mode)

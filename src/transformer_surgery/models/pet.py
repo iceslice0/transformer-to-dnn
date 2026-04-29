@@ -21,6 +21,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
+from transformer_surgery.pipeline import accuracy_and_loss, get_device
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -336,52 +338,3 @@ def train_timm_deit_on_pet(
 ) -> Tuple[float, float, Optional[int], int]:
     """Timm DeiT-Tiny Pet head training; delegates to :func:`finetune_model_adaptertune_style`."""
     return finetune_model_adaptertune_style(ref, train_loader, val_loader, cfg, resume_val_acc=resume_val_acc)
-
-
-# Backward-compatible aliases for generic runtime and processing helpers.
-#
-# Pretraining remains the concrete Pet/DeiT recipe in this module. Surgery, distillation, and PTQ
-# use the adapter-aware implementations from ``pipeline`` / ``models.adapters``; the aliases keep
-# existing imports from ``transformer_surgery.pet`` working.
-from transformer_surgery.cli.distill_config import (
-    CLI_JEFFREYS_CONFIG_DEFAULT as CLI_JEFFREYS_CONFIG_DEFAULT,
-    CLI_JEFFREYS_CONFIG_HELP as CLI_JEFFREYS_CONFIG_HELP,
-    CLI_JEFFREYS_DESCRIPTION as CLI_JEFFREYS_DESCRIPTION,
-    FIELD_HELP_JEFFREYS as FIELD_HELP_JEFFREYS,
-    JeffreysDistillConfig as JeffreysDistillConfig,
-)
-from transformer_surgery.cli.pretrain_config import (
-    CLI_PRETRAIN_CONFIG_DEFAULT as CLI_PRETRAIN_CONFIG_DEFAULT,
-    CLI_PRETRAIN_DESCRIPTION as CLI_PRETRAIN_DESCRIPTION,
-    FIELD_HELP_PRETRAIN as FIELD_HELP_PRETRAIN,
-    PretrainPetConfig as PretrainPetConfig,
-    parse_pretrain_pet_config as parse_pretrain_pet_config,
-    pretrain_train_config_record as pretrain_train_config_record,
-)
-from transformer_surgery.cli.surgery_config import (
-    CLI_SURGERY_RUN_CONFIG_DEFAULT as CLI_SURGERY_RUN_CONFIG_DEFAULT,
-    CLI_SURGERY_RUN_DESCRIPTION as CLI_SURGERY_RUN_DESCRIPTION,
-    FIELD_HELP_SURGERY_RUN as FIELD_HELP_SURGERY_RUN,
-    SurgeryRunConfig as SurgeryRunConfig,
-    parse_surgery_run_config as parse_surgery_run_config,
-)
-from transformer_surgery.models.adapters import load_surgery_student_checkpoint as load_surgery_student_checkpoint
-from transformer_surgery.pipeline import (
-    accuracy_and_loss as accuracy_and_loss,
-    add_dataclass_cli_args as add_dataclass_cli_args,
-    apply_device_from_config as apply_device_from_config,
-    apply_dtype_from_config as apply_dtype_from_config,
-    build_config_cli_parser as build_config_cli_parser,
-    cli_overrides_from_namespace as cli_overrides_from_namespace,
-    describe_device as describe_device,
-    describe_dtype as describe_dtype,
-    distill_student_from_teacher_jeffreys as distill_surgery_from_teacher_jeffreys,
-    eval_distillation_metrics as eval_distillation_metrics,
-    get_device as get_device,
-    load_dataclass_from_json as load_dataclass_from_json,
-    merge_post_distill_into_surgery_meta as merge_post_distill_into_surgery_meta,
-    parse_cli_config as parse_cli_config,
-    save_model_checkpoint as save_deit_checkpoint,
-    set_default_device as set_default_device,
-    set_seed as set_seed,
-)

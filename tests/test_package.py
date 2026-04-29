@@ -1,5 +1,6 @@
 import glob
 import os
+import importlib.util
 import subprocess
 import sys
 import unittest
@@ -12,16 +13,18 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackageSmokeTests(unittest.TestCase):
     def test_imports(self) -> None:
         import transformer_surgery
-        from transformer_surgery import models, ops, pet, pipeline, ptq
+        from transformer_surgery import models, ops, pipeline, ptq
+        from transformer_surgery.models import pet
         from transformer_surgery.models.adapters import get_model_adapter
 
         self.assertTrue(transformer_surgery.__all__)
         self.assertTrue(hasattr(models, "DeiTTinySurgeryModel"))
         self.assertEqual(get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
         self.assertTrue(hasattr(ops, "AffineContract"))
-        self.assertTrue(hasattr(pet, "PretrainPetConfig"))
+        self.assertEqual(pet.PET_NUM_CLASSES, 37)
         self.assertTrue(hasattr(pipeline, "parse_cli_config"))
         self.assertTrue(hasattr(ptq, "PTQSurgeryConfig"))
+        self.assertIsNone(importlib.util.find_spec("transformer_surgery.pet"))
 
     def test_configs_load(self) -> None:
         from transformer_surgery.cli.distill_config import (

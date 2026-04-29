@@ -14,7 +14,7 @@ from transformer_surgery.cli.pretrain_config import (
     parse_pretrain_pet_config,
     pretrain_train_config_record,
 )
-from transformer_surgery.pet import (
+from transformer_surgery.models.pet import (
     PET_NUM_CLASSES,
     build_pet_loaders,
     create_deit_tiny_pet,

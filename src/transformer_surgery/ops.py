@@ -28,7 +28,7 @@ def get_surgery_dtype() -> torch.dtype:
 
 
 def set_surgery_dtype(dt: torch.dtype) -> None:
-    """Set global surgery dtype (mirrors process device pattern in ``transformer_surgery.pet``)."""
+    """Set global surgery dtype (mirrors the process device pattern in ``transformer_surgery.pipeline``)."""
     global _SURGERY_DTYPE
     _SURGERY_DTYPE = dt
 

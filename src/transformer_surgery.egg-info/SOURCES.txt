@@ -2,7 +2,6 @@ README.md
 pyproject.toml
 src/transformer_surgery/__init__.py
 src/transformer_surgery/ops.py
-src/transformer_surgery/pet.py
 src/transformer_surgery/pipeline.py
 src/transformer_surgery/ptq.py
 src/transformer_surgery.egg-info/PKG-INFO
@@ -23,4 +22,5 @@ src/transformer_surgery/cli/surgery_config.py
 src/transformer_surgery/models/__init__.py
 src/transformer_surgery/models/adapters.py
 src/transformer_surgery/models/deit_tiny.py
+src/transformer_surgery/models/pet.py
 tests/test_package.py
