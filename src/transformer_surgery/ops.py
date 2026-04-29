@@ -808,7 +808,6 @@ class SurgeryMeta:
     calibration: Dict[str, float] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
     reference_checkpoint: str = ""
-    pet_ref_checkpoint: str = ""
     allow_matmul: bool = False
 
     def to_json(self, path: str) -> None:
@@ -826,7 +825,6 @@ class SurgeryMeta:
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,
                     "module_mapping": self.module_mapping,
                     "reference_checkpoint": self.reference_checkpoint,
-                    "pet_ref_checkpoint": self.pet_ref_checkpoint,
                     "allow_matmul": self.allow_matmul,
                 },
                 f,

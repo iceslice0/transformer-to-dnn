@@ -20,7 +20,7 @@ class PTQSurgeryConfig:
     workers: int = 2
     randaugment: bool = True
     ra_magnitude: int = 9
-    random_erasing: float = 0.0
+    random_erasing_prob: float = 0.0
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
     calibration_batches: int = 4
@@ -41,12 +41,8 @@ class PTQSurgeryConfig:
     per_output_channel: bool = True
     top_k: Optional[int] = None
     eps: Optional[float] = None
-    debug_node_stats: bool = True
-    quiet: bool = False
     log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
-    # Print effective quant policy + per-node table; set True or pass --quant-policy-debug.
-    quant_policy_debug: bool = False
 
     @classmethod
     def load(cls, json_path: str) -> "PTQSurgeryConfig":
@@ -64,13 +60,5 @@ def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
         default="configs/ptq/full_8bit.json",
         help="JSON config for PTQ wrapping and validation.",
     )
-    parser.add_argument(
-        "--quant-policy-debug",
-        action="store_true",
-        help="Print per-node weight scale mode (per_output_channel applies to Linear/Conv2d weights only).",
-    )
     args = parser.parse_args(argv)
-    cfg = PTQSurgeryConfig.load(args.config)
-    if args.quant_policy_debug:
-        cfg.quant_policy_debug = True
-    return cfg
+    return PTQSurgeryConfig.load(args.config)

@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformer_surgery.cli.ptq_config import PTQSurgeryConfig, parse_ptq_config
-from transformer_surgery.model_adapters import get_model_adapter, load_surgery_student_checkpoint
+from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
 from transformer_surgery.pipeline import (
     apply_device_from_config,
     apply_dtype_from_config,
@@ -619,27 +619,6 @@ def _node_debug_metadata(data: NodeCalibrationData) -> Dict[str, Any]:
     }
 
 
-def _print_quant_policy_report(cfg: PTQSurgeryConfig, node_meta: List[Dict[str, Any]]) -> None:
-    print("=== quant policy (per_output_channel) ===", flush=True)
-    print(
-        "per_output_channel applies to **Linear/Conv2d weight** quantization only: True = per-output-channel "
-        "scales, False = one global weight scale (usually catastrophic). Affine/unary/coeff always use one "
-        "global weight scale. MatMul: activations only.",
-        flush=True,
-    )
-    print(f"  Config: per_output_channel={cfg.per_output_channel}", flush=True)
-    print("  Wrapped nodes:", flush=True)
-    for meta in node_meta:
-        w_eff = "per-output-ch" if meta.get("per_output_channel_weights_effective") else "global"
-        applies = "yes" if meta["kind"] in ("linear", "conv2d") else "n/a (not linear/conv)"
-        print(
-            f"    {meta['name']}: kind={meta['kind']}  flag_applies={applies}  "
-            f"weight_scale_mode={w_eff}  out_scale_mode={meta.get('out_scale_mode')}",
-            flush=True,
-        )
-    print("=== end quant policy ===", flush=True)
-
-
 @torch.no_grad()
 def validate_model(
     model: nn.Module,
@@ -684,8 +663,7 @@ def _build_wrapped_model(
         wrapper = CalibratedAffinePTQWrapper(name, _get_module(wrapped, name), cal, cfg)
         _set_module(wrapped, name, wrapper)
         meta = wrapper.metadata()
-        if cfg.debug_node_stats:
-            meta["calibration_debug"] = _node_debug_metadata(cal)
+        meta["calibration_debug"] = _node_debug_metadata(cal)
         node_meta.append(meta)
     return wrapped, node_meta
 
@@ -750,34 +728,26 @@ def main() -> None:
     device = apply_device_from_config(cfg)
     dtype = apply_dtype_from_config(cfg)
     fp_path = os.path.abspath(cfg.fp_checkpoint)
-    if not os.path.isfile(fp_path):
-        raise SystemExit(
-            f"Missing fp surgery checkpoint: {fp_path}\n"
-            "Run python -m transformer_surgery.cli.run_surgery or python -m transformer_surgery.cli.distill first."
-        )
 
-    if not cfg.quiet:
-        print(f"Using device: {describe_device(device)}", flush=True)
-        print(f"Requested surgery dtype: {describe_dtype(dtype)}", flush=True)
-        if cfg.config_json_path:
-            print(f"config_json={cfg.config_json_path}", flush=True)
+    print(f"Using device: {describe_device(device)}", flush=True)
+    print(f"Requested surgery dtype: {describe_dtype(dtype)}", flush=True)
+    if cfg.config_json_path:
+        print(f"config_json={cfg.config_json_path}", flush=True)
 
     criterion = nn.CrossEntropyLoss()
 
     fp_model, fp_extra = load_surgery_student_checkpoint(fp_path, cfg)
     adapter = get_model_adapter(fp_extra.get("model_key", getattr(cfg, "model_key", None)))
     _train_loader, val_loader = adapter.build_loaders(cfg)
-    if not cfg.quiet:
-        print(f"Using model adapter: {adapter.key}", flush=True)
-        print(f"Loaded checkpoint dtype: {describe_dtype(get_surgery_dtype())}", flush=True)
+    print(f"Using model adapter: {adapter.key}", flush=True)
+    print(f"Loaded checkpoint dtype: {describe_dtype(get_surgery_dtype())}", flush=True)
     selected = _build_node_selection(fp_model, cfg)
     if not selected:
         raise SystemExit("No PTQ-wrappable nodes selected by the current config.")
 
-    if not cfg.quiet:
-        print(f"Selected {len(selected)} PTQ node(s).", flush=True)
-        for name, kind in selected.items():
-            print(f"  {name}: {kind}", flush=True)
+    print(f"Selected {len(selected)} PTQ node(s).", flush=True)
+    for name, kind in selected.items():
+        print(f"  {name}: {kind}", flush=True)
 
     controller = CalibrationController(
         selected=selected,
@@ -788,8 +758,7 @@ def main() -> None:
     fp_acc, fp_loss = validate_model(fp_model, val_loader, criterion, calibration=controller)
     controller.close()
 
-    if not cfg.quiet:
-        print(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}", flush=True)
+    print(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}", flush=True)
 
     missing = [name for name in selected if not controller.cache[name].output_samples]
     if missing:
@@ -802,18 +771,14 @@ def main() -> None:
         fp_model, selected, int(cfg.weight_bits)
     )
 
-    if not cfg.quiet:
-        print(f"Wrapped model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}", flush=True)
-        print(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}", flush=True)
-        if linear_conv_max_sg_over_spc is not None:
-            print(
-                f"Linear/Conv weight_scale: max(s_global/s_per_channel)={linear_conv_max_sg_over_spc:.6g} "
-                f"(over all selected conv/linear output channels; same symmetric scales as PTQ)",
-                flush=True,
-            )
-
-    if cfg.quant_policy_debug:
-        _print_quant_policy_report(cfg, node_meta)
+    print(f"Wrapped model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}", flush=True)
+    print(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}", flush=True)
+    if linear_conv_max_sg_over_spc is not None:
+        print(
+            f"Linear/Conv weight_scale: max(s_global/s_per_channel)={linear_conv_max_sg_over_spc:.6g} "
+            f"(over all selected conv/linear output channels; same symmetric scales as PTQ)",
+            flush=True,
+        )
 
     meta = _ptq_summary(
         cfg,
@@ -845,15 +810,14 @@ def main() -> None:
         "calibration_batches": int(cfg.calibration_batches),
         "calibration_examples_per_node": int(cfg.calibration_examples_per_node),
     }
-    write_model_structure_txt(model_log_abs, wrapped_model, adapter.ptq_log_title)
+    write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped Surgery Model")
     save_model_checkpoint(out_abs, wrapped_model, extra=out_extra)
     with open(meta_abs, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    if not cfg.quiet:
-        print(f"wrote {model_log_abs}", flush=True)
-        print(f"wrote {out_abs}", flush=True)
-        print(f"wrote {meta_abs}", flush=True)
+    print(f"wrote {model_log_abs}", flush=True)
+    print(f"wrote {out_abs}", flush=True)
+    print(f"wrote {meta_abs}", flush=True)
 
 
 if __name__ == "__main__":

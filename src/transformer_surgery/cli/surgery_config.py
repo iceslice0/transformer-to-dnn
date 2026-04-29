@@ -19,7 +19,6 @@ class SurgeryRunConfig:
     top_k: int = 32
     eps: float = 1e-5
     reference_checkpoint: Optional[str] = None
-    pet_ref_checkpoint: Optional[str] = None
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
     disable_layernorm_replacement: bool = False
@@ -41,8 +40,7 @@ class SurgeryRunConfig:
 
 FIELD_HELP_SURGERY_RUN: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
-    "reference_checkpoint": "Generic reference/teacher checkpoint path. Overrides legacy pet_ref_checkpoint when set.",
-    "pet_ref_checkpoint": "Legacy DeiT-Tiny Pet reference checkpoint path.",
+    "reference_checkpoint": "Reference/teacher checkpoint path.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",

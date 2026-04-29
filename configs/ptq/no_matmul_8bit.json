@@ -9,7 +9,7 @@
   "workers": 2,
   "randaugment": true,
   "ra_magnitude": 9,
-  "random_erasing": 0.0,
+  "random_erasing_prob": 0.0,
   "device": "cuda",
   "surgery_dtype": "float16",
   "calibration_batches": 4,
@@ -23,7 +23,5 @@
   "activation_bits": 8,
   "affine_activation_bits": 12,
   "matmul_activation_bits": 8,
-  "per_output_channel": true,
-  "debug_node_stats": true,
-  "quiet": false
+  "per_output_channel": true
 }

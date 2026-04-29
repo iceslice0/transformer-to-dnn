@@ -20,7 +20,7 @@ import os
 import torch.nn as nn
 
 from transformer_surgery.cli.surgery_config import SurgeryRunConfig, parse_surgery_run_config
-from transformer_surgery.model_adapters import get_model_adapter
+from transformer_surgery.models.adapters import get_model_adapter
 from transformer_surgery.pipeline import (
     accuracy_and_loss,
     apply_device_from_config,
@@ -43,12 +43,6 @@ def main() -> None:
     dtype = apply_dtype_from_config(cfg)
 
     reference_path = adapter.reference_checkpoint_path(cfg)
-    if not os.path.isfile(reference_path):
-        hint = f"\nRun first: {adapter.pretrain_command}" if adapter.pretrain_command else ""
-        raise SystemExit(
-            f"Missing reference checkpoint for model adapter {adapter.key!r}: {reference_path}{hint}"
-        )
-
     print(f"Using device: {describe_device(device)}", flush=True)
     print(f"Using surgery dtype: {describe_dtype(dtype)}", flush=True)
     print(f"Using model adapter: {adapter.key}", flush=True)
@@ -64,7 +58,7 @@ def main() -> None:
     write_model_structure_txt(
         os.path.join(log_dir, "model_before_surgery.txt"),
         ref,
-        adapter.reference_log_title,
+        "Reference Model (before surgery transform)",
     )
     print(f"wrote {os.path.join(log_dir, 'model_before_surgery.txt')}", flush=True)
 
@@ -91,7 +85,7 @@ def main() -> None:
     write_model_structure_txt(
         os.path.join(log_dir, "model_after_surgery.txt"),
         model,
-        adapter.surgery_log_title,
+        "Surgery Model (after transform, pre-finetune checkpoint)",
     )
     print(f"wrote {os.path.join(log_dir, 'model_after_surgery.txt')}", flush=True)
 

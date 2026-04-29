@@ -17,7 +17,7 @@ What the output of the work should be
 
 You should produce:
 
-- a transformed model definition in Python (the included adapter uses ``src/transformer_surgery/model.py``)
+- a transformed model definition in Python (the included adapter uses ``src/transformer_surgery/models/deit_tiny.py``)
 - scripts that perform surgery, optional distillation fine-tuning, and optional PTQ
 - a checkpoint after surgery, before fine-tuning
 - a checkpoint after short fine-tuning (optional pipeline step)
@@ -37,7 +37,7 @@ registering a model adapter rather than by adding model-specific branches to tho
 Allowed graph basis after surgery
 
 After the rewrite, the strict graph uses explicit modules in ``src/transformer_surgery/ops.py`` and
-``src/transformer_surgery/model.py``. Conceptually:
+``src/transformer_surgery/models/deit_tiny.py``. Conceptually:
 
 A. Affine and fixed-linear nodes
 
@@ -157,7 +157,7 @@ Validation: Jeffreys divergence metrics vs dense / naive top-k (see ``transforme
 
 Concrete building blocks (current code)
 
-These are the main exported concepts; names match ``transformer_surgery.ops`` / ``transformer_surgery.model``:
+These are the main exported concepts; names match ``transformer_surgery.ops`` / ``transformer_surgery.models``:
 
 - **Fixed affine:** ``AffineContract``, ``AffineFixedMix``, ``AffineScaleBias``
 - **Unary:** ``UnaryMean``, ``UnarySum``, ``UnaryScale``, ``UnarySquare``, ``UnaryExp``, ``UnaryLogPlusEps``,

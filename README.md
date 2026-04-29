@@ -46,7 +46,7 @@ Default configs live under `configs/`:
 - `configs/ptq/*.json`: PTQ variants for full, linear-only, no-matmul, and per-tensor quantization.
 
 Pass a different config with `--config path/to/config.json`. CLI flags override JSON fields where supported.
-For adapter-based stages, `reference_checkpoint` is the generic teacher/reference checkpoint field; legacy configs may still use `pet_ref_checkpoint`.
+For adapter-based stages, `reference_checkpoint` is the teacher/reference checkpoint field.
 
 ## Artifacts
 

@@ -12,11 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackageSmokeTests(unittest.TestCase):
     def test_imports(self) -> None:
         import transformer_surgery
-        from transformer_surgery import model, model_adapters, ops, pet, pipeline, ptq
+        from transformer_surgery import models, ops, pet, pipeline, ptq
+        from transformer_surgery.models.adapters import get_model_adapter
 
         self.assertTrue(transformer_surgery.__all__)
-        self.assertTrue(hasattr(model, "DeiTTinySurgeryModel"))
-        self.assertEqual(model_adapters.get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
+        self.assertTrue(hasattr(models, "DeiTTinySurgeryModel"))
+        self.assertEqual(get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
         self.assertTrue(hasattr(ops, "AffineContract"))
         self.assertTrue(hasattr(pet, "PretrainPetConfig"))
         self.assertTrue(hasattr(pipeline, "parse_cli_config"))
@@ -79,7 +80,7 @@ class PackageSmokeTests(unittest.TestCase):
                 self.assertIn("--config", proc.stdout)
 
     def test_model_instantiates_on_cpu(self) -> None:
-        from transformer_surgery.model import DeiTTinySurgeryModel
+        from transformer_surgery.models import DeiTTinySurgeryModel
 
         model = DeiTTinySurgeryModel(num_classes=37).cpu()
         self.assertEqual(model.num_classes, 37)

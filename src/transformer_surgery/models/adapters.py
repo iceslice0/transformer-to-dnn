@@ -32,22 +32,10 @@ def _is_set(value: Any) -> bool:
 
 
 def _model_key_from_config_or_extra(cfg: Any = None, extra: Optional[Mapping[str, Any]] = None) -> str:
-    cfg_key = (
-        str(getattr(cfg, "model_key")).strip()
-        if cfg is not None and _is_set(getattr(cfg, "model_key", None))
-        else ""
-    )
-    extra_key = (
-        str(extra["model_key"]).strip()
-        if extra is not None and _is_set(extra.get("model_key"))
-        else ""
-    )
-    if extra_key and (not cfg_key or cfg_key == DEFAULT_MODEL_KEY):
-        return extra_key
-    if cfg_key:
-        return cfg_key
-    if extra_key:
-        return extra_key
+    if extra is not None and _is_set(extra.get("model_key")):
+        return str(extra["model_key"]).strip()
+    if cfg is not None and _is_set(getattr(cfg, "model_key", None)):
+        return str(getattr(cfg, "model_key")).strip()
     return DEFAULT_MODEL_KEY
 
 
@@ -56,14 +44,9 @@ class SurgeryModelAdapter:
     patient_name: str = "unknown"
     dataset_name: str = "unknown"
     pretrain_command: str = ""
-    reference_log_title: str = "Reference Model"
-    surgery_log_title: str = "Surgery Model"
-    ptq_log_title: str = "PTQ-Wrapped Surgery Model"
 
     def reference_checkpoint_path(self, cfg: Any) -> str:
-        generic = getattr(cfg, "reference_checkpoint", None)
-        legacy = getattr(cfg, "pet_ref_checkpoint", None)
-        path = generic if _is_set(generic) else legacy
+        path = getattr(cfg, "reference_checkpoint", None)
         if not _is_set(path):
             raise ValueError(f"No reference checkpoint configured for model adapter {self.key!r}")
         return os.path.abspath(str(path))
@@ -112,7 +95,6 @@ class SurgeryModelAdapter:
             calibration=dict(calibration),
             module_mapping=module_mapping,
             reference_checkpoint=reference_checkpoint_abs,
-            pet_ref_checkpoint=reference_checkpoint_abs if self.key == DEFAULT_MODEL_KEY else "",
             allow_matmul=bool(cfg.allow_matmul),
         )
 
@@ -140,9 +122,6 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
     patient_name = "DeiT-Tiny"
     dataset_name = "Oxford-IIIT Pet"
     pretrain_command = "python -m transformer_surgery.cli.pretrain_pet"
-    reference_log_title = "Timm DeiT-Tiny (Pet reference, before surgery transform)"
-    surgery_log_title = "DeiTTinySurgeryModel (after surgery, pre-finetune checkpoint)"
-    ptq_log_title = "PTQ-Wrapped DeiT-Tiny Surgery Model"
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         from transformer_surgery.pet import build_pet_loaders
@@ -155,13 +134,13 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         return load_timm_deit_pet_checkpoint(path)
 
     def build_surgery_model(self, cfg: Any) -> nn.Module:
-        from transformer_surgery.model import DeiTTinySurgeryModel
+        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
         from transformer_surgery.pet import PET_NUM_CLASSES
 
         return DeiTTinySurgeryModel.from_surgery_run_config(cfg, num_classes=PET_NUM_CLASSES)
 
     def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
-        from transformer_surgery.model import DeiTTinySurgeryModel
+        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
         from transformer_surgery.pet import PET_NUM_CLASSES
 
         return DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=PET_NUM_CLASSES)
@@ -170,7 +149,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         return student.load_from_timm(reference)
 
     def freeze_surgery_parameters(self, model: nn.Module) -> None:
-        from transformer_surgery.model import freeze_eps_parameters
+        from transformer_surgery.models.deit_tiny import freeze_eps_parameters
 
         freeze_eps_parameters(model)
 
@@ -327,8 +306,7 @@ def load_surgery_student_checkpoint(
         payload = torch.load(path, map_location=device)
     extra = dict(payload["extra"])
     if adapter is None:
-        adapter_key = extra.get("model_key") if _is_set(extra.get("model_key")) else getattr(cfg, "model_key", None)
-        adapter = get_model_adapter(adapter_key)
+        adapter = get_model_adapter(cfg, extra=extra)
     if getattr(cfg, "top_k", None) is not None:
         extra["top_k"] = int(cfg.top_k)
     if getattr(cfg, "eps", None) is not None:
