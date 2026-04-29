@@ -22,9 +22,8 @@ from transformer_surgery.ops import (
     get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
     jeffreys_naive_topk,
-    set_surgery_dtype,
 )
-from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, describe_dtype, dtype_from_name, get_device
+from transformer_surgery.util import DEFAULT_MODEL_KEY, describe_dtype, get_device
 
 
 def _is_set(value: Any) -> bool:
@@ -43,7 +42,6 @@ class SurgeryModelAdapter:
     key: str = DEFAULT_MODEL_KEY
     patient_name: str = "unknown"
     dataset_name: str = "unknown"
-    pretrain_command: str = ""
 
     def reference_checkpoint_path(self, cfg: Any) -> str:
         path = getattr(cfg, "reference_checkpoint", None)
@@ -121,7 +119,6 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
     key = DEFAULT_MODEL_KEY
     patient_name = "DeiT-Tiny"
     dataset_name = "Oxford-IIIT Pet"
-    pretrain_command = "python -m transformer_surgery.cli.pretrain_pet"
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         from transformer_surgery.models.pet import build_pet_loaders
@@ -157,7 +154,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
     def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, float]:
         """
         DeiT-specific diagnostics: layernorm rewrite MSE and dense-vs-top-k Jeffreys metrics.
-        The generic surgery pipeline treats this as opaque adapter metadata.
+        The generic surgery stage treats this as opaque adapter metadata.
         """
         device = get_device()
         dt = get_surgery_dtype()
@@ -311,9 +308,7 @@ def load_surgery_student_checkpoint(
         extra["top_k"] = int(cfg.top_k)
     if getattr(cfg, "eps", None) is not None:
         extra["eps_ln"] = float(cfg.eps)
-    dtype_name = str(extra.get("surgery_dtype", getattr(cfg, "surgery_dtype", "bfloat16"))).strip()
-    runtime_dtype = dtype_from_name(dtype_name)
-    set_surgery_dtype(runtime_dtype)
+    runtime_dtype = get_surgery_dtype()
     extra["surgery_dtype"] = describe_dtype(runtime_dtype)
     extra.setdefault("model_key", adapter.key)
     extra.setdefault("patient", adapter.patient_name)

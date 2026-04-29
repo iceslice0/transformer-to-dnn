@@ -1,5 +1,4 @@
-
-What this project is trying to do
+# Surgery
 
 Take a pretrained classifier model and rewrite it into a graph that uses
 only three kinds of things:
@@ -15,12 +14,10 @@ exists separately; QAT may follow).
 
 What the output of the work should be
 
-You should produce:
+The surgery stage should produce:
 
 - a transformed model definition in Python (the included adapter uses ``src/transformer_surgery/models/deit_tiny.py``)
-- scripts that perform surgery, optional distillation fine-tuning, and optional PTQ
 - a checkpoint after surgery, before fine-tuning
-- a checkpoint after short fine-tuning (optional pipeline step)
 - metadata describing the surgery choices and validation results
 
 Default patient and dataset
@@ -31,8 +28,8 @@ Patient:
 Dataset:
 - Oxford-IIIT Pet classification
 
-Surgery, distillation, and PTQ are adapter-driven. Extra models or datasets should be added by
-registering a model adapter rather than by adding model-specific branches to those processing CLIs.
+Surgery is adapter-driven. Extra models or datasets should be added by registering a model adapter
+rather than by adding model-specific branches to the processing CLI.
 
 Allowed graph basis after surgery
 
@@ -150,8 +147,7 @@ opaque binary ops.
 Normalization avoids raw ``/`` in the strict path (``exp(vals - log(z_tail+eps))`` style); with
 ``allow_matmul=True``, reciprocal + ``MatMulHadamard`` may be used.
 
-Module: ``GibbsTopKSoftmax`` (selection uses ``torch.topk`` in ``forward``). A separate
-``SelectionRoutingTopK`` helper exists in ``transformer_surgery.ops`` but is not required by the current Gibbs path.
+Module: ``GibbsTopKSoftmax`` (selection uses ``torch.topk`` in ``forward``).
 
 Validation: Jeffreys divergence metrics vs dense / naive top-k (see ``transformer_surgery.ops`` / run scripts).
 
@@ -173,34 +169,19 @@ These are the main exported concepts; names match ``transformer_surgery.ops`` / 
 There are **no** separate classes named ``ExplicitAdd``, ``ExplicitMean``, ``SetSign``, ``AbsOp``,
 ``MultiTailPWLEpilogue`` — those ideas are expressed with the modules above.
 
-What the main scripts do (reference)
+What the surgery CLI does
 
 - ``python -m transformer_surgery.cli.surgery``: load Pet timm checkpoint, build surgery student, eval, write
   ``ts_surgery_<config>.pt``, ``artifacts/metadata/ts_surgery_<config>.json``, and
   ``artifacts/logs/ts_surgery_<config>_model_{before,after}_surgery.txt``
   (includes forward **output shape** traces via ``write_model_structure_txt``).
-- ``python -m transformer_surgery.cli.distill``: Jeffreys distillation / fine-tuning from config.
-- ``python -m transformer_surgery.cli.ptq``: optional post-training quantization; writes
-  ``artifacts/logs/ts_ptq_<config>_model_after_ptq.txt``.
-
-Fine-tuning rule
-
-Trainable:
-- affine weights and biases where ``requires_grad`` is set
-- PWL parameters (knot values)
-- ``gamma``/``beta`` in ``AffineScaleBias``
-
-Not trainable:
-- fixed ``eps`` buffers/parameters frozen by ``freeze_eps_parameters`` (and similar fixed scalars
-  per config)
 
 Artifacts to save
 
 Save:
 - transformed model Python code
 - pre-finetune checkpoint
-- post-finetune checkpoint (when run)
-- surgery / PTQ metadata JSON
+- surgery metadata JSON
 - optional calibration stats (LN MSE, Jeffreys metrics, top-k, GELU PWL knot positions in ``pwl``, eps)
 - text dumps under ``artifacts/logs/`` with model structure and per-layer forward output shapes
 
@@ -216,7 +197,7 @@ The surgery is acceptable only if:
 5. No ``torch.nn.LayerNorm`` remains in blocks that are configured for surgery LN.
 6. No dense softmax over full keys when surgery softmax is enabled.
 7. No variable ``torch.matmul`` in attention score or sparse value paths when ``allow_matmul=False``.
-8. Checkpoints and metadata are produced for the chosen pipeline steps.
+8. Checkpoint, metadata, and logs are produced for the surgery config.
 
 Final instruction
 
@@ -236,4 +217,4 @@ Do:
 - save real PyTorch checkpoints and human-readable ``artifacts/logs/*.txt`` structure dumps
 
 The final transformed model must be a real saved PyTorch model in this basis and suitable for
-later quantization of affine nodes (see PTQ script and ``ptq_plan.md``).
+later distillation and quantization of affine nodes (see ``docs/distill.md`` and ``docs/ptq.md``).

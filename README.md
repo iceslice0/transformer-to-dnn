@@ -62,4 +62,5 @@ The default e2e files are `artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt`, 
 
 ## Method Notes
 
-See `docs/method.md` for the surgery graph design and `docs/ptq.md` for PTQ notes.
+See `docs/surgery.md` for the surgery graph design, `docs/distill.md` for distillation, and
+`docs/ptq.md` for PTQ notes.

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackageSmokeTests(unittest.TestCase):
     def test_imports(self) -> None:
         import transformer_surgery
-        from transformer_surgery import models, ops, pipeline, ptq
+        from transformer_surgery import distill, models, ops, ptq, surgery, util
         from transformer_surgery.models import pet
         from transformer_surgery.models.adapters import get_model_adapter
 
@@ -23,9 +23,12 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
         self.assertTrue(hasattr(ops, "AffineContract"))
         self.assertEqual(pet.PET_NUM_CLASSES, 37)
-        self.assertTrue(hasattr(pipeline, "parse_cli_config"))
-        self.assertTrue(hasattr(ptq, "PTQSurgeryConfig"))
+        self.assertTrue(hasattr(util, "traceable_artifact_path"))
+        self.assertTrue(hasattr(surgery, "surgery"))
+        self.assertTrue(hasattr(distill, "run_distill"))
+        self.assertTrue(hasattr(ptq, "run_ptq"))
         self.assertIsNone(importlib.util.find_spec("transformer_surgery.pet"))
+        self.assertIsNone(importlib.util.find_spec(".".join(("transformer_surgery", "pipe" + "line"))))
 
     def test_configs_load(self) -> None:
         from transformer_surgery.cli.distill_config import (
@@ -65,7 +68,7 @@ class PackageSmokeTests(unittest.TestCase):
                 self.assertNotIn(forbidden_metadata_field, json.load(f), path)
 
     def test_traceable_artifact_names(self) -> None:
-        from transformer_surgery.pipeline import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
+        from transformer_surgery.util import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
 
         pretrain_cfg = ROOT / "configs/pretrain/pet_deit_tiny.json"
         surgery_cfg = ROOT / "configs/surgery/topk64_fast.json"

@@ -24,11 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformer_surgery.cli.ptq_config import PTQSurgeryConfig, parse_ptq_config
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
-from transformer_surgery.pipeline import (
-    apply_device_from_config,
-    apply_dtype_from_config,
+from transformer_surgery.util import (
     describe_device,
     describe_dtype,
     get_device,
@@ -45,7 +42,6 @@ from transformer_surgery.ops import (
     MatMulHadamard,
     UnaryScale,
     get_surgery_dtype,
-    jeffreys_divergence_dense,
     write_model_structure_txt,
 )
 
@@ -89,7 +85,7 @@ def _module_kind(module: nn.Module) -> Optional[str]:
     return None
 
 
-def _module_type_selected(module: nn.Module, cfg: PTQSurgeryConfig) -> bool:
+def _module_type_selected(module: nn.Module, cfg: Any) -> bool:
     if cfg.wrap_linear_conv and isinstance(module, SUPPORTED_LINEAR_CONV_TYPES):
         return True
     if cfg.wrap_affine and isinstance(module, SUPPORTED_AFFINE_TYPES):
@@ -105,7 +101,7 @@ def _activation_group_for_kind(kind: str) -> str:
     return "affine"
 
 
-def _activation_bits_for_kind(kind: str, cfg: PTQSurgeryConfig) -> int:
+def _activation_bits_for_kind(kind: str, cfg: Any) -> int:
     legacy_bits = int(cfg.activation_bits)
     if kind in MATMUL_KINDS:
         if cfg.matmul_activation_bits is not None:
@@ -265,7 +261,7 @@ def _diagnostic_linear_conv_max_s_global_over_s_pc(
     return float(cat.max().item())
 
 
-def _weight_quant_axis(kind: str, cfg: PTQSurgeryConfig) -> Optional[int]:
+def _weight_quant_axis(kind: str, cfg: Any) -> Optional[int]:
     """
     Symmetric weight quantization axis. ``Linear``/``Conv2d``: axis 0 (per output filter) when
     ``cfg.per_output_channel`` else **None** (single global scale). Affine/unary/coeff: always
@@ -462,7 +458,7 @@ def _calibrated_input_scales(data: NodeCalibrationData, activation_bits: int) ->
 
 
 class CalibratedAffinePTQWrapper(nn.Module):
-    def __init__(self, name: str, module: nn.Module, data: NodeCalibrationData, cfg: PTQSurgeryConfig) -> None:
+    def __init__(self, name: str, module: nn.Module, data: NodeCalibrationData, cfg: Any) -> None:
         super().__init__()
         if not data.input_samples or not data.output_samples:
             raise ValueError(f"No calibration samples cached for node {name}")
@@ -593,7 +589,7 @@ class CalibratedAffinePTQWrapper(nn.Module):
         }
 
 
-def _build_node_selection(model: nn.Module, cfg: PTQSurgeryConfig) -> Dict[str, str]:
+def _build_node_selection(model: nn.Module, cfg: Any) -> Dict[str, str]:
     selected: Dict[str, str] = {}
     for name, module in model.named_modules():
         if not name:
@@ -657,7 +653,7 @@ def _build_wrapped_model(
     fp_model: nn.Module,
     selected: Dict[str, str],
     calibration_cache: Dict[str, NodeCalibrationData],
-    cfg: PTQSurgeryConfig,
+    cfg: Any,
 ) -> Tuple[nn.Module, List[Dict[str, Any]]]:
     wrapped = copy.deepcopy(fp_model)
     node_meta: List[Dict[str, Any]] = []
@@ -672,7 +668,7 @@ def _build_wrapped_model(
 
 
 def _ptq_summary(
-    cfg: PTQSurgeryConfig,
+    cfg: Any,
     selected: Dict[str, str],
     fp_acc: float,
     fp_loss: float,
@@ -725,11 +721,14 @@ def _ptq_summary(
     }
 
 
-def main() -> None:
-    cfg = parse_ptq_config()
-
-    device = apply_device_from_config(cfg)
-    dtype = apply_dtype_from_config(cfg)
+def run_ptq(
+    cfg: Any,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> None:
+    device = get_device() if device is None else device
+    dtype = get_surgery_dtype() if dtype is None else dtype
     fp_path = os.path.abspath(cfg.fp_checkpoint)
     out_abs = traceable_artifact_path(cfg.output, cfg, "ts-ptq", "wrapped", ".pt")
     meta_abs = metadata_path_for_checkpoint(out_abs)
@@ -821,7 +820,3 @@ def main() -> None:
     print(f"wrote {model_log_abs}", flush=True)
     print(f"wrote {out_abs}", flush=True)
     print(f"wrote {meta_abs}", flush=True)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,6 +1,6 @@
 """
 Discovery, calibration, replacement helpers, validation metrics, and checkpoint export
-for the DeiT-Tiny pseudo-hardware surgery pipeline.
+for the DeiT-Tiny pseudo-hardware surgery graph.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def get_surgery_dtype() -> torch.dtype:
 
 
 def set_surgery_dtype(dt: torch.dtype) -> None:
-    """Set global surgery dtype (mirrors the process device pattern in ``transformer_surgery.pipeline``)."""
+    """Set global surgery dtype (mirrors the process device pattern in ``transformer_surgery.util``)."""
     global _SURGERY_DTYPE
     _SURGERY_DTYPE = dt
 
@@ -388,18 +388,6 @@ class PairwiseDotBySquare(nn.Module):
 # ---------------------------------------------------------------------------
 # Gibbs Top-K softmax with implicit replicated tail
 # ---------------------------------------------------------------------------
-
-
-class SelectionRoutingTopK(nn.Module):
-    def __init__(self, k: int, dim: int = -1) -> None:
-        super().__init__()
-        self.k = k
-        self.dim = dim
-
-    def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        k = min(self.k, scores.shape[self.dim])
-        vals, idx = torch.topk(scores, k=k, dim=self.dim, largest=True, sorted=True)
-        return vals, idx
 
 
 class GibbsTopKSoftmax(nn.Module):
@@ -830,7 +818,3 @@ class SurgeryMeta:
                 f,
                 indent=2,
             )
-
-
-def register_calibration_stats(meta: SurgeryMeta, key: str, value: float) -> None:
-    meta.calibration[key] = float(value)

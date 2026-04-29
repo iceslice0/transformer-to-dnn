@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
-from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_json
+from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
+from transformer_surgery.util import DEFAULT_MODEL_KEY
 
 
 @dataclass
@@ -44,17 +44,31 @@ class PTQSurgeryConfig:
     config_json_path: Optional[str] = None
 
     @classmethod
-    def load(cls, json_path: str) -> "PTQSurgeryConfig":
-        return load_dataclass_from_json(cls, json_path, overrides=None)
+    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "PTQSurgeryConfig":
+        return load_dataclass_from_json(cls, json_path, overrides)
+
+
+FIELD_HELP_PTQ: Dict[str, str] = {
+    "model_key": "Model adapter key. Default: deit_tiny_pet.",
+    "fp_checkpoint": "Float checkpoint to wrap with PTQ modules.",
+    "output": "PTQ checkpoint output path.",
+    "surgery_dtype": "torch dtype name for model load/eval, e.g. bfloat16, float16, or float32.",
+    "include_names": "Only wrap nodes whose module name contains one of these substrings.",
+    "exclude_names": "Skip nodes whose module name contains one of these substrings.",
+    "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",
+}
+
+CLI_PTQ_DESCRIPTION = "Standalone PTQ for surgery checkpoints"
+CLI_PTQ_CONFIG_DEFAULT = "configs/ptq/64_fast_jeffreys_8bit.json"
+CLI_PTQ_CONFIG_HELP = "JSON config for PTQ wrapping and validation."
 
 
 def parse_ptq_config(argv: Optional[Sequence[str]] = None) -> PTQSurgeryConfig:
-    parser = argparse.ArgumentParser(description="Standalone PTQ for surgery checkpoints")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/ptq/64_fast_jeffreys_8bit.json",
-        help="JSON config for PTQ wrapping and validation.",
+    return parse_cli_config(
+        PTQSurgeryConfig,
+        description=CLI_PTQ_DESCRIPTION,
+        config_default=CLI_PTQ_CONFIG_DEFAULT,
+        config_help=CLI_PTQ_CONFIG_HELP,
+        field_help=FIELD_HELP_PTQ,
+        argv=argv,
     )
-    args = parser.parse_args(argv)
-    return PTQSurgeryConfig.load(args.config)

@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
-from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_json, parse_cli_config
+from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
+from transformer_surgery.util import DEFAULT_MODEL_KEY
 
 
 @dataclass

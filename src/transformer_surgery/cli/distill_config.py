@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from transformer_surgery.cli.surgery_config import FIELD_HELP_SURGERY
-from transformer_surgery.pipeline import DEFAULT_MODEL_KEY, load_dataclass_from_json
+from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
+from transformer_surgery.util import DEFAULT_MODEL_KEY
 
 
 @dataclass
@@ -56,3 +57,14 @@ FIELD_HELP_JEFFREYS: Dict[str, str] = {
 CLI_JEFFREYS_DESCRIPTION = "Model-adapter CE + Jeffreys teacher matching"
 CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/64_fast_jeffreys.json"
 CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
+
+
+def parse_distill_config(argv: Optional[Sequence[str]] = None) -> JeffreysDistillConfig:
+    return parse_cli_config(
+        JeffreysDistillConfig,
+        description=CLI_JEFFREYS_DESCRIPTION,
+        config_default=CLI_JEFFREYS_CONFIG_DEFAULT,
+        config_help=CLI_JEFFREYS_CONFIG_HELP,
+        field_help=FIELD_HELP_JEFFREYS,
+        argv=argv,
+    )

@@ -16,12 +16,11 @@ from typing import Any, Optional, Tuple
 import timm
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
-from transformer_surgery.pipeline import accuracy_and_loss, get_device
+from transformer_surgery.util import accuracy_and_loss, get_device, warmup_cosine_scheduler
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -103,11 +102,6 @@ def build_pet_transforms(
     return train_tf, eval_tf
 
 
-def pet_transforms(img_size: int = 224) -> Tuple[transforms.Compose, transforms.Compose]:
-    """Alias: strong aug on by default."""
-    return build_pet_transforms(img_size)
-
-
 def build_pet_loaders(
     cfg: Any,
 ) -> Tuple[DataLoader, DataLoader]:
@@ -184,43 +178,6 @@ def load_timm_deit_pet_checkpoint(path: str) -> nn.Module:
     return model
 
 
-def _warmup_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    total_steps: int,
-    warmup_steps: int,
-    eta_min: float,
-) -> LRScheduler:
-    """
-    Linear warmup (``LinearLR``) then ``CosineAnnealingLR``, chained with ``SequentialLR``.
-    Step once per optimizer step. Matches common ViT fine-tuning schedules without hand-written cos.
-    """
-    total_steps = max(1, int(total_steps))
-    warmup_steps = max(0, int(warmup_steps))
-    warmup_steps = min(warmup_steps, total_steps)
-
-    if warmup_steps <= 0:
-        return CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
-
-    if warmup_steps >= total_steps:
-        return LinearLR(
-            optimizer,
-            start_factor=1e-8,
-            end_factor=1.0,
-            total_iters=total_steps,
-        )
-
-    cosine_steps = max(1, total_steps - warmup_steps)
-    warmup = LinearLR(
-        optimizer,
-        start_factor=1e-8,
-        end_factor=1.0,
-        total_iters=warmup_steps,
-    )
-    cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=eta_min)
-    return SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
-
-
 def _fmt_best_epoch_for_log(best_ep: Optional[int]) -> str:
     """Training epoch (1-based), ``resume`` when baseline was seeded from a checkpoint (0), else ``—``."""
     if best_ep is None:
@@ -230,7 +187,7 @@ def _fmt_best_epoch_for_log(best_ep: Optional[int]) -> str:
     return str(best_ep)
 
 
-def finetune_model_adaptertune_style(
+def train_timm_deit_on_pet(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -238,11 +195,7 @@ def finetune_model_adaptertune_style(
     *,
     resume_val_acc: Optional[float] = None,
 ) -> Tuple[float, float, Optional[int], int]:
-    """
-    Pet timm DeiT-Tiny: train classifier head only (AdamW + warmup + cosine per step).
-    Hyperparameters from ``cfg``; optional ``resume_val_acc`` seeds best-so-far before epoch 1.
-    Optional ``cfg.gap_th`` enables per-epoch gap revert vs best val acc.
-    """
+    """Pet timm DeiT-Tiny classifier-head training."""
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     for n, p in model.named_parameters():
         p.requires_grad = n.startswith("head")
@@ -258,7 +211,7 @@ def finetune_model_adaptertune_style(
     total_steps = max(1, epochs * steps_per_epoch)
     warmup_steps = min(cfg.warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
 
-    scheduler = _warmup_cosine_scheduler(
+    scheduler = warmup_cosine_scheduler(
         opt,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
@@ -326,15 +279,3 @@ def finetune_model_adaptertune_style(
         )
     acc_f, loss_f = accuracy_and_loss(model, val_loader, criterion)
     return acc_f, loss_f, best_ep, gap_revert_count
-
-
-def train_timm_deit_on_pet(
-    ref: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    cfg: "PretrainPetConfig",
-    *,
-    resume_val_acc: Optional[float] = None,
-) -> Tuple[float, float, Optional[int], int]:
-    """Timm DeiT-Tiny Pet head training; delegates to :func:`finetune_model_adaptertune_style`."""
-    return finetune_model_adaptertune_style(ref, train_loader, val_loader, cfg, resume_val_acc=resume_val_acc)

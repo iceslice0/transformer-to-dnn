@@ -21,9 +21,9 @@ from transformer_surgery.models.pet import (
     load_timm_deit_pet_checkpoint,
     train_timm_deit_on_pet,
 )
-from transformer_surgery.pipeline import (
+from transformer_surgery.cli.common import apply_device_from_config
+from transformer_surgery.util import (
     accuracy_and_loss,
-    apply_device_from_config,
     describe_device,
     set_seed,
     traceable_artifact_path,
