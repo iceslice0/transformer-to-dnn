@@ -40,8 +40,6 @@ class JeffreysDistillConfig:
     val_progress_batches: int = 20
     top_k: Optional[int] = None
     eps: Optional[float] = None
-    gibbs_tail_use_prob_eps: Optional[bool] = None
-    gibbs_tail_prob_eps: Optional[float] = None
     config_json_path: Optional[str] = None
 
     @classmethod

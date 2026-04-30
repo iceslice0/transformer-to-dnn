@@ -65,6 +65,11 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     if isinstance(tail_cal, list) and tail_cal:
         values = ", ".join(f"{float(v):.6g}" for v in tail_cal)
         print(f"Calibrated gibbs_tail_prob_eps by block: [{values}]", flush=True)
+    elif cal.get("disable_calib_gibbs_tail_prob"):
+        print(
+            f"gibbs_tail_prob_eps calibration disabled; using configured value {float(cfg.gibbs_tail_prob_eps):.6g}",
+            flush=True,
+        )
 
     print("Building surgery model...", flush=True)
     print(
@@ -79,6 +84,8 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     applied_cal = adapter.apply_calibration(model, cal)
     if applied_cal:
         cal.update(applied_cal)
+        if "gibbs_tail_prob_eps_applied_mean" in applied_cal:
+            cfg.gibbs_tail_prob_eps = float(applied_cal["gibbs_tail_prob_eps_applied_mean"])
         print("Applied calibration:", json.dumps(applied_cal, indent=2), flush=True)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
 
@@ -119,6 +126,7 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
         "gibbs_tail_prob_eps_calibrated_mean",
         "gibbs_tail_prob_eps_applied_by_block",
         "gibbs_tail_prob_eps_applied_mean",
+        "disable_calib_gibbs_tail_prob",
     ):
         if key in cal:
             checkpoint_extra[key] = cal[key]

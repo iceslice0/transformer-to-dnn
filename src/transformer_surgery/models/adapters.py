@@ -90,8 +90,8 @@ class SurgeryModelAdapter:
             patient=self.patient_name,
             dataset=self.dataset_name,
             eps=float(cfg.eps),
-            gibbs_tail_use_prob_eps=bool(cfg.gibbs_tail_use_prob_eps),
             gibbs_tail_prob_eps=float(cfg.gibbs_tail_prob_eps),
+            disable_calib_gibbs_tail_prob=bool(cfg.disable_calib_gibbs_tail_prob),
             top_k=int(cfg.top_k),
             surgery_dtype=str(cfg.surgery_dtype),
             pwl=pwl,
@@ -111,8 +111,8 @@ class SurgeryModelAdapter:
             "mapping": mapping,
             "top_k": int(cfg.top_k),
             "eps_ln": float(cfg.eps),
-            "gibbs_tail_use_prob_eps": bool(cfg.gibbs_tail_use_prob_eps),
             "gibbs_tail_prob_eps": float(cfg.gibbs_tail_prob_eps),
+            "disable_calib_gibbs_tail_prob": bool(cfg.disable_calib_gibbs_tail_prob),
             "config_json": cfg.config_json_path,
             "disable_layernorm_replacement": cfg.disable_layernorm_replacement,
             "disable_attention_surgery": cfg.disable_attention_surgery,
@@ -166,12 +166,12 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         return (q @ k.transpose(-2, -1)) * float(attn.scale)
 
     @staticmethod
-    def _sample_topk_tail_mass(
+    def _sample_topk_scores(
         scores: torch.Tensor,
         top_k: int,
         *,
         max_rows: int = 4096,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         flat = scores.reshape(-1, scores.shape[-1])
         rows = min(flat.shape[0], max_rows)
         teacher = flat[:rows].float()
@@ -179,18 +179,27 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         nk = t.shape[-1]
         k_top = min(int(top_k), nk)
         vals, idx = torch.topk(t, k=k_top, dim=-1, largest=True, sorted=True)
+        return teacher, vals, idx, nk, k_top
+
+    @staticmethod
+    def _topk_tail_mass_stats(
+        teacher: torch.Tensor,
+        idx: torch.Tensor,
+        nk: int,
+        k_top: int,
+    ) -> Dict[str, float]:
+        t = teacher - teacher.max(dim=-1, keepdim=True).values
         if nk > k_top:
             dense = torch.softmax(t, dim=-1)
             top_mass = dense.gather(1, idx).sum(dim=-1)
             tail_mass = (1.0 - top_mass).clamp(0.0, 1.0)
         else:
-            tail_mass = torch.zeros(rows, device=scores.device, dtype=torch.float32)
-        tail_stats = {
+            tail_mass = torch.zeros(teacher.shape[0], device=teacher.device, dtype=torch.float32)
+        return {
             "mean": float(tail_mass.mean().cpu()),
             "min": float(tail_mass.min().cpu()),
             "max": float(tail_mass.max().cpu()),
         }
-        return teacher, vals, idx, nk, k_top, tail_stats
 
     @torch.no_grad()
     def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
@@ -203,8 +212,8 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         reference.eval()
         stats: Dict[str, Any] = {}
         eps = float(cfg.eps)
-        gibbs_tail_use_prob_eps = bool(cfg.gibbs_tail_use_prob_eps)
         gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
+        disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
         top_k = int(cfg.top_k)
         use_cuda = device.type == "cuda"
         batch, _ = next(iter(loader))
@@ -242,17 +251,20 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
             copy_ln_params_to_rewritten(rw, blk.norm1)
             mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
             n_ln += 1
-            scores = self._attention_scores(blk.attn, n1)
-            teacher, vals, idx, nk, k_top, tail_stats = self._sample_topk_tail_mass(scores, top_k)
-            tail_eps_by_block.append(tail_stats["mean"])
-            tail_eps_min_by_block.append(tail_stats["min"])
-            tail_eps_max_by_block.append(tail_stats["max"])
-            if block_idx == 0:
-                block0_teacher = teacher
-                block0_vals = vals
-                block0_idx = idx
-                block0_nk = nk
-                block0_k_top = k_top
+            if block_idx == 0 or not disable_tail_calib:
+                scores = self._attention_scores(blk.attn, n1)
+                teacher, vals, idx, nk, k_top = self._sample_topk_scores(scores, top_k)
+                if not disable_tail_calib:
+                    tail_stats = self._topk_tail_mass_stats(teacher, idx, nk, k_top)
+                    tail_eps_by_block.append(tail_stats["mean"])
+                    tail_eps_min_by_block.append(tail_stats["min"])
+                    tail_eps_max_by_block.append(tail_stats["max"])
+                if block_idx == 0:
+                    block0_teacher = teacher
+                    block0_vals = vals
+                    block0_idx = idx
+                    block0_nk = nk
+                    block0_k_top = k_top
             h = h + blk.attn(n1)
             n2 = blk.norm2(h)
             rw2 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
@@ -272,13 +284,16 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         n_ln += 1
         stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
 
-        stats["gibbs_tail_use_prob_eps"] = gibbs_tail_use_prob_eps
+        stats["disable_calib_gibbs_tail_prob"] = disable_tail_calib
         stats["gibbs_tail_prob_eps_configured"] = gibbs_tail_prob_eps
-        stats["gibbs_tail_prob_eps_calibrated_by_block"] = tail_eps_by_block
-        stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
-        stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
-        stats["gibbs_tail_prob_eps_calibrated_mean"] = float(sum(tail_eps_by_block) / max(len(tail_eps_by_block), 1))
-        metric_tail_prob_eps = tail_eps_by_block[0] if gibbs_tail_use_prob_eps and tail_eps_by_block else gibbs_tail_prob_eps
+        if disable_tail_calib:
+            metric_tail_prob_eps = gibbs_tail_prob_eps
+        else:
+            stats["gibbs_tail_prob_eps_calibrated_by_block"] = tail_eps_by_block
+            stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
+            stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
+            stats["gibbs_tail_prob_eps_calibrated_mean"] = float(sum(tail_eps_by_block) / max(len(tail_eps_by_block), 1))
+            metric_tail_prob_eps = tail_eps_by_block[0] if tail_eps_by_block else gibbs_tail_prob_eps
         stats["gibbs_tail_prob_eps_metric"] = float(metric_tail_prob_eps)
 
         if block0_teacher is None or block0_vals is None or block0_idx is None:
@@ -289,8 +304,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
             block0_idx,
             block0_nk,
             block0_k_top,
-            tail_use_prob_eps=gibbs_tail_use_prob_eps,
-            tail_prob_eps=metric_tail_prob_eps,
+            gibbs_tail_prob_eps=metric_tail_prob_eps,
         ).mean()
         j_naive = jeffreys_naive_topk(block0_teacher, block0_vals, block0_idx, block0_nk, block0_k_top).mean()
         stats["jeffreys_gibbs_mean_cached"] = float(j_gibbs.cpu())
@@ -306,8 +320,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
             idx2,
             block0_nk,
             block0_k_top,
-            tail_use_prob_eps=gibbs_tail_use_prob_eps,
-            tail_prob_eps=metric_tail_prob_eps,
+            gibbs_tail_prob_eps=metric_tail_prob_eps,
         ).mean()
         j_naive2 = jeffreys_naive_topk(teacher2, vals2, idx2, block0_nk, block0_k_top).mean()
         stats["jeffreys_gibbs_mean_synthetic"] = float(j_gibbs2.cpu())
@@ -316,7 +329,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         return stats
 
     def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-        if not bool(getattr(model, "gibbs_tail_use_prob_eps", False)):
+        if bool(calibration.get("disable_calib_gibbs_tail_prob", False)):
             return {}
         values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
         if not isinstance(values, list) or not values or not hasattr(model, "blocks"):
@@ -406,10 +419,6 @@ def load_surgery_student_checkpoint(
         extra["top_k"] = int(cfg.top_k)
     if getattr(cfg, "eps", None) is not None:
         extra["eps_ln"] = float(cfg.eps)
-    if getattr(cfg, "gibbs_tail_use_prob_eps", None) is not None:
-        extra["gibbs_tail_use_prob_eps"] = bool(cfg.gibbs_tail_use_prob_eps)
-    if getattr(cfg, "gibbs_tail_prob_eps", None) is not None:
-        extra["gibbs_tail_prob_eps"] = float(cfg.gibbs_tail_prob_eps)
     runtime_dtype = get_surgery_dtype()
     extra["surgery_dtype"] = describe_dtype(runtime_dtype)
     extra.setdefault("model_key", adapter.key)

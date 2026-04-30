@@ -62,6 +62,7 @@ class PackageSmokeTests(unittest.TestCase):
             JeffreysDistillConfig.load(path)
         for path in glob.glob(str(ROOT / "configs/ptq/*.json")):
             PTQSurgeryConfig.load(path)
+        self.assertFalse(SurgeryConfig.load(str(ROOT / CLI_SURGERY_CONFIG_DEFAULT)).disable_calib_gibbs_tail_prob)
         forbidden_metadata_field = "_".join(("meta", "json"))
         for path in glob.glob(str(ROOT / "configs/**/*.json"), recursive=True):
             with open(path, encoding="utf-8") as f:
@@ -158,14 +159,29 @@ class PackageSmokeTests(unittest.TestCase):
         tail_prob = model.blocks[0].attn.gibbs.gibbs_tail_prob_eps
         self.assertIsInstance(tail_prob, nn.Parameter)
         self.assertEqual(tuple(tail_prob.shape), ())
+        self.assertTrue(hasattr(model.blocks[0].attn.gibbs, "scale_top_probs_by_tail"))
+
+        adapter = get_model_adapter("deit_tiny_pet")
+        disabled_calibration = DeiTTinySurgeryModel(
+            num_classes=37,
+            depth=1,
+            gibbs_tail_prob_eps=0.1,
+        ).cpu()
+        skipped = adapter.apply_calibration(
+            disabled_calibration,
+            {"disable_calib_gibbs_tail_prob": True, "gibbs_tail_prob_eps_calibrated_by_block": [0.02]},
+        )
+        self.assertEqual(skipped, {})
+        self.assertAlmostEqual(
+            float(disabled_calibration.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.1, places=2
+        )
 
         calibrated = DeiTTinySurgeryModel(
             num_classes=37,
             depth=2,
-            gibbs_tail_use_prob_eps=True,
             gibbs_tail_prob_eps=0.1,
         ).cpu()
-        applied = get_model_adapter("deit_tiny_pet").apply_calibration(
+        applied = adapter.apply_calibration(
             calibrated,
             {"gibbs_tail_prob_eps_calibrated_by_block": [0.02, 0.03]},
         )

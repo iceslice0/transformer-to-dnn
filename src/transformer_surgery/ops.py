@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath as _TimmDropPath
 
-# Default number of PWL knots (log, exp, GELU, Gibbs exp epilogue); cap at 17.
+# Default number of PWL knots for scalar PWL modules; currently used by NLGELU.
 PWL_NUM_KNOTS = 17
 
 # Process-wide dtype for surgery tensor literals and ``.to(dtype=...)`` (set via ``apply_dtype_from_config``).
@@ -41,7 +41,6 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
 # directly. External callers may import them to make the routing surface explicit.
 # ---------------------------------------------------------------------------
 
-RoutingReshape = torch.reshape
 RoutingTranspose = torch.transpose
 RoutingCat = torch.cat
 RoutingStack = torch.stack
@@ -52,7 +51,6 @@ RoutingGather = torch.gather
 RoutingMax = torch.max
 RoutingFullLike = torch.full_like
 RoutingReLU = F.relu
-RoutingDropout = nn.Dropout
 RoutingDropPath = _TimmDropPath
 
 
@@ -429,25 +427,24 @@ class PairwiseDotBySquare(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Gibbs Top-K softmax with implicit replicated tail
+# Gibbs Top-K softmax with fixed omitted-tail probability
 # ---------------------------------------------------------------------------
 
 
 class GibbsTopKSoftmax(nn.Module):
     """
-    Sparse Gibbs Top-K with configurable omitted-tail handling.
+    Sparse Gibbs Top-K with a fixed omitted-tail probability parameter.
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
     :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; with
-    ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
+    ``allow_matmul=False`` use ``exp(vals - log(sum_exp + eps))`` (same math, no division).
 
-    ``tail_use_prob_eps=False`` keeps the original approximation:
-    ``Z_tail = sum_k exp(val_k) + (N-K) * exp(s_K)``.
-
-    ``tail_use_prob_eps=True`` reserves probability mass ``gibbs_tail_prob_eps`` for all omitted
-    entries and scales the top-k probabilities by ``1 - gibbs_tail_prob_eps``. The value is an
-    ``nn.Parameter`` initialized from config.
+    ``gibbs_tail_prob_eps`` reserves probability mass for all omitted entries and scales the top-k
+    probabilities by ``1 - gibbs_tail_prob_eps``. The value is an ``nn.Parameter`` initialized from
+    config, then typically overwritten by surgery calibration. The scale is applied to top-k
+    probabilities through an explicit ``AffineHadamard`` module rather than a bare tensor multiply
+    in ``forward``.
 
     Only normalization subgraphs for the chosen ``allow_matmul`` mode are registered.
 
@@ -460,20 +457,17 @@ class GibbsTopKSoftmax(nn.Module):
         top_k: int,
         *,
         eps: float,
-        tail_use_prob_eps: bool,
-        tail_prob_eps: float,
+        gibbs_tail_prob_eps: float,
         allow_matmul: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
         self.top_k = top_k
-        self.tail_use_prob_eps = bool(tail_use_prob_eps)
-        tail_prob = float(tail_prob_eps)
+        tail_prob = float(gibbs_tail_prob_eps)
         if not 0.0 <= tail_prob < 1.0:
-            raise ValueError("tail_prob_eps must be in [0, 1)")
+            raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
         self.gibbs_tail_prob_eps = nn.Parameter(
             torch.tensor(tail_prob, dtype=get_surgery_dtype()),
-            requires_grad=self.tail_use_prob_eps,
         )
         self.allow_matmul = allow_matmul
         e = float(eps)
@@ -483,13 +477,7 @@ class GibbsTopKSoftmax(nn.Module):
             "i,...i->...",
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
         )
-        if not self.tail_use_prob_eps:
-            k_static = min(int(top_k), self.seq_len)
-            self.tail_mass_mul = AffineScale(float(max(0, self.seq_len - k_static)))
-            self.z_tail_contract = AffineContract(
-                "i,...i->...",
-                torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-            )
+        self.scale_top_probs_by_tail = AffineHadamard()
         if allow_matmul:
             self.inv_z = NLReciprocalPlusEps(e)
             self.mul_by_inv_z = AffineHadamard()
@@ -513,18 +501,7 @@ class GibbsTopKSoftmax(nn.Module):
         vals, idx = RoutingTopK(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
-        sum_exp = self.sum_exp_vals(exp_vals)
-
-        if not self.tail_use_prob_eps:
-            exp_tail = self.exp(s_k)
-            if nk > k:
-                tail_term = self.tail_mass_mul(exp_tail)
-            else:
-                tail_term = RoutingFullLike(exp_tail, 0.0)
-            _se, _tt = RoutingBroadcastTensors(sum_exp, tail_term)
-            normalizer = self.z_tail_contract(RoutingStack((_se, _tt), dim=-1))
-        else:
-            normalizer = sum_exp
+        normalizer = self.sum_exp_vals(exp_vals)
 
         if self.allow_matmul:
             inv_z = self.inv_z(normalizer)
@@ -536,20 +513,9 @@ class GibbsTopKSoftmax(nn.Module):
             logits_norm = self.logit_logz_contract(RoutingStack((_v, _nlz), dim=-1))
             top_probs = self.exp(logits_norm)
 
-        if not self.tail_use_prob_eps:
-            probs = top_probs
-            if self.allow_matmul:
-                q_tail = self.mul_by_inv_z(tail_term, inv_z)
-            else:
-                _sk, _nlz2 = RoutingBroadcastTensors(s_k, neg_log_z)
-                sk_norm = self.logit_logz_contract(RoutingStack((_sk, _nlz2), dim=-1))
-                if nk > k:
-                    q_tail = self.tail_mass_mul(self.exp(sk_norm))
-                else:
-                    q_tail = RoutingFullLike(sk_norm, 0.0)
-        elif nk > k:
+        if nk > k:
             tail_prob = self.gibbs_tail_prob_eps.to(device=s_k.device, dtype=s_k.dtype).clamp(0.0, 1.0)
-            probs = top_probs * (1.0 - tail_prob)
+            probs = self.scale_top_probs_by_tail(top_probs, 1.0 - tail_prob)
             q_tail = RoutingExpandAs(tail_prob, s_k)
         else:
             probs = top_probs
@@ -676,42 +642,28 @@ def jeffreys_distance_sparse_teacher(
     nk: int,
     k: int,
     *,
-    tail_use_prob_eps: bool,
-    tail_prob_eps: float,
+    gibbs_tail_prob_eps: float,
 ) -> torch.Tensor:
     """
     teacher_logits: [R, nk]
     vals: top-k stabilized logits (row-wise max subtracted) [R, k]
     idx: [R, k]
-    Dense student q uses either the original k-th-logit replicated tail or a fixed
-    omitted-tail probability mass.
+    Dense student q uses a fixed omitted-tail probability mass.
     """
-    use_prob_eps = bool(tail_use_prob_eps)
-    tail_prob = float(tail_prob_eps)
+    tail_prob = float(gibbs_tail_prob_eps)
     if not 0.0 <= tail_prob < 1.0:
-        raise ValueError("tail_prob_eps must be in [0, 1)")
+        raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
     t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
     p = F.softmax(t, dim=-1)
     _, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
 
-    s_k = vals[:, -1:]
     exp_vals = torch.exp(vals)
-    r = teacher_logits.shape[0]
     q_dense = torch.zeros_like(p)
-    if not use_prob_eps:
-        exp_tail = torch.exp(s_k)
-        tail_count = float(nk - k) if nk > k else 0.0
-        z_tail = exp_vals.sum(dim=-1, keepdim=True) + tail_count * exp_tail
-        q_on_I = exp_vals / (z_tail + denom_eps)
-        if nk > k:
-            q_tail_each = exp_tail / (z_tail + denom_eps)
-            q_dense = RoutingExpand(q_tail_each, r, nk).clone()
-    else:
-        tail_mass = tail_prob if nk > k else 0.0
-        z_top = exp_vals.sum(dim=-1, keepdim=True)
-        q_on_I = (1.0 - tail_mass) * exp_vals / (z_top + denom_eps)
-        if nk > k:
-            q_dense = torch.full_like(p, tail_mass / float(nk - k))
+    tail_mass = tail_prob if nk > k else 0.0
+    z_top = exp_vals.sum(dim=-1, keepdim=True)
+    q_on_I = (1.0 - tail_mass) * exp_vals / (z_top + denom_eps)
+    if nk > k:
+        q_dense = torch.full_like(p, tail_mass / float(nk - k))
     q_dense.scatter_(1, idx, q_on_I)
 
     j = _kl_safe(p, q_dense) + _kl_safe(q_dense, p)
@@ -749,8 +701,7 @@ CALIBRATION_LEGEND_TEXT = (
     "student_post_distill_* and val_*_post_ft: after Jeffreys distillation "
     "(acc and mean CE / Jeffreys; legacy keys val_acc_post_ft retained). "
     "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
-    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters when fixed-tail "
-    "probability mode is active."
+    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
 )
 
 
@@ -882,8 +833,8 @@ class SurgeryMeta:
     patient: str = "DeiT-Tiny"
     dataset: str = "Oxford-IIIT Pet"
     eps: float = 1e-5
-    gibbs_tail_use_prob_eps: bool = False
     gibbs_tail_prob_eps: float = 1e-5
+    disable_calib_gibbs_tail_prob: bool = False
     top_k: int = 32
     surgery_dtype: str = "bfloat16"
     pwl: Dict[str, Any] = field(default_factory=dict)
@@ -900,8 +851,8 @@ class SurgeryMeta:
                     "patient": self.patient,
                     "dataset": self.dataset,
                     "eps": self.eps,
-                    "gibbs_tail_use_prob_eps": self.gibbs_tail_use_prob_eps,
                     "gibbs_tail_prob_eps": self.gibbs_tail_prob_eps,
+                    "disable_calib_gibbs_tail_prob": self.disable_calib_gibbs_tail_prob,
                     "top_k": self.top_k,
                     "surgery_dtype": self.surgery_dtype,
                     "pwl": self.pwl,
