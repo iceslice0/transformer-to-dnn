@@ -19,6 +19,8 @@ class SurgeryConfig:
     workers: int = 2
     top_k: int = 32
     eps: float = 1e-5
+    gibbs_tail_use_prob_eps: bool = False
+    gibbs_tail_prob_eps: float = 1e-5
     reference_checkpoint: Optional[str] = None
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
@@ -41,6 +43,8 @@ class SurgeryConfig:
 FIELD_HELP_SURGERY: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "reference_checkpoint": "Reference/teacher checkpoint path.",
+    "gibbs_tail_use_prob_eps": "Use fixed omitted-tail probability mass instead of the k-th-logit estimate.",
+    "gibbs_tail_prob_eps": "Fixed omitted-tail probability mass used when gibbs_tail_use_prob_eps is true.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",

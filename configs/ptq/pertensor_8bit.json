@@ -2,7 +2,7 @@
   "model_key": "deit_tiny_pet",
   "data_dir": "./data",
   "fp_checkpoint": "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt",
-  "output": "artifacts/checkpoints/ts_ptq_pertensor_8bit_wrapped.pt",
+  "output": "artifacts/checkpoints/ts_ptq_pertensor_8bit.pt",
   "log_dir": "artifacts/logs",
   "batch_size": 32,
   "workers": 2,

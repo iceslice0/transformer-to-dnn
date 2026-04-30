@@ -67,7 +67,10 @@ class SurgeryModelAdapter:
     def freeze_surgery_parameters(self, model: nn.Module) -> None:
         return None
 
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, float]:
+    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+        return {}
+
+    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
         return {}
 
     def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
@@ -77,7 +80,7 @@ class SurgeryModelAdapter:
         self,
         cfg: Any,
         *,
-        calibration: Dict[str, float],
+        calibration: Dict[str, Any],
         reference_checkpoint_abs: str,
         pwl: Dict[str, Any],
         module_mapping: Dict[str, str],
@@ -87,6 +90,8 @@ class SurgeryModelAdapter:
             patient=self.patient_name,
             dataset=self.dataset_name,
             eps=float(cfg.eps),
+            gibbs_tail_use_prob_eps=bool(cfg.gibbs_tail_use_prob_eps),
+            gibbs_tail_prob_eps=float(cfg.gibbs_tail_prob_eps),
             top_k=int(cfg.top_k),
             surgery_dtype=str(cfg.surgery_dtype),
             pwl=pwl,
@@ -106,6 +111,8 @@ class SurgeryModelAdapter:
             "mapping": mapping,
             "top_k": int(cfg.top_k),
             "eps_ln": float(cfg.eps),
+            "gibbs_tail_use_prob_eps": bool(cfg.gibbs_tail_use_prob_eps),
+            "gibbs_tail_prob_eps": float(cfg.gibbs_tail_prob_eps),
             "config_json": cfg.config_json_path,
             "disable_layernorm_replacement": cfg.disable_layernorm_replacement,
             "disable_attention_surgery": cfg.disable_attention_surgery,
@@ -150,8 +157,43 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
 
         freeze_eps_parameters(model)
 
+    @staticmethod
+    def _attention_scores(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+        head_dim = c // int(attn.num_heads)
+        qkv = attn.qkv(x).reshape(b, n, 3, attn.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qkv[0], qkv[1]
+        return (q @ k.transpose(-2, -1)) * float(attn.scale)
+
+    @staticmethod
+    def _sample_topk_tail_mass(
+        scores: torch.Tensor,
+        top_k: int,
+        *,
+        max_rows: int = 4096,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, Dict[str, float]]:
+        flat = scores.reshape(-1, scores.shape[-1])
+        rows = min(flat.shape[0], max_rows)
+        teacher = flat[:rows].float()
+        t = teacher - teacher.max(dim=-1, keepdim=True).values
+        nk = t.shape[-1]
+        k_top = min(int(top_k), nk)
+        vals, idx = torch.topk(t, k=k_top, dim=-1, largest=True, sorted=True)
+        if nk > k_top:
+            dense = torch.softmax(t, dim=-1)
+            top_mass = dense.gather(1, idx).sum(dim=-1)
+            tail_mass = (1.0 - top_mass).clamp(0.0, 1.0)
+        else:
+            tail_mass = torch.zeros(rows, device=scores.device, dtype=torch.float32)
+        tail_stats = {
+            "mean": float(tail_mass.mean().cpu()),
+            "min": float(tail_mass.min().cpu()),
+            "max": float(tail_mass.max().cpu()),
+        }
+        return teacher, vals, idx, nk, k_top, tail_stats
+
     @torch.no_grad()
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, float]:
+    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
         """
         DeiT-specific diagnostics: layernorm rewrite MSE and dense-vs-top-k Jeffreys metrics.
         The generic surgery stage treats this as opaque adapter metadata.
@@ -159,8 +201,10 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         device = get_device()
         dt = get_surgery_dtype()
         reference.eval()
-        stats: Dict[str, float] = {}
+        stats: Dict[str, Any] = {}
         eps = float(cfg.eps)
+        gibbs_tail_use_prob_eps = bool(cfg.gibbs_tail_use_prob_eps)
+        gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
         top_k = int(cfg.top_k)
         use_cuda = device.type == "cuda"
         batch, _ = next(iter(loader))
@@ -182,7 +226,15 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         h = x
         mse_acc = 0.0
         n_ln = 0
-        for blk in reference.blocks:
+        tail_eps_by_block = []
+        tail_eps_min_by_block = []
+        tail_eps_max_by_block = []
+        block0_teacher: Optional[torch.Tensor] = None
+        block0_vals: Optional[torch.Tensor] = None
+        block0_idx: Optional[torch.Tensor] = None
+        block0_nk = 0
+        block0_k_top = 0
+        for block_idx, blk in enumerate(reference.blocks):
             n1 = blk.norm1(h)
             rw = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
                 device=device, dtype=dt
@@ -190,6 +242,17 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
             copy_ln_params_to_rewritten(rw, blk.norm1)
             mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
             n_ln += 1
+            scores = self._attention_scores(blk.attn, n1)
+            teacher, vals, idx, nk, k_top, tail_stats = self._sample_topk_tail_mass(scores, top_k)
+            tail_eps_by_block.append(tail_stats["mean"])
+            tail_eps_min_by_block.append(tail_stats["min"])
+            tail_eps_max_by_block.append(tail_stats["max"])
+            if block_idx == 0:
+                block0_teacher = teacher
+                block0_vals = vals
+                block0_idx = idx
+                block0_nk = nk
+                block0_k_top = k_top
             h = h + blk.attn(n1)
             n2 = blk.norm2(h)
             rw2 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
@@ -209,38 +272,73 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         n_ln += 1
         stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
 
-        attn = reference.blocks[0].attn
-        qkv = attn.qkv(h0).reshape(
-            b,
-            h0.shape[1],
-            3,
-            attn.num_heads,
-            reference.embed_dim // attn.num_heads,
-        ).permute(2, 0, 3, 1, 4)
-        q, k = qkv[0], qkv[1]
-        scores = (q @ k.transpose(-2, -1)) * float(attn.scale)
-        flat = scores.reshape(-1, scores.shape[-1])
-        rows = min(flat.shape[0], 4096)
-        teacher = flat[:rows].clone()
-        t = teacher - teacher.max(dim=-1, keepdim=True).values
-        nk = t.shape[-1]
-        k_top = min(top_k, nk)
-        vals, idx = torch.topk(t, k=k_top, dim=-1, largest=True, sorted=True)
-        j_gibbs = jeffreys_distance_sparse_teacher(teacher, vals, idx, nk, k_top).mean()
-        j_naive = jeffreys_naive_topk(teacher, vals, idx, nk, k_top).mean()
+        stats["gibbs_tail_use_prob_eps"] = gibbs_tail_use_prob_eps
+        stats["gibbs_tail_prob_eps_configured"] = gibbs_tail_prob_eps
+        stats["gibbs_tail_prob_eps_calibrated_by_block"] = tail_eps_by_block
+        stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
+        stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
+        stats["gibbs_tail_prob_eps_calibrated_mean"] = float(sum(tail_eps_by_block) / max(len(tail_eps_by_block), 1))
+        metric_tail_prob_eps = tail_eps_by_block[0] if gibbs_tail_use_prob_eps and tail_eps_by_block else gibbs_tail_prob_eps
+        stats["gibbs_tail_prob_eps_metric"] = float(metric_tail_prob_eps)
+
+        if block0_teacher is None or block0_vals is None or block0_idx is None:
+            return stats
+        j_gibbs = jeffreys_distance_sparse_teacher(
+            block0_teacher,
+            block0_vals,
+            block0_idx,
+            block0_nk,
+            block0_k_top,
+            tail_use_prob_eps=gibbs_tail_use_prob_eps,
+            tail_prob_eps=metric_tail_prob_eps,
+        ).mean()
+        j_naive = jeffreys_naive_topk(block0_teacher, block0_vals, block0_idx, block0_nk, block0_k_top).mean()
         stats["jeffreys_gibbs_mean_cached"] = float(j_gibbs.cpu())
         stats["jeffreys_naive_mean_cached"] = float(j_naive.cpu())
         stats["jeffreys_improvement_naive_minus_gibbs_cached"] = float((j_naive - j_gibbs).cpu())
 
-        teacher2 = torch.randn(4096, nk, device=device, dtype=dt)
+        teacher2 = torch.randn(4096, block0_nk, device=device, dtype=dt)
         t2 = teacher2 - teacher2.max(dim=-1, keepdim=True).values
-        vals2, idx2 = torch.topk(t2, k=k_top, dim=-1, largest=True, sorted=True)
-        j_gibbs2 = jeffreys_distance_sparse_teacher(teacher2, vals2, idx2, nk, k_top).mean()
-        j_naive2 = jeffreys_naive_topk(teacher2, vals2, idx2, nk, k_top).mean()
+        vals2, idx2 = torch.topk(t2, k=block0_k_top, dim=-1, largest=True, sorted=True)
+        j_gibbs2 = jeffreys_distance_sparse_teacher(
+            teacher2,
+            vals2,
+            idx2,
+            block0_nk,
+            block0_k_top,
+            tail_use_prob_eps=gibbs_tail_use_prob_eps,
+            tail_prob_eps=metric_tail_prob_eps,
+        ).mean()
+        j_naive2 = jeffreys_naive_topk(teacher2, vals2, idx2, block0_nk, block0_k_top).mean()
         stats["jeffreys_gibbs_mean_synthetic"] = float(j_gibbs2.cpu())
         stats["jeffreys_naive_mean_synthetic"] = float(j_naive2.cpu())
         stats["jeffreys_improvement_naive_minus_gibbs_synthetic"] = float((j_naive2 - j_gibbs2).cpu())
         return stats
+
+    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
+        if not bool(getattr(model, "gibbs_tail_use_prob_eps", False)):
+            return {}
+        values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
+        if not isinstance(values, list) or not values or not hasattr(model, "blocks"):
+            return {}
+        applied = []
+        with torch.no_grad():
+            for block_idx, blk in enumerate(model.blocks):
+                gibbs = getattr(getattr(blk, "attn", None), "gibbs", None)
+                param = getattr(gibbs, "gibbs_tail_prob_eps", None)
+                if not isinstance(param, nn.Parameter):
+                    continue
+                raw_value = float(values[min(block_idx, len(values) - 1)])
+                value = max(0.0, min(raw_value, 1.0 - 1e-7))
+                param.copy_(torch.tensor(value, device=param.device, dtype=param.dtype))
+                applied.append(value)
+        if not applied:
+            return {}
+        model.gibbs_tail_prob_eps = float(sum(applied) / len(applied))
+        return {
+            "gibbs_tail_prob_eps_applied_by_block": applied,
+            "gibbs_tail_prob_eps_applied_mean": model.gibbs_tail_prob_eps,
+        }
 
     def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
         if cfg.disable_layernorm_replacement:
@@ -308,6 +406,10 @@ def load_surgery_student_checkpoint(
         extra["top_k"] = int(cfg.top_k)
     if getattr(cfg, "eps", None) is not None:
         extra["eps_ln"] = float(cfg.eps)
+    if getattr(cfg, "gibbs_tail_use_prob_eps", None) is not None:
+        extra["gibbs_tail_use_prob_eps"] = bool(cfg.gibbs_tail_use_prob_eps)
+    if getattr(cfg, "gibbs_tail_prob_eps", None) is not None:
+        extra["gibbs_tail_prob_eps"] = float(cfg.gibbs_tail_prob_eps)
     runtime_dtype = get_surgery_dtype()
     extra["surgery_dtype"] = describe_dtype(runtime_dtype)
     extra.setdefault("model_key", adapter.key)

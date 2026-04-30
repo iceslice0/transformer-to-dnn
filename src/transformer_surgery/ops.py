@@ -50,9 +50,22 @@ RoutingBroadcastTensors = torch.broadcast_tensors
 RoutingTopK = torch.topk
 RoutingGather = torch.gather
 RoutingMax = torch.max
+RoutingFullLike = torch.full_like
 RoutingReLU = F.relu
 RoutingDropout = nn.Dropout
 RoutingDropPath = _TimmDropPath
+
+
+def RoutingExpand(x: torch.Tensor, *sizes: int) -> torch.Tensor:
+    return x.expand(*sizes)
+
+
+def RoutingExpandAs(x: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    return x.expand_as(other)
+
+
+def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
+    return x.squeeze() if dim is None else x.squeeze(dim)
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +76,7 @@ RoutingDropPath = _TimmDropPath
 #   NL*      — strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
 #              reciprocal+eps, scalar PWL, GELU-as-PWL).
 #   Routing* — pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
-#              broadcast_tensors, topk/gather, F.relu, torch.max, Dropout/DropPath); see the
+#              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, torch.max, Dropout/DropPath); see the
 #              ``Routing*`` aliases above.
 # ---------------------------------------------------------------------------
 
@@ -350,7 +363,7 @@ class RewrittenLayerNorm(nn.Module):
         else:
             au = RoutingStack((RoutingReLU(u), RoutingReLU(-u)), dim=-2)
             log_num = self.log_eps(au)
-            log_den = self.log_eps(r2).unsqueeze(-2).expand_as(log_num)
+            log_den = RoutingExpandAs(RoutingUnsqueeze(self.log_eps(r2), -2), log_num)
             lin_log = self.log_a_contract(RoutingStack((log_num, log_den), dim=2))
             a_mag = self.sqrt_exp(lin_log)
             z = self.out_contract(a_mag)
@@ -378,7 +391,7 @@ class PairwiseDotBySquare(nn.Module):
     """
     scores[b,h,i,j] = (1/sqrt(d)) * sum_l q[b,h,i,l] * k[b,h,j,l]
 
-    **Demonstration / plan.md form (default):** uses :class:`SquareIdentityOperandChain` with
+    **Strict form (default):** uses :class:`SquareIdentityOperandChain` with
     mix ``pq,...qd→...pd``, contract ``p,...pd→...``, coeffs ``±1/(4√d)``. Operands ``a,b`` are the
     broadcast Q/K grid. **No** ``torch.matmul`` for QKᵀ.
 
@@ -405,13 +418,13 @@ class PairwiseDotBySquare(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         if self.allow_matmul:
             qs = self.q_scale(q)
-            return self.qk_matmul(qs, k.transpose(-2, -1))
-        qe = q.unsqueeze(3)
-        ke = k.unsqueeze(2)
+            return self.qk_matmul(qs, RoutingTranspose(k, -2, -1))
+        qe = RoutingUnsqueeze(q, 3)
+        ke = RoutingUnsqueeze(k, 2)
         nq = q.shape[2]
         nk = k.shape[2]
-        qe_b = qe.expand(-1, -1, -1, nk, -1)
-        ke_b = ke.expand(-1, -1, nq, -1, -1)
+        qe_b = RoutingExpand(qe, -1, -1, -1, nk, -1)
+        ke_b = RoutingExpand(ke, -1, -1, nq, -1, -1)
         return self.square_chain(qe_b, ke_b)
 
 
@@ -422,21 +435,23 @@ class PairwiseDotBySquare(nn.Module):
 
 class GibbsTopKSoftmax(nn.Module):
     """
-    Sparse Gibbs Top-K with replicated tail at s_(k).
+    Sparse Gibbs Top-K with configurable omitted-tail handling.
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
     :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; with
     ``allow_matmul=False`` use ``exp(vals - log(z_tail + eps))`` (same math, no division).
 
-    **z_tail**: ``sum_k exp(val_k) + (N_k - K) * exp(s_K)`` via :class:`AffineSum`,
-    tail mass as :class:`AffineHadamard` (``allow_matmul=True``) or :class:`AffineScale` with
-    fixed ``(N_k - K)`` from ``seq_len``/``top_k`` (strict — no Hadamard in graph), then
-    ``stack`` (routing) and :class:`AffineContract` ``(1,1)`` on the last dim.
+    ``tail_use_prob_eps=False`` keeps the original approximation:
+    ``Z_tail = sum_k exp(val_k) + (N-K) * exp(s_K)``.
 
-    Only subgraphs for the chosen ``allow_matmul`` mode are registered (no unused children).
+    ``tail_use_prob_eps=True`` reserves probability mass ``gibbs_tail_prob_eps`` for all omitted
+    entries and scales the top-k probabilities by ``1 - gibbs_tail_prob_eps``. The value is an
+    ``nn.Parameter`` initialized from config.
 
-    ``eps`` is the same floor as LayerNorm / run config: ``log(z_tail + eps)`` and ``1/(z_tail + eps)``.
+    Only normalization subgraphs for the chosen ``allow_matmul`` mode are registered.
+
+    ``eps`` is the same floor as LayerNorm / run config for log/reciprocal normalizers.
     """
 
     def __init__(
@@ -445,30 +460,40 @@ class GibbsTopKSoftmax(nn.Module):
         top_k: int,
         *,
         eps: float,
+        tail_use_prob_eps: bool,
+        tail_prob_eps: float,
         allow_matmul: bool = False,
     ) -> None:
         super().__init__()
+        self.seq_len = int(seq_len)
         self.top_k = top_k
+        self.tail_use_prob_eps = bool(tail_use_prob_eps)
+        tail_prob = float(tail_prob_eps)
+        if not 0.0 <= tail_prob < 1.0:
+            raise ValueError("tail_prob_eps must be in [0, 1)")
+        self.gibbs_tail_prob_eps = nn.Parameter(
+            torch.tensor(tail_prob, dtype=get_surgery_dtype()),
+            requires_grad=self.tail_use_prob_eps,
+        )
         self.allow_matmul = allow_matmul
         e = float(eps)
         self.exp = NLExp()
         self.sum_exp_vals = AffineSum(-1, keepdim=True)
-        self.z_tail_contract = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-        )
         self.scores_stable_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
         )
+        if not self.tail_use_prob_eps:
+            k_static = min(int(top_k), self.seq_len)
+            self.tail_mass_mul = AffineScale(float(max(0, self.seq_len - k_static)))
+            self.z_tail_contract = AffineContract(
+                "i,...i->...",
+                torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+            )
         if allow_matmul:
-            self.tail_mass_mul = AffineHadamard()
             self.inv_z = NLReciprocalPlusEps(e)
             self.mul_by_inv_z = AffineHadamard()
         else:
-            nk = seq_len
-            kk = min(top_k, nk)
-            self.tail_mass_mul = AffineScale(float(max(0, nk - kk)))
             self.log_z = NLLogPlusEps(e)
             self.logit_logz_contract = AffineContract(
                 "i,...i->...",
@@ -482,35 +507,53 @@ class GibbsTopKSoftmax(nn.Module):
         """
         _b, _h, _nq, nk = scores.shape
         k = min(self.top_k, nk)
-        tail_coeff = float(nk - k)
         row_max = RoutingMax(scores, dim=-1, keepdim=True).values
         _s, _r = RoutingBroadcastTensors(scores, row_max)
         scores_stable = self.scores_stable_contract(RoutingStack((_s, _r), dim=-1))
         vals, idx = RoutingTopK(scores_stable, k=k, dim=-1, largest=True, sorted=True)
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
-        exp_tail = self.exp(s_k)
         sum_exp = self.sum_exp_vals(exp_vals)
-        if self.allow_matmul:
-            tail_term = self.tail_mass_mul(exp_tail, torch.full_like(exp_tail, tail_coeff))
+
+        if not self.tail_use_prob_eps:
+            exp_tail = self.exp(s_k)
+            if nk > k:
+                tail_term = self.tail_mass_mul(exp_tail)
+            else:
+                tail_term = RoutingFullLike(exp_tail, 0.0)
+            _se, _tt = RoutingBroadcastTensors(sum_exp, tail_term)
+            normalizer = self.z_tail_contract(RoutingStack((_se, _tt), dim=-1))
         else:
-            tail_term = self.tail_mass_mul(exp_tail)
-        _se, _tt = RoutingBroadcastTensors(sum_exp, tail_term)
-        z_tail = self.z_tail_contract(RoutingStack((_se, _tt), dim=-1))
+            normalizer = sum_exp
 
         if self.allow_matmul:
-            inv_z = self.inv_z(z_tail)
-            probs = self.mul_by_inv_z(exp_vals, inv_z)
-            q_tail = self.mul_by_inv_z(tail_term, inv_z)
+            inv_z = self.inv_z(normalizer)
+            top_probs = self.mul_by_inv_z(exp_vals, inv_z)
         else:
-            log_z = self.log_z(z_tail)
+            log_z = self.log_z(normalizer)
             neg_log_z = -log_z
             _v, _nlz = RoutingBroadcastTensors(vals, neg_log_z)
             logits_norm = self.logit_logz_contract(RoutingStack((_v, _nlz), dim=-1))
-            probs = self.exp(logits_norm)
-            _sk, _nlz2 = RoutingBroadcastTensors(s_k, neg_log_z)
-            sk_norm = self.logit_logz_contract(RoutingStack((_sk, _nlz2), dim=-1))
-            q_tail = self.tail_mass_mul(self.exp(sk_norm))
+            top_probs = self.exp(logits_norm)
+
+        if not self.tail_use_prob_eps:
+            probs = top_probs
+            if self.allow_matmul:
+                q_tail = self.mul_by_inv_z(tail_term, inv_z)
+            else:
+                _sk, _nlz2 = RoutingBroadcastTensors(s_k, neg_log_z)
+                sk_norm = self.logit_logz_contract(RoutingStack((_sk, _nlz2), dim=-1))
+                if nk > k:
+                    q_tail = self.tail_mass_mul(self.exp(sk_norm))
+                else:
+                    q_tail = RoutingFullLike(sk_norm, 0.0)
+        elif nk > k:
+            tail_prob = self.gibbs_tail_prob_eps.to(device=s_k.device, dtype=s_k.dtype).clamp(0.0, 1.0)
+            probs = top_probs * (1.0 - tail_prob)
+            q_tail = RoutingExpandAs(tail_prob, s_k)
+        else:
+            probs = top_probs
+            q_tail = RoutingFullLike(s_k, 0.0)
 
         return probs, idx, q_tail
 
@@ -524,7 +567,7 @@ class SparseWeightedSumBySquare(nn.Module):
     """
     y[b,h,nq,d] = sum_{k in top} p[b,h,nq,k] * v[b,h, idx[b,h,nq,k], d]
 
-    **Default (plan.md):** uses :class:`SquareIdentityOperandChain` with mix ``pq,...kqd→...kpd``,
+    **Strict form (default):** uses :class:`SquareIdentityOperandChain` with mix ``pq,...kqd→...kpd``,
     contract ``p,...kpd→...d``, coeffs ``(¼,−¼)``. Operands ``a,b`` are expanded prob and gathered
     value per top-k slot. No dense ``matmul`` for attention-value mixing.
 
@@ -557,14 +600,14 @@ class SparseWeightedSumBySquare(nn.Module):
         """
         _, _, nq, _ = probs.shape
         _, _, nk, d = v.shape
-        idx_e = idx.unsqueeze(-1).expand(-1, -1, -1, -1, d)
-        v_h = v.unsqueeze(2).expand(-1, -1, nq, -1, -1)
+        idx_e = RoutingExpand(RoutingUnsqueeze(idx, -1), -1, -1, -1, -1, d)
+        v_h = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, -1, -1)
         v_g = RoutingGather(v_h, 3, idx_e)
         if self.allow_matmul:
             # [B,H,Nq,1,K] @ [B,H,Nq,K,D] -> [B,H,Nq,1,D]
-            return self.pv_matmul(probs.unsqueeze(-2), v_g).squeeze(-2)
-        p = probs.unsqueeze(-1)
-        p_b = p.expand(-1, -1, -1, -1, d)
+            return RoutingSqueeze(self.pv_matmul(RoutingUnsqueeze(probs, -2), v_g), -2)
+        p = RoutingUnsqueeze(probs, -1)
+        p_b = RoutingExpand(p, -1, -1, -1, -1, d)
         return self.square_chain(p_b, v_g)
 
 
@@ -632,27 +675,43 @@ def jeffreys_distance_sparse_teacher(
     idx: torch.Tensor,
     nk: int,
     k: int,
+    *,
+    tail_use_prob_eps: bool,
+    tail_prob_eps: float,
 ) -> torch.Tensor:
     """
     teacher_logits: [R, nk]
     vals: top-k stabilized logits (row-wise max subtracted) [R, k]
     idx: [R, k]
-    Dense student q: on I, q_i = exp(s_i)/Z_tail; each omitted index gets exp(s_k)/Z_tail.
+    Dense student q uses either the original k-th-logit replicated tail or a fixed
+    omitted-tail probability mass.
     """
+    use_prob_eps = bool(tail_use_prob_eps)
+    tail_prob = float(tail_prob_eps)
+    if not 0.0 <= tail_prob < 1.0:
+        raise ValueError("tail_prob_eps must be in [0, 1)")
     t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
     p = F.softmax(t, dim=-1)
     _, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
 
     s_k = vals[:, -1:]
     exp_vals = torch.exp(vals)
-    exp_tail = torch.exp(s_k)
-    z_tail = exp_vals.sum(dim=-1, keepdim=True) + float(nk - k) * exp_tail
-    q_on_I = exp_vals / (z_tail + denom_eps)
-
     r = teacher_logits.shape[0]
-    device = teacher_logits.device
-    q_tail_each = exp_tail / (z_tail + denom_eps)
-    q_dense = q_tail_each.expand(r, nk).clone()
+    q_dense = torch.zeros_like(p)
+    if not use_prob_eps:
+        exp_tail = torch.exp(s_k)
+        tail_count = float(nk - k) if nk > k else 0.0
+        z_tail = exp_vals.sum(dim=-1, keepdim=True) + tail_count * exp_tail
+        q_on_I = exp_vals / (z_tail + denom_eps)
+        if nk > k:
+            q_tail_each = exp_tail / (z_tail + denom_eps)
+            q_dense = RoutingExpand(q_tail_each, r, nk).clone()
+    else:
+        tail_mass = tail_prob if nk > k else 0.0
+        z_top = exp_vals.sum(dim=-1, keepdim=True)
+        q_on_I = (1.0 - tail_mass) * exp_vals / (z_top + denom_eps)
+        if nk > k:
+            q_dense = torch.full_like(p, tail_mass / float(nk - k))
     q_dense.scatter_(1, idx, q_on_I)
 
     j = _kl_safe(p, q_dense) + _kl_safe(q_dense, p)
@@ -688,7 +747,10 @@ CALIBRATION_LEGEND_TEXT = (
     "student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val "
     "after transform, before distill. "
     "student_post_distill_* and val_*_post_ft: after Jeffreys distillation "
-    "(acc and mean CE / Jeffreys; legacy keys val_acc_post_ft retained)."
+    "(acc and mean CE / Jeffreys; legacy keys val_acc_post_ft retained). "
+    "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
+    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters when fixed-tail "
+    "probability mode is active."
 )
 
 
@@ -820,10 +882,12 @@ class SurgeryMeta:
     patient: str = "DeiT-Tiny"
     dataset: str = "Oxford-IIIT Pet"
     eps: float = 1e-5
+    gibbs_tail_use_prob_eps: bool = False
+    gibbs_tail_prob_eps: float = 1e-5
     top_k: int = 32
     surgery_dtype: str = "bfloat16"
     pwl: Dict[str, Any] = field(default_factory=dict)
-    calibration: Dict[str, float] = field(default_factory=dict)
+    calibration: Dict[str, Any] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
     reference_checkpoint: str = ""
     allow_matmul: bool = False
@@ -836,6 +900,8 @@ class SurgeryMeta:
                     "patient": self.patient,
                     "dataset": self.dataset,
                     "eps": self.eps,
+                    "gibbs_tail_use_prob_eps": self.gibbs_tail_use_prob_eps,
+                    "gibbs_tail_prob_eps": self.gibbs_tail_prob_eps,
                     "top_k": self.top_k,
                     "surgery_dtype": self.surgery_dtype,
                     "pwl": self.pwl,

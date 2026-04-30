@@ -60,7 +60,11 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     print(f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f}")
 
     cal = adapter.calibrate_reference(ref, val_loader, cfg)
-    print("Calibration:", json.dumps(cal, indent=2))
+    print("Calibration:", json.dumps(cal, indent=2), flush=True)
+    tail_cal = cal.get("gibbs_tail_prob_eps_calibrated_by_block")
+    if isinstance(tail_cal, list) and tail_cal:
+        values = ", ".join(f"{float(v):.6g}" for v in tail_cal)
+        print(f"Calibrated gibbs_tail_prob_eps by block: [{values}]", flush=True)
 
     print("Building surgery model...", flush=True)
     print(
@@ -72,6 +76,10 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
     mapping = adapter.copy_reference_weights(model, ref)
     adapter.freeze_surgery_parameters(model)
+    applied_cal = adapter.apply_calibration(model, cal)
+    if applied_cal:
+        cal.update(applied_cal)
+        print("Applied calibration:", json.dumps(applied_cal, indent=2), flush=True)
     print(f"Loaded {len(mapping)} tensors from reference checkpoint.")
 
     after_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_after_surgery")
@@ -105,10 +113,19 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     meta.to_json(meta_path)
 
     os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
+    checkpoint_extra = adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path)
+    for key in (
+        "gibbs_tail_prob_eps_calibrated_by_block",
+        "gibbs_tail_prob_eps_calibrated_mean",
+        "gibbs_tail_prob_eps_applied_by_block",
+        "gibbs_tail_prob_eps_applied_mean",
+    ):
+        if key in cal:
+            checkpoint_extra[key] = cal[key]
     save_model_checkpoint(
         pre_path,
         model,
-        extra=adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path),
+        extra=checkpoint_extra,
     )
     print(f"Wrote {pre_path} and {meta_path}")
     print("Next: run the distill stage.", flush=True)

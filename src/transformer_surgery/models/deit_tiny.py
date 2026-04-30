@@ -15,7 +15,13 @@ from transformer_surgery.ops import (
     NLGELU,
     PairwiseDotBySquare,
     RewrittenLayerNorm,
+    RoutingBroadcastTensors,
+    RoutingCat,
     RoutingDropPath,
+    RoutingExpand,
+    RoutingStack,
+    RoutingTranspose,
+    RoutingUnsqueeze,
     SparseWeightedSumBySquare,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
@@ -48,6 +54,8 @@ class SurgeryAttention(nn.Module):
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
         eps_ln: float = 1e-5,
+        gibbs_tail_use_prob_eps: bool = False,
+        gibbs_tail_prob_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -63,7 +71,14 @@ class SurgeryAttention(nn.Module):
         if use_attention_surgery:
             self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
             if use_surgery_softmax:
-                self.gibbs = GibbsTopKSoftmax(seq_len, top_k, eps=eps_ln, allow_matmul=allow_matmul)
+                self.gibbs = GibbsTopKSoftmax(
+                    seq_len,
+                    top_k,
+                    eps=eps_ln,
+                    tail_use_prob_eps=gibbs_tail_use_prob_eps,
+                    tail_prob_eps=gibbs_tail_prob_eps,
+                    allow_matmul=allow_matmul,
+                )
                 self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
             else:
                 self.attn_drop = nn.Dropout(attn_drop)
@@ -78,7 +93,7 @@ class SurgeryAttention(nn.Module):
         if not self.use_attention_surgery:
             s = self.attn_scale.to(device=q.device, dtype=q.dtype)
             qs = q * s
-            kt = k.transpose(-2, -1)
+            kt = RoutingTranspose(k, -2, -1)
             attn = qs @ kt
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -95,9 +110,9 @@ class SurgeryAttention(nn.Module):
                 attn = self.matmul(attn, v)
             else:
                 _, _, nq, nk = attn.shape
-                v_b = v.unsqueeze(2).expand(-1, -1, nq, nk, -1)
-                attn = (attn.unsqueeze(-1) * v_b).sum(dim=3)
-        attn = attn.transpose(1, 2).reshape(b, n, c)
+                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
+                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
+        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
         attn = self.proj(attn)
         attn = self.proj_drop(attn)
         return attn
@@ -136,6 +151,8 @@ class SurgeryBlock(nn.Module):
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
+        gibbs_tail_use_prob_eps: bool = False,
+        gibbs_tail_prob_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
@@ -155,6 +172,8 @@ class SurgeryBlock(nn.Module):
             use_surgery_softmax=use_surgery_softmax,
             allow_matmul=allow_matmul,
             eps_ln=eps_ln,
+            gibbs_tail_use_prob_eps=gibbs_tail_use_prob_eps,
+            gibbs_tail_prob_eps=gibbs_tail_prob_eps,
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
@@ -165,10 +184,10 @@ class SurgeryBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a, b = torch.broadcast_tensors(x, self.drop_path(self.attn(self.norm1(x))))
-        x = self.residual_contract(torch.stack((a, b), dim=-1))
-        a, b = torch.broadcast_tensors(x, self.drop_path(self.mlp(self.norm2(x))))
-        x = self.residual_contract(torch.stack((a, b), dim=-1))
+        a, b = RoutingBroadcastTensors(x, self.drop_path(self.attn(self.norm1(x))))
+        x = self.residual_contract(RoutingStack((a, b), dim=-1))
+        a, b = RoutingBroadcastTensors(x, self.drop_path(self.mlp(self.norm2(x))))
+        x = self.residual_contract(RoutingStack((a, b), dim=-1))
         return x
 
 
@@ -195,6 +214,8 @@ class DeiTTinySurgeryModel(nn.Module):
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
+        gibbs_tail_use_prob_eps: bool = False,
+        gibbs_tail_prob_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -230,6 +251,8 @@ class DeiTTinySurgeryModel(nn.Module):
                     use_attention_surgery=use_attention_surgery,
                     use_surgery_softmax=use_surgery_softmax,
                     allow_matmul=allow_matmul,
+                    gibbs_tail_use_prob_eps=gibbs_tail_use_prob_eps,
+                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
                 )
                 for i in range(depth)
             ]
@@ -242,6 +265,8 @@ class DeiTTinySurgeryModel(nn.Module):
 
         self._init_weights()
         self.eps_ln = eps_ln
+        self.gibbs_tail_use_prob_eps = bool(gibbs_tail_use_prob_eps)
+        self.gibbs_tail_prob_eps = gibbs_tail_prob_eps
         self.top_k = top_k
 
     @classmethod
@@ -251,6 +276,8 @@ class DeiTTinySurgeryModel(nn.Module):
             num_classes=num_classes,
             top_k=int(cfg.top_k),
             eps_ln=float(cfg.eps),
+            gibbs_tail_use_prob_eps=bool(cfg.gibbs_tail_use_prob_eps),
+            gibbs_tail_prob_eps=float(cfg.gibbs_tail_prob_eps),
             use_surgery_layernorm=not bool(cfg.disable_layernorm_replacement),
             use_attention_surgery=not bool(cfg.disable_attention_surgery),
             use_surgery_softmax=not bool(cfg.disable_softmax_replacement),
@@ -264,6 +291,8 @@ class DeiTTinySurgeryModel(nn.Module):
             num_classes=num_classes,
             top_k=int(ex["top_k"]),
             eps_ln=float(ex["eps_ln"]),
+            gibbs_tail_use_prob_eps=bool(ex["gibbs_tail_use_prob_eps"]),
+            gibbs_tail_prob_eps=float(ex["gibbs_tail_prob_eps"]),
             use_surgery_layernorm=not bool(ex["disable_layernorm_replacement"]),
             use_attention_surgery=not bool(ex["disable_attention_surgery"]),
             use_surgery_softmax=not bool(ex["disable_softmax_replacement"]),
@@ -281,9 +310,9 @@ class DeiTTinySurgeryModel(nn.Module):
         b = x.shape[0]
         x = self.patch_embed(x)
         cls = self.cls_token.expand(b, -1, -1)
-        x = torch.cat((cls, x), dim=1)
-        pe_a, pe_b = torch.broadcast_tensors(x, self.pos_embed)
-        x = self.pos_embed_contract(torch.stack((pe_a, pe_b), dim=-1))
+        x = RoutingCat((cls, x), dim=1)
+        pe_a, pe_b = RoutingBroadcastTensors(x, self.pos_embed)
+        x = self.pos_embed_contract(RoutingStack((pe_a, pe_b), dim=-1))
         x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x)

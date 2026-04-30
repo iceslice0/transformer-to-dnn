@@ -39,6 +39,7 @@ Trainable:
 - affine weights and biases where ``requires_grad`` is set.
 - PWL parameters, including trainable knot values where present.
 - ``gamma``/``beta`` in ``AffineScaleBias``.
+- ``GibbsTopKSoftmax.gibbs_tail_prob_eps`` when fixed-probability Gibbs tail mode is enabled.
 
 Not trainable:
 

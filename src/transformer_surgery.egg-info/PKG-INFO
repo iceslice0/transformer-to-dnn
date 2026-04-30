@@ -69,7 +69,7 @@ Generated outputs are intentionally ignored by Git:
 - model structure dumps: `artifacts/logs/`
 - previous run folders: `artifacts/runs/`
 
-The default e2e files are `artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt`, `artifacts/checkpoints/ts_surgery_topk64_fast.pt`, `artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt`, and `artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit_wrapped.pt`, plus matching metadata and logs.
+The default e2e files are `artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt`, `artifacts/checkpoints/ts_surgery_topk64_fast.pt`, `artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt`, and `artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit.pt`, plus matching metadata and logs.
 
 ## Method Notes
 

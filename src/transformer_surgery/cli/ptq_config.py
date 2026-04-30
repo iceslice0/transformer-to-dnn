@@ -14,7 +14,7 @@ class PTQSurgeryConfig:
     model_key: str = DEFAULT_MODEL_KEY
     data_dir: str = "./data"
     fp_checkpoint: str = "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt"
-    output: str = "artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit_wrapped.pt"
+    output: str = "artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit.pt"
     batch_size: int = 32
     workers: int = 2
     randaugment: bool = True
@@ -40,6 +40,8 @@ class PTQSurgeryConfig:
     per_output_channel: bool = True
     top_k: Optional[int] = None
     eps: Optional[float] = None
+    gibbs_tail_use_prob_eps: Optional[bool] = None
+    gibbs_tail_prob_eps: Optional[float] = None
     log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
 

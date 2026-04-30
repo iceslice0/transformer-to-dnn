@@ -147,11 +147,31 @@ class PackageSmokeTests(unittest.TestCase):
                 self.assertIn("--config", proc.stdout)
 
     def test_model_instantiates_on_cpu(self) -> None:
+        import torch.nn as nn
+
         from transformer_surgery.models import DeiTTinySurgeryModel
+        from transformer_surgery.models.adapters import get_model_adapter
 
         model = DeiTTinySurgeryModel(num_classes=37).cpu()
         self.assertEqual(model.num_classes, 37)
         self.assertEqual(model.seq_len, 197)
+        tail_prob = model.blocks[0].attn.gibbs.gibbs_tail_prob_eps
+        self.assertIsInstance(tail_prob, nn.Parameter)
+        self.assertEqual(tuple(tail_prob.shape), ())
+
+        calibrated = DeiTTinySurgeryModel(
+            num_classes=37,
+            depth=2,
+            gibbs_tail_use_prob_eps=True,
+            gibbs_tail_prob_eps=0.1,
+        ).cpu()
+        applied = get_model_adapter("deit_tiny_pet").apply_calibration(
+            calibrated,
+            {"gibbs_tail_prob_eps_calibrated_by_block": [0.02, 0.03]},
+        )
+        self.assertEqual(applied["gibbs_tail_prob_eps_applied_by_block"], [0.02, 0.03])
+        self.assertAlmostEqual(float(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.02, places=3)
+        self.assertTrue(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.requires_grad)
 
 
 if __name__ == "__main__":

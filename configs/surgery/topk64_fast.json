@@ -5,6 +5,8 @@
   "workers": 2,
   "top_k": 64,
   "eps": 1e-3,
+  "gibbs_tail_use_prob_eps": false,
+  "gibbs_tail_prob_eps": 1e-3,
   "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "device": "cuda",
   "surgery_dtype": "float16",

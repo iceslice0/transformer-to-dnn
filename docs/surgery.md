@@ -5,8 +5,8 @@ adapter, builds a surgery student in a restricted op vocabulary (affine + local 
 /routing), copies reference weights into the student, runs a calibration pass, and saves the
 pre-finetune checkpoint with metadata and model-structure logs.
 
-The core code lives in [src/transformer_surgery/surgery.py](src/transformer_surgery/surgery.py)
-and the op vocabulary in [src/transformer_surgery/ops.py](src/transformer_surgery/ops.py). The CLI
+The core code lives in [src/transformer_surgery/surgery.py](../src/transformer_surgery/surgery.py)
+and the op vocabulary in [src/transformer_surgery/ops.py](../src/transformer_surgery/ops.py). The CLI
 wrapper is `python -m transformer_surgery.cli.surgery` or `ts-surgery`.
 
 ## Inputs
@@ -15,19 +15,20 @@ wrapper is `python -m transformer_surgery.cli.surgery` or `ts-surgery`.
 - `model_key`: adapter key, default `deit_tiny_pet`.
 - dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
   `randaugment`, `ra_magnitude`, `random_erasing_prob`.
-- surgery shape fields: `top_k`, `eps`, `surgery_dtype`.
+- surgery shape/numerics fields: `top_k`, `eps`, `gibbs_tail_use_prob_eps`,
+  `gibbs_tail_prob_eps`, `surgery_dtype`.
 - transform flags: `disable_layernorm_replacement`, `disable_attention_surgery`,
   `disable_softmax_replacement`, `allow_matmul`.
 - output paths: `pre_ft_checkpoint`, `log_dir`.
 
-Surgery must not import model-specific code directly. It uses `get_model_adapter` so dataset
+Surgery code stays model-agnostic. It uses `get_model_adapter` so dataset
 loaders, reference loading, surgery-model construction, weight copy, and calibration diagnostics
 stay inside the adapter layer. Default adapter:
 
 - patient: DeiT-Tiny from timm, fine-tuned on Oxford-IIIT Pet.
 - dataset: Oxford-IIIT Pet classification (37 classes).
 - surgery model: `DeiTTinySurgeryModel` in
-  [src/transformer_surgery/models/deit_tiny.py](src/transformer_surgery/models/deit_tiny.py).
+  [src/transformer_surgery/models/deit_tiny.py](../src/transformer_surgery/models/deit_tiny.py).
 
 Extra models or datasets are added by registering a new adapter, not by branching the surgery
 driver.
@@ -87,9 +88,11 @@ rather than computing a smooth nonlinearity, so they live with `topk` and `gathe
 
 The routing surface is also re-exported from `transformer_surgery.ops` under `Routing*`
 aliases (`RoutingReshape`, `RoutingTranspose`, `RoutingCat`, `RoutingStack`,
-`RoutingUnsqueeze`, `RoutingBroadcastTensors`, `RoutingTopK`, `RoutingGather`, `RoutingMax`,
+`RoutingUnsqueeze`, `RoutingExpand`, `RoutingExpandAs`, `RoutingSqueeze`,
+`RoutingBroadcastTensors`, `RoutingTopK`, `RoutingGather`, `RoutingMax`, `RoutingFullLike`,
 `RoutingReLU`, `RoutingDropout`, `RoutingDropPath`) so the routing vocabulary is discoverable
-alongside the `Affine*` and `NL*` classes.
+alongside the `Affine*` and `NL*` classes. The op implementations use these aliases for routing
+inside `ops.py`; the aliases are names for tensor wiring, not extra graph modules.
 
 ## Transform 1: LayerNorm Rewrite
 
@@ -122,7 +125,7 @@ from `cfg.eps` and frozen by `freeze_eps_parameters` (it is not copied from `src
 ## Transform 2: Variable Matrix-Multiplication Replacement in Attention
 
 Attention is implemented in `SurgeryAttention` (in
-[src/transformer_surgery/models/deit_tiny.py](src/transformer_surgery/models/deit_tiny.py)).
+[src/transformer_surgery/models/deit_tiny.py](../src/transformer_surgery/models/deit_tiny.py)).
 
 In strict mode (`allow_matmul=False`) there is no variable `matmul` for QKᵀ score computation
 or for sparse value mixing PV. Both use the identity `a*b = ((a+b)² - (a-b)²)/4` through
@@ -149,22 +152,29 @@ modules for the chosen mode are registered.
 
 ## Transform 3: Softmax Replacement
 
-`GibbsTopKSoftmax(seq_len, top_k, eps, allow_matmul)` replaces dense softmax. It returns sparse
-probabilities on the top-k indices, the index tensor, and a tail-mass scalar `q_tail`.
+`GibbsTopKSoftmax(seq_len, top_k, eps, tail_use_prob_eps, tail_prob_eps, allow_matmul)` replaces
+dense softmax. It returns sparse probabilities on the top-k indices, the index tensor, and a
+tail-mass scalar `q_tail`.
 
 Score stabilization, tail-sum aggregation, and logit normalization are exposed as
 `AffineContract` submodules so the graph lists explicit affine nodes:
 
 - `scores_stable_contract` (`[1, -1]`) implements `scores - row_max` over a stacked operand.
-- `z_tail_contract` (`[1, 1]`) sums `sum_exp` and `tail_term` to form
-  `Z_tail = Σ_k exp(s_k) + (N - K) · exp(s_K)`.
+- `gibbs_tail_use_prob_eps=false` keeps the original replicated-tail estimate:
+  `Z_tail = Σ_k exp(s_k) + (N-K) · exp(s_K)`.
+- `gibbs_tail_use_prob_eps=true` reserves an omitted-tail probability mass from the scalar
+  module parameter `gibbs_tail_prob_eps` and scales top-k probabilities by
+  `1 - gibbs_tail_prob_eps`.
+- `z_tail_contract` (`[1, 1]`) is used by the default k-th-logit path to sum `sum_exp`
+  and `tail_term`.
 - `logit_logz_contract` (`[1, 1]`) implements `vals + (-log_z)` and `s_K + (-log_z)`.
 
 Tail term:
 
-- Strict (`allow_matmul=False`): `tail_mass_mul = AffineScale(N - K)` applied to `exp(s_K)`. The
-  multiplicand is fixed at construction from `seq_len`/`top_k`.
-- Fast (`allow_matmul=True`): `AffineHadamard()` on `exp(s_K)` and a broadcast `(N - K)` tensor.
+- default path: omitted entries are modeled as if each had logit `s_K`.
+- fixed-probability path: the total omitted-tail probability is the `gibbs_tail_prob_eps`
+  parameter when `N > K`.
+- When `N <= K`, `q_tail` is a routed zero tensor from `RoutingFullLike`.
 
 Normalization:
 
@@ -172,12 +182,15 @@ Normalization:
   + `NLExp`. No `/` operator.
 - Fast: `probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(eps)(Z_tail))`.
 
-`eps` matches the LayerNorm floor and is frozen by `freeze_eps_parameters`.
+`eps` is the normalizer floor used in `log(Z_tail + eps)` / `1/(Z_tail + eps)`.
+`gibbs_tail_prob_eps` is an `nn.Parameter` initialized from config, saved in the checkpoint state
+dict, and used only when `gibbs_tail_use_prob_eps` is true. The forward path clamps it to
+`[0, 1]` before applying it as probability mass.
 
 ## Transform Flags
 
 The CLI config (in
-[src/transformer_surgery/cli/surgery_config.py](src/transformer_surgery/cli/surgery_config.py))
+[src/transformer_surgery/cli/surgery_config.py](../src/transformer_surgery/cli/surgery_config.py))
 exposes four debug flags that selectively bypass the rewrites:
 
 - `disable_layernorm_replacement` — keep `nn.LayerNorm` instead of `RewrittenLayerNorm`.
@@ -202,9 +215,16 @@ diagnostics. For `deit_tiny_pet` these are:
   while replaying the residual stream of the reference model.
 - `jeffreys_gibbs_mean_cached` and `jeffreys_naive_mean_cached` — mean Jeffreys divergence of
   the Gibbs Top-K and naive Top-K approximations against the dense softmax on cached attention
-  scores from block 0.
-- `jeffreys_improvement_naive_minus_gibbs_cached` — non-negative gap; the Gibbs replacement is
-  expected to be closer to dense softmax than naive top-k.
+  scores from block 0. Gibbs uses the configured tail mode; fixed-probability mode uses the
+  block-0 calibrated `gibbs_tail_prob_eps` value for this metric.
+- `jeffreys_improvement_naive_minus_gibbs_cached` — signed gap between naive and Gibbs Top-K under
+  the active tail behavior.
+- `gibbs_tail_prob_eps_calibrated_by_block` — per-block estimates of the true omitted dense-softmax
+  probability mass outside the top-k set on the calibration minibatch.
+- `gibbs_tail_prob_eps_calibrated_mean` plus per-block min/max variants — summary statistics for
+  those omitted-tail estimates. The surgery CLI prints the by-block values.
+- `gibbs_tail_prob_eps_applied_by_block` — values copied into each `GibbsTopKSoftmax` scalar
+  parameter when `gibbs_tail_use_prob_eps` is true.
 - Synthetic `*_synthetic` variants on a Gaussian score tensor of the same shape, for
   cross-checking.
 
@@ -220,19 +240,22 @@ The CLI writes:
   (`save_model_checkpoint` with adapter-supplied `extra`).
 - `artifacts/metadata/ts_surgery_<config>.json` — `SurgeryMeta` JSON with `model_key`,
   `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `pwl`, `calibration`, `module_mapping`,
-  `reference_checkpoint`, and `allow_matmul`.
+  `reference_checkpoint`, `allow_matmul`, `gibbs_tail_use_prob_eps`, and `gibbs_tail_prob_eps`.
 - `artifacts/logs/ts_surgery_<config>_model_before_surgery.txt` and `_model_after_surgery.txt`
   — `write_model_structure_txt` dumps with `repr(model)`, parameter counts, the
   `named_modules` listing, and per-module forward output tensor shapes from one `eval` pass on
   a dummy batch.
 
 Checkpoint `extra` records the adapter key, reference checkpoint, metadata basename, mapping,
-top_k, eps_ln, config JSON path, all transform flags, and the surgery dtype, so the surgery
-student can be reconstructed by `build_surgery_model_from_extra` without the original config.
+top_k, eps_ln, `gibbs_tail_use_prob_eps`, `gibbs_tail_prob_eps`, config JSON path, all transform
+flags, and the surgery dtype, so the surgery student can be reconstructed by
+`build_surgery_model_from_extra` without the original config. Per-block calibrated
+`gibbs_tail_prob_eps` values live in the checkpoint state dict, checkpoint `extra`, and the
+metadata calibration block.
 
-## Acceptance Criteria
+## Validation Expectations
 
-The surgery stage is acceptable only if:
+The surgery stage is expected to satisfy:
 
 1. It loads the reference and builds the student through the adapter and does not depend on a
    concrete model module.
@@ -241,9 +264,10 @@ The surgery stage is acceptable only if:
    `torch.matmul` or `AffineHadamard` in attention score or value paths.
 3. Binary mixes (residual, positional embedding, centering, Gibbs intermediates) appear as
    `AffineContract` after `stack`, not inside opaque add modules.
-4. Calibration reports LN MSE and Gibbs-vs-naive Jeffreys metrics; the Gibbs replacement is no
-   worse than naive top-k in Jeffreys distance.
-5. `eps` is a fixed scalar, frozen for fine-tuning by `freeze_eps_parameters`.
+4. Calibration reports LN MSE, calibrated `gibbs_tail_prob_eps` values, and Gibbs-vs-naive Jeffreys
+   metrics for the configured tail behavior.
+5. `eps` is a fixed normalizer floor from config. When `gibbs_tail_use_prob_eps` is true,
+   `gibbs_tail_prob_eps` is a scalar module parameter and does not multiply `exp(s_K)`.
 6. The post-transform student validates reasonably close to the reference under the chosen
    flags.
 7. The CLI writes the checkpoint, metadata JSON, and before/after structure logs for the run
