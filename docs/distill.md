@@ -37,7 +37,6 @@ mean Jeffreys divergence against the teacher.
 Trainable:
 
 - affine weights and biases where ``requires_grad`` is set.
-- PWL parameters, including trainable knot values where present.
 - ``gamma``/``beta`` in ``AffineScaleBias``.
 - ``GibbsTopKSoftmax.gibbs_tail_prob_eps``.
 

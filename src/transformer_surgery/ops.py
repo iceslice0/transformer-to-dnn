@@ -16,9 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath as _TimmDropPath
 
-# Default number of PWL knots for scalar PWL modules; currently used by NLGELU.
-PWL_NUM_KNOTS = 17
-
 # Process-wide dtype for surgery tensor literals and ``.to(dtype=...)`` (set via ``apply_dtype_from_config``).
 _SURGERY_DTYPE: torch.dtype = torch.bfloat16
 
@@ -72,7 +69,7 @@ def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
 #              scale+bias, fixed 2x2 mixes, linear unary reductions/scalings, and the variable
 #              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul.
 #   NL*      — strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
-#              reciprocal+eps, scalar PWL, GELU-as-PWL).
+#              reciprocal+eps, GELU).
 #   Routing* — pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
 #              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, torch.max, Dropout/DropPath); see the
 #              ``Routing*`` aliases above.
@@ -272,43 +269,7 @@ class AffineMean(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Scalar PWL (trainable knots/values) — unary epilogue
-# ---------------------------------------------------------------------------
-
-
-def _pwl_eval(x: torch.Tensor, knots: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-    """Piecewise-linear interpolation; knots strictly increasing."""
-    x_flat = x.reshape(-1)
-    k = knots.to(device=x.device, dtype=x.dtype)
-    v = values.to(device=x.device, dtype=x.dtype)
-    xc = x_flat.clamp(k[0], k[-1])
-    idx = torch.searchsorted(k, xc, right=False) - 1
-    idx = idx.clamp(0, k.numel() - 2)
-    t0, t1 = k[idx], k[idx + 1]
-    y0, y1 = v[idx], v[idx + 1]
-    w = (xc - t0) / (t1 - t0 + 1e-30)
-    y = y0 + w * (y1 - y0)
-    return y.reshape_as(x)
-
-
-class NLScalarPWL(nn.Module):
-    """Univariate PWL with learnable knot values (knot positions fixed)."""
-
-    def __init__(self, knots: torch.Tensor, init_values: Optional[torch.Tensor] = None) -> None:
-        super().__init__()
-        if knots.ndim != 1 or knots.numel() < 2:
-            raise ValueError("knots must be 1D with length >= 2")
-        self.register_buffer("knots", knots.clone().detach())
-        if init_values is None:
-            init_values = torch.zeros_like(knots)
-        self.values = nn.Parameter(init_values.clone().float())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _pwl_eval(x, self.knots, self.values)
-
-
-# ---------------------------------------------------------------------------
-# LayerNorm rewrite: relu± stack + affine reductions + NLSqrtExp (no log PWL)
+# LayerNorm rewrite: relu± stack + affine reductions + NLSqrtExp
 # ---------------------------------------------------------------------------
 
 
@@ -578,20 +539,15 @@ class SparseWeightedSumBySquare(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# GELU as unary PWL (MLP nonlinearity)
+# GELU basis op (MLP nonlinearity)
 # ---------------------------------------------------------------------------
 
 
 class NLGELU(nn.Module):
-    def __init__(self, knots: Optional[torch.Tensor] = None) -> None:
-        super().__init__()
-        if knots is None:
-            knots = torch.linspace(-4.0, 4.0, PWL_NUM_KNOTS)
-        ref = F.gelu(knots)
-        self.pwl = NLScalarPWL(knots, init_values=ref)
+    """Exact GELU as a nonlinear unary basis op."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pwl(x)
+        return F.gelu(x)
 
 
 # ---------------------------------------------------------------------------
@@ -703,25 +659,6 @@ CALIBRATION_LEGEND_TEXT = (
     "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
     "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
 )
-
-
-def build_surgery_pwl_meta() -> Dict[str, Any]:
-    """
-    JSON-safe summary of **live** PWL in the surgery model. Gibbs / LN use exact ``exp`` /
-    ``log`` on buffers — no PWL grids there. Only :class:`NLGELU` uses scalar PWL; knot
-    positions match its default (values are trainable parameters in the checkpoint).
-    """
-    k = torch.linspace(-4.0, 4.0, PWL_NUM_KNOTS)
-    return {
-        "gelu_mlp": {
-            "knot_positions": [float(x) for x in k],
-            "num_knots": int(PWL_NUM_KNOTS),
-            "note": (
-                "Default knot x-positions for NLGELU; knot values are "
-                "``blocks.*.mlp.act.pwl.values`` in the state dict."
-            ),
-        },
-    }
 
 
 def _forward_output_shape_str(out: Any) -> str:
@@ -837,7 +774,6 @@ class SurgeryMeta:
     disable_calib_gibbs_tail_prob: bool = False
     top_k: int = 32
     surgery_dtype: str = "bfloat16"
-    pwl: Dict[str, Any] = field(default_factory=dict)
     calibration: Dict[str, Any] = field(default_factory=dict)
     module_mapping: Dict[str, str] = field(default_factory=dict)
     reference_checkpoint: str = ""
@@ -855,7 +791,6 @@ class SurgeryMeta:
                     "disable_calib_gibbs_tail_prob": self.disable_calib_gibbs_tail_prob,
                     "top_k": self.top_k,
                     "surgery_dtype": self.surgery_dtype,
-                    "pwl": self.pwl,
                     "calibration": self.calibration,
                     "calibration_legend": CALIBRATION_LEGEND_TEXT,
                     "module_mapping": self.module_mapping,

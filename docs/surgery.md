@@ -65,10 +65,10 @@ The graph shows an `AffineContract` child; the stack is plain tensor wiring in `
 Strictly nonlinear scalar maps:
 
 - Exact unaries: `NLSquare`, `NLExp`, `NLLogPlusEps`, `NLSqrtExp`,
-  `NLRsqrtPlusEps`, `NLReciprocalPlusEps`.
-- Trainable PWL: `NLScalarPWL` (learnable knot values, fixed knot positions);
-  `NLGELU` wraps it with default knots on `linspace(-4, 4, PWL_NUM_KNOTS)` initialized to
-  `F.gelu(knots)`.
+  `NLRsqrtPlusEps`, `NLReciprocalPlusEps`, `NLGELU`.
+
+`NLGELU` is an exact GELU basis op, not a piecewise-linear approximation and not a trainable
+parameter block.
 
 `NLLogPlusEps`, `NLRsqrtPlusEps`, and `NLReciprocalPlusEps` carry a fixed `eps` buffer
 set from the run config and frozen at training time by `freeze_eps_parameters`.
@@ -236,7 +236,7 @@ The CLI writes:
 - `artifacts/checkpoints/ts_surgery_<config>.pt` — pre-finetune surgery checkpoint
   (`save_model_checkpoint` with adapter-supplied `extra`).
 - `artifacts/metadata/ts_surgery_<config>.json` — `SurgeryMeta` JSON with `model_key`,
-  `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `pwl`, `calibration`, `module_mapping`,
+  `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `calibration`, `module_mapping`,
   `reference_checkpoint`, `allow_matmul`, `gibbs_tail_prob_eps`, and
   `disable_calib_gibbs_tail_prob`.
 - `artifacts/logs/ts_surgery_<config>_model_before_surgery.txt` and `_model_after_surgery.txt`

@@ -148,7 +148,9 @@ class PackageSmokeTests(unittest.TestCase):
                 self.assertIn("--config", proc.stdout)
 
     def test_model_instantiates_on_cpu(self) -> None:
+        import torch
         import torch.nn as nn
+        import torch.nn.functional as F
 
         from transformer_surgery.models import DeiTTinySurgeryModel
         from transformer_surgery.models.adapters import get_model_adapter
@@ -156,6 +158,9 @@ class PackageSmokeTests(unittest.TestCase):
         model = DeiTTinySurgeryModel(num_classes=37).cpu()
         self.assertEqual(model.num_classes, 37)
         self.assertEqual(model.seq_len, 197)
+        self.assertEqual(sum(p.numel() for p in model.blocks[0].mlp.act.parameters()), 0)
+        x = torch.linspace(-3.0, 3.0, 9)
+        self.assertTrue(torch.equal(model.blocks[0].mlp.act(x), F.gelu(x)))
         tail_prob = model.blocks[0].attn.gibbs.gibbs_tail_prob_eps
         self.assertIsInstance(tail_prob, nn.Parameter)
         self.assertEqual(tuple(tail_prob.shape), ())

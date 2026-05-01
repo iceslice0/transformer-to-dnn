@@ -1,5 +1,5 @@
 """
-DeiT-Tiny rewritten in the pseudo-hardware basis: explicit affine + local PWL epilogues + routing.
+DeiT-Tiny rewritten in the pseudo-hardware basis: explicit affine + nonlinear unary ops + routing.
 """
 
 from __future__ import annotations

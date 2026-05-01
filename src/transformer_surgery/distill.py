@@ -277,9 +277,6 @@ def merge_post_distill_into_surgery_meta(
             "patient": patient,
             "dataset": dataset,
             "calibration": {},
-            "pwl": {
-                "note": "No surgery metadata on disk; run the surgery CLI first for PWL metadata.",
-            },
             "meta_note": "Stub created before distill (no prior surgery metadata at this path).",
         }
     raw.setdefault("model_key", model_key)

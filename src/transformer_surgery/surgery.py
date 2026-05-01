@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from transformer_surgery.models.adapters import get_model_adapter
-from transformer_surgery.ops import build_surgery_pwl_meta, get_surgery_dtype, write_model_structure_txt
+from transformer_surgery.ops import get_surgery_dtype, write_model_structure_txt
 from transformer_surgery.util import (
     accuracy_and_loss,
     describe_device,
@@ -100,13 +100,11 @@ def surgery(cfg: Any, *, device: Optional[torch.device] = None, dtype: Optional[
     pre_acc, pre_loss = accuracy_and_loss(model, val_loader, criterion)
     print(f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f}")
 
-    pwl_meta = build_surgery_pwl_meta()
     mod_map = adapter.build_module_mapping(cfg, model)
     meta = adapter.build_surgery_meta(
         cfg,
         calibration=cal,
         reference_checkpoint_abs=reference_path,
-        pwl=pwl_meta,
         module_mapping=mod_map,
     )
     meta.calibration["ref_val_acc"] = float(ref_acc)

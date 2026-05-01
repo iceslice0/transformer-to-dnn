@@ -82,7 +82,6 @@ class SurgeryModelAdapter:
         *,
         calibration: Dict[str, Any],
         reference_checkpoint_abs: str,
-        pwl: Dict[str, Any],
         module_mapping: Dict[str, str],
     ) -> SurgeryMeta:
         return SurgeryMeta(
@@ -94,7 +93,6 @@ class SurgeryModelAdapter:
             disable_calib_gibbs_tail_prob=bool(cfg.disable_calib_gibbs_tail_prob),
             top_k=int(cfg.top_k),
             surgery_dtype=str(cfg.surgery_dtype),
-            pwl=pwl,
             calibration=dict(calibration),
             module_mapping=module_mapping,
             reference_checkpoint=reference_checkpoint_abs,
