@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import time
 from contextlib import nullcontext
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,7 @@ from transformer_surgery.util import (
     get_device,
     metadata_path_for_checkpoint,
     save_model_checkpoint,
+    set_seed,
     traceable_artifact_path,
     warmup_cosine_scheduler,
 )
@@ -45,6 +47,21 @@ def _copy_trainable_state(src: nn.Module, dst: nn.Module) -> None:
                 tensor.copy_(src_t.to(device=tensor.device, dtype=tensor.dtype))
             else:
                 tensor.copy_(src_t.to(device=tensor.device))
+
+
+def _clone_state_dict_to_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def _validation_accuracy_summary(run_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    accs = [float(run["val_acc"]) for run in run_results]
+    mean = sum(accs) / max(len(accs), 1)
+    std = math.sqrt(sum((acc - mean) ** 2 for acc in accs) / max(len(accs), 1))
+    return {
+        "val_acc_mean": mean,
+        "val_acc_std": std,
+        "num_trainings": len(accs),
+    }
 
 
 @torch.no_grad()
@@ -100,8 +117,11 @@ def distill_student_from_teacher_jeffreys(
     cfg: Any,
     *,
     log_prefix: str = "distill",
-) -> Tuple[float, float, float, Optional[int]]:
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
     """Train any classifier student with mixed hard-label CE plus Jeffreys teacher matching."""
+    if seed is not None:
+        set_seed(seed)
     device = get_device()
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps_per_epoch = len(train_loader)
@@ -164,6 +184,8 @@ def distill_student_from_teacher_jeffreys(
         f"  {pf}baseline val acc={baseline_acc:.4f} ce={baseline_ce:.4f} jeffreys={baseline_j:.4f}",
         flush=True,
     )
+    if seed is not None:
+        set_seed(seed)
     best_acc = baseline_acc
     best_ep: Optional[int] = 0
     best_state: Optional[dict] = copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
@@ -255,7 +277,15 @@ def distill_student_from_teacher_jeffreys(
         progress_batches=cfg.val_progress_batches,
         progress_prefix=pf,
     )
-    return acc_f, ce_f, j_f, best_ep if cfg.keep_best else None
+    return {
+        "baseline_val_acc": float(baseline_acc),
+        "baseline_val_ce_mean": float(baseline_ce),
+        "baseline_val_jeffreys_mean": float(baseline_j),
+        "val_acc": float(acc_f),
+        "val_ce_mean": float(ce_f),
+        "val_jeffreys_mean": float(j_f),
+        "best_val_epoch": best_ep if cfg.keep_best else None,
+    }
 
 
 def merge_post_distill_into_surgery_meta(
@@ -264,6 +294,9 @@ def merge_post_distill_into_surgery_meta(
     val_ce: float,
     val_jeffreys: float,
     *,
+    run_results: Optional[List[Dict[str, Any]]] = None,
+    accuracy_summary: Optional[Dict[str, Any]] = None,
+    best_run: Optional[Dict[str, Any]] = None,
     model_key: str = DEFAULT_MODEL_KEY,
     patient: str = "unknown",
     dataset: str = "unknown",
@@ -289,6 +322,15 @@ def merge_post_distill_into_surgery_meta(
     cal["val_acc_post_ft"] = float(val_acc)
     cal["val_ce_post_ft"] = float(val_ce)
     cal["val_jeffreys_post_ft"] = float(val_jeffreys)
+    if run_results is not None:
+        cal["student_post_distill_runs"] = run_results
+    if accuracy_summary is not None:
+        cal["student_post_distill_val_acc_mean"] = float(accuracy_summary["val_acc_mean"])
+        cal["student_post_distill_val_acc_std"] = float(accuracy_summary["val_acc_std"])
+        cal["student_post_distill_num_trainings"] = int(accuracy_summary["num_trainings"])
+    if best_run is not None:
+        cal["student_post_distill_best_run_index"] = int(best_run["run_index"])
+        cal["student_post_distill_best_seed"] = int(best_run["seed"])
     cal.pop("val_loss_post_ft", None)
     raw["calibration"] = cal
     raw["calibration_legend"] = CALIBRATION_LEGEND_TEXT
@@ -310,20 +352,32 @@ def _log_distill_session_line(cfg: Any, teacher_path: str) -> None:
     print(
         f"fine-tune CE+distill | teacher={teacher_path} mix={cfg.distill_weight} "
         f"epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay} "
+        f"num_trainings={cfg.num_trainings} base_seed={cfg.base_seed} "
         f"train_progress_interval={cfg.train_progress_interval} val_progress_batches={cfg.val_progress_batches}",
         flush=True,
     )
 
 
-def _log_distill_final_metrics(
-    val_acc: float,
-    val_ce: float,
-    val_j: float,
-    best_ep: Optional[int],
-) -> None:
+def _log_distill_final_metrics(result: Dict[str, Any]) -> None:
     print(
-        f"final val acc={val_acc:.4f} ce={val_ce:.4f} jeffreys={val_j:.4f}"
-        + (f" best_epoch={best_ep}" if best_ep is not None else ""),
+        f"run {int(result['run_number'])}/{int(result['num_trainings'])} "
+        f"seed={int(result['seed'])} final val acc={float(result['val_acc']):.4f} "
+        f"ce={float(result['val_ce_mean']):.4f} jeffreys={float(result['val_jeffreys_mean']):.4f}"
+        + (
+            f" best_epoch={result['best_val_epoch']}"
+            if result.get("best_val_epoch") is not None
+            else ""
+        ),
+        flush=True,
+    )
+
+
+def _log_distill_summary(summary: Dict[str, Any], best_run: Dict[str, Any]) -> None:
+    print(
+        f"validation accuracy over {int(summary['num_trainings'])} training run(s): "
+        f"mean={float(summary['val_acc_mean']):.4f} std={float(summary['val_acc_std']):.4f}; "
+        f"best run={int(best_run['run_number'])} seed={int(best_run['seed'])} "
+        f"acc={float(best_run['val_acc']):.4f}",
         flush=True,
     )
 
@@ -331,15 +385,18 @@ def _log_distill_final_metrics(
 def _write_distill_metadata(
     meta_out: str,
     adapter: Any,
-    val_acc: float,
-    val_ce: float,
-    val_j: float,
+    best_run: Dict[str, Any],
+    run_results: List[Dict[str, Any]],
+    accuracy_summary: Dict[str, Any],
 ) -> None:
     merge_post_distill_into_surgery_meta(
         meta_out,
-        val_acc,
-        val_ce,
-        val_j,
+        float(best_run["val_acc"]),
+        float(best_run["val_ce_mean"]),
+        float(best_run["val_jeffreys_mean"]),
+        run_results=run_results,
+        accuracy_summary=accuracy_summary,
+        best_run=best_run,
         model_key=adapter.key,
         patient=adapter.patient_name,
         dataset=adapter.dataset_name,
@@ -353,25 +410,60 @@ def run_distill(cfg: Any) -> None:
     out_abs = traceable_artifact_path(cfg.output, cfg, "ts-distill", extension=".pt")
     meta_abs = metadata_path_for_checkpoint(out_abs)
     cfg.output = out_abs
+    num_trainings = int(cfg.num_trainings)
+    if num_trainings < 1:
+        raise ValueError("num_trainings must be >= 1")
+    base_seed = int(cfg.base_seed)
 
-    student, student_extra = load_surgery_student_checkpoint(pre_path, cfg)
+    probe_student, student_extra = load_surgery_student_checkpoint(pre_path, cfg)
+    del probe_student
     adapter = get_model_adapter(student_extra.get("model_key", getattr(cfg, "model_key", None)))
     teacher_path = adapter.reference_checkpoint_path(cfg)
     _log_distill_device_and_config_json(cfg)
     teacher = adapter.load_reference_checkpoint(teacher_path).to(
         device=get_device(), dtype=get_surgery_dtype()
     )
-    train_loader, val_loader = adapter.build_loaders(cfg)
 
     _log_distill_session_line(cfg, teacher_path)
-    val_acc, val_ce, val_j, best_ep = distill_student_from_teacher_jeffreys(
-        student,
-        teacher,
-        train_loader,
-        val_loader,
-        cfg,
-    )
-    _log_distill_final_metrics(val_acc, val_ce, val_j, best_ep)
+    run_results: List[Dict[str, Any]] = []
+    best_run: Optional[Dict[str, Any]] = None
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    for run_index in range(num_trainings):
+        seed = base_seed + run_index
+        run_number = run_index + 1
+        print(f"starting distill run {run_number}/{num_trainings} seed={seed}", flush=True)
+        set_seed(seed)
+        student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
+        train_loader, val_loader = adapter.build_loaders(cfg)
+        result = distill_student_from_teacher_jeffreys(
+            student,
+            teacher,
+            train_loader,
+            val_loader,
+            cfg,
+            log_prefix=f"distill[{run_number}/{num_trainings}]",
+            seed=seed,
+        )
+        result.update(
+            {
+                "run_index": run_index,
+                "run_number": run_number,
+                "num_trainings": num_trainings,
+                "seed": seed,
+            }
+        )
+        run_results.append(result)
+        _log_distill_final_metrics(result)
+        if best_run is None or float(result["val_acc"]) > float(best_run["val_acc"]):
+            best_run = result
+            best_state = _clone_state_dict_to_cpu(student)
+    if best_run is None or best_state is None:
+        raise RuntimeError("distillation produced no runs")
+    accuracy_summary = _validation_accuracy_summary(run_results)
+    _log_distill_summary(accuracy_summary, best_run)
+
+    best_student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
+    best_student.load_state_dict(best_state, strict=True)
 
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
     out_extra = dict(student_extra)
@@ -383,18 +475,26 @@ def run_distill(cfg: Any) -> None:
             "distill_weight": float(cfg.distill_weight),
             "reference_checkpoint": teacher_path,
             "student_pre_checkpoint": pre_path,
-            "val_acc": val_acc,
-            "val_ce_mean": val_ce,
-            "val_jeffreys_mean": val_j,
-            "best_val_epoch": best_ep,
+            "base_seed": base_seed,
+            "num_trainings": num_trainings,
+            "distill_runs": run_results,
+            "distill_val_acc_mean": float(accuracy_summary["val_acc_mean"]),
+            "distill_val_acc_std": float(accuracy_summary["val_acc_std"]),
+            "best_distill_run": best_run,
+            "best_distill_run_index": int(best_run["run_index"]),
+            "best_distill_seed": int(best_run["seed"]),
+            "val_acc": float(best_run["val_acc"]),
+            "val_ce_mean": float(best_run["val_ce_mean"]),
+            "val_jeffreys_mean": float(best_run["val_jeffreys_mean"]),
+            "best_val_epoch": best_run.get("best_val_epoch"),
             "config_json": cfg.config_json_path,
             "surgery_dtype": describe_dtype(get_surgery_dtype()),
         }
     )
     save_model_checkpoint(
         out_abs,
-        student,
+        best_student,
         extra=out_extra,
     )
     print(f"wrote {out_abs}", flush=True)
-    _write_distill_metadata(meta_abs, adapter, val_acc, val_ce, val_j)
+    _write_distill_metadata(meta_abs, adapter, best_run, run_results, accuracy_summary)

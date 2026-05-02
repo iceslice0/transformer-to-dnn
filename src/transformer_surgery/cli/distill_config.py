@@ -28,6 +28,8 @@ class JeffreysDistillConfig:
     distill_weight: float = 0.5
     max_train_batches: Optional[int] = None
     keep_best: bool = True
+    base_seed: int = 42
+    num_trainings: int = 1
     reference_checkpoint: Optional[str] = None
     pre_checkpoint: str = "artifacts/checkpoints/ts_surgery_topk64_fast.pt"
     output: str = "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt"
@@ -51,6 +53,8 @@ FIELD_HELP_JEFFREYS: Dict[str, str] = {
     "model_key": FIELD_HELP_SURGERY["model_key"],
     "reference_checkpoint": FIELD_HELP_SURGERY["reference_checkpoint"],
     "distill_weight": "Mixing weight for teacher matching vs hard-label CE.",
+    "base_seed": "Base random seed; run i uses base_seed + i.",
+    "num_trainings": "Number of independent distillation trainings to run; only the best checkpoint is saved.",
     "surgery_dtype": FIELD_HELP_SURGERY["surgery_dtype"],
 }
 

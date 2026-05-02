@@ -4,6 +4,7 @@ import os
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -59,7 +60,9 @@ class PackageSmokeTests(unittest.TestCase):
         for path in glob.glob(str(ROOT / "configs/surgery/*.json")):
             SurgeryConfig.load(path)
         for path in glob.glob(str(ROOT / "configs/distill/*.json")):
-            JeffreysDistillConfig.load(path)
+            cfg = JeffreysDistillConfig.load(path)
+            self.assertEqual(cfg.base_seed, 42)
+            self.assertGreaterEqual(cfg.num_trainings, 1)
         for path in glob.glob(str(ROOT / "configs/ptq/*.json")):
             PTQSurgeryConfig.load(path)
         self.assertFalse(SurgeryConfig.load(str(ROOT / CLI_SURGERY_CONFIG_DEFAULT)).disable_calib_gibbs_tail_prob)
@@ -123,6 +126,33 @@ class PackageSmokeTests(unittest.TestCase):
                 "artifacts/logs/ts_ptq_64_fast_jeffreys_8bit_model_after_ptq.txt"
             )
         )
+
+    def test_distill_repeat_metadata_helpers(self) -> None:
+        from transformer_surgery.distill import _validation_accuracy_summary, merge_post_distill_into_surgery_meta
+
+        runs = [
+            {"run_index": 0, "seed": 42, "val_acc": 0.60, "val_ce_mean": 1.0, "val_jeffreys_mean": 0.3},
+            {"run_index": 1, "seed": 43, "val_acc": 0.80, "val_ce_mean": 0.8, "val_jeffreys_mean": 0.2},
+        ]
+        summary = _validation_accuracy_summary(runs)
+        self.assertAlmostEqual(summary["val_acc_mean"], 0.70)
+        self.assertAlmostEqual(summary["val_acc_std"], 0.10)
+        with tempfile.TemporaryDirectory() as td:
+            meta_path = os.path.join(td, "distill.json")
+            merge_post_distill_into_surgery_meta(
+                meta_path,
+                0.80,
+                0.8,
+                0.2,
+                run_results=runs,
+                accuracy_summary=summary,
+                best_run=runs[1],
+            )
+            with open(meta_path, encoding="utf-8") as f:
+                cal = json.load(f)["calibration"]
+        self.assertEqual(cal["student_post_distill_runs"], runs)
+        self.assertEqual(cal["student_post_distill_best_seed"], 43)
+        self.assertAlmostEqual(cal["student_post_distill_val_acc_mean"], 0.70)
 
     def test_cli_help(self) -> None:
         env = dict(os.environ)

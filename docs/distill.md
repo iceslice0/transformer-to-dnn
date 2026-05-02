@@ -15,6 +15,8 @@ The core code lives in ``src/transformer_surgery/distill.py``. The CLI wrapper i
 - dataset/config fields shared with the adapter, such as ``data_dir``, ``batch_size``, and ``workers``.
 - optimization fields: ``epochs``, ``lr``, ``weight_decay``, ``warmup_epochs``, ``grad_clip``,
   ``cosine_eta_min``, ``keep_best``, and progress intervals.
+- repeat fields: ``base_seed`` and ``num_trainings``. Training run ``i`` uses seed
+  ``base_seed + i``.
 
 Distillation must not import Pet/DeiT code directly. It uses ``get_model_adapter`` and
 ``load_surgery_student_checkpoint`` so model-specific loading, dataloaders, and reconstruction stay
@@ -50,6 +52,10 @@ When the runtime device is CUDA and the surgery dtype is ``float16``, distillati
 training copy and copies trainable state back into the surgery student. Other dtypes train the
 student directly.
 
+When ``num_trainings`` is greater than one, each run reloads the same ``pre_checkpoint`` and trains
+independently. All run metrics are kept in metadata, validation accuracy mean/std are computed
+across runs, and only the best-validation-accuracy checkpoint is written to disk.
+
 ## Outputs
 
 The CLI writes:
@@ -58,9 +64,10 @@ The CLI writes:
 - ``artifacts/metadata/ts_distill_<config>.json``.
 
 Checkpoint metadata records the adapter key, teacher checkpoint, source surgery checkpoint,
-temperature, distillation weight, validation metrics, best epoch, config JSON path, and surgery
-dtype. The metadata JSON adds post-distillation metrics under the ``calibration`` block so the full
-surgery -> distill result remains traceable by checkpoint basename.
+temperature, distillation weight, base seed, number of trainings, every run's metrics, validation
+accuracy mean/std, best run, config JSON path, and surgery dtype. The saved model state is from the
+best run only. The metadata JSON adds post-distillation metrics under the ``calibration`` block so
+the full surgery -> distill result remains traceable by checkpoint basename.
 
 ## Acceptance Criteria
 
@@ -69,5 +76,7 @@ The distillation stage is acceptable only if:
 1. It loads the student through the adapter checkpoint path and does not depend on a concrete model module.
 2. It keeps the teacher frozen.
 3. It reports CE and Jeffreys validation metrics before saving.
-4. It saves a real PyTorch checkpoint and matching metadata derived from the output checkpoint name.
-5. It preserves fixed surgery constants and only trains intended parameters.
+4. It keeps per-run metrics, reports validation accuracy mean/std, and saves only the best run's
+   checkpoint.
+5. It saves a real PyTorch checkpoint and matching metadata derived from the output checkpoint name.
+6. It preserves fixed surgery constants and only trains intended parameters.
