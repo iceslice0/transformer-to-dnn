@@ -1,5 +1,6 @@
 import glob
 import json
+import math
 import os
 import importlib.util
 import subprocess
@@ -136,7 +137,7 @@ class PackageSmokeTests(unittest.TestCase):
         ]
         summary = _validation_accuracy_summary(runs)
         self.assertAlmostEqual(summary["val_acc_mean"], 0.70)
-        self.assertAlmostEqual(summary["val_acc_std"], 0.10)
+        self.assertAlmostEqual(summary["val_acc_std"], math.sqrt(0.02))
         with tempfile.TemporaryDirectory() as td:
             meta_path = os.path.join(td, "distill.json")
             merge_post_distill_into_surgery_meta(

@@ -8,7 +8,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,9 @@ from transformer_surgery.util import (
     warmup_cosine_scheduler,
 )
 
+if TYPE_CHECKING:
+    from transformer_surgery.cli.distill_config import JeffreysDistillConfig
+
 
 def _maybe_cuda_autocast(device: torch.device, dt: torch.dtype):
     if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
@@ -35,7 +38,8 @@ def _maybe_cuda_autocast(device: torch.device, dt: torch.dtype):
     return nullcontext()
 
 
-def _copy_trainable_state(src: nn.Module, dst: nn.Module) -> None:
+def _copy_state_into(src: nn.Module, dst: nn.Module) -> None:
+    """Copy every matching state_dict entry from ``src`` into ``dst`` in place."""
     with torch.no_grad():
         src_sd = src.state_dict()
         dst_sd = dst.state_dict()
@@ -55,12 +59,16 @@ def _clone_state_dict_to_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 def _validation_accuracy_summary(run_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     accs = [float(run["val_acc"]) for run in run_results]
-    mean = sum(accs) / max(len(accs), 1)
-    std = math.sqrt(sum((acc - mean) ** 2 for acc in accs) / max(len(accs), 1))
+    n = len(accs)
+    mean = sum(accs) / n if n else 0.0
+    if n > 1:
+        std = math.sqrt(sum((acc - mean) ** 2 for acc in accs) / (n - 1))
+    else:
+        std = 0.0
     return {
         "val_acc_mean": mean,
         "val_acc_std": std,
-        "num_trainings": len(accs),
+        "num_trainings": n,
     }
 
 
@@ -79,9 +87,10 @@ def eval_distillation_metrics(
     teacher.eval()
     student.eval()
     use_cuda = device.type == "cuda"
-    ce_sum, j_sum = 0.0, 0.0
+    ce_sum_t = torch.zeros((), device=device, dtype=torch.float64)
+    j_sum_t = torch.zeros((), device=device, dtype=torch.float64)
+    correct_t = torch.zeros((), device=device, dtype=torch.long)
     n = 0
-    correct = 0
     n_val = len(val_loader)
     t0 = time.perf_counter()
     dt = get_surgery_dtype()
@@ -91,9 +100,9 @@ def eval_distillation_metrics(
         with _maybe_cuda_autocast(device, dt):
             t_log = teacher(x)
             s_log = student(x)
-        ce_sum += torch.nn.functional.cross_entropy(s_log.float(), y, reduction="sum").item()
-        j_sum += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().item()
-        correct += (s_log.argmax(dim=-1) == y).sum().item()
+        ce_sum_t += torch.nn.functional.cross_entropy(s_log.float(), y, reduction="sum").double()
+        j_sum_t += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().double()
+        correct_t += (s_log.argmax(dim=-1) == y).sum()
         n += y.size(0)
         if progress_batches > 0 and n_val > 0:
             if bi == 0 or (bi + 1) % progress_batches == 0 or (bi + 1) == n_val:
@@ -105,8 +114,8 @@ def eval_distillation_metrics(
                     f"~{rate:.2f} batch/s eta~{eta:.0f}s",
                     flush=True,
                 )
-    acc = correct / max(n, 1)
-    return acc, ce_sum / max(n, 1), j_sum / max(n, 1)
+    denom = max(n, 1)
+    return correct_t.item() / denom, ce_sum_t.item() / denom, j_sum_t.item() / denom
 
 
 def distill_student_from_teacher_jeffreys(
@@ -114,7 +123,7 @@ def distill_student_from_teacher_jeffreys(
     teacher: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    cfg: Any,
+    cfg: "JeffreysDistillConfig",
     *,
     log_prefix: str = "distill",
     seed: Optional[int] = None,
@@ -123,20 +132,13 @@ def distill_student_from_teacher_jeffreys(
     if seed is not None:
         set_seed(seed)
     device = get_device()
-    opt = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps_per_epoch = len(train_loader)
     if cfg.max_train_batches is not None:
         steps_per_epoch = min(steps_per_epoch, cfg.max_train_batches)
     epochs = cfg.epochs
     total_steps = max(1, epochs * steps_per_epoch)
-    warmup_epochs = min(5, max(cfg.epochs, 1)) if cfg.warmup_epochs is None else int(cfg.warmup_epochs)
+    warmup_epochs = min(5, max(epochs, 1)) if cfg.warmup_epochs is None else int(cfg.warmup_epochs)
     warmup_steps = min(warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
-    scheduler = warmup_cosine_scheduler(
-        opt,
-        total_steps=total_steps,
-        warmup_steps=warmup_steps,
-        eta_min=max(0.0, float(cfg.cosine_eta_min)),
-    )
     use_cuda = device.type == "cuda"
     pf = f"{log_prefix} " if log_prefix else ""
     print(
@@ -155,18 +157,16 @@ def distill_student_from_teacher_jeffreys(
     use_master_fp32 = use_cuda and dt == torch.float16
     if use_master_fp32:
         train_student = copy.deepcopy(student).float()
-        train_opt = torch.optim.AdamW(train_student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        train_scheduler = warmup_cosine_scheduler(
-            train_opt,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            eta_min=max(0.0, float(cfg.cosine_eta_min)),
-        )
         train_student.train()
     else:
         train_student = student
-        train_opt = opt
-        train_scheduler = scheduler
+    train_opt = torch.optim.AdamW(train_student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    train_scheduler = warmup_cosine_scheduler(
+        train_opt,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        eta_min=max(0.0, float(cfg.cosine_eta_min)),
+    )
     baseline_teacher = teacher
     for p in baseline_teacher.parameters():
         p.requires_grad = False
@@ -187,13 +187,19 @@ def distill_student_from_teacher_jeffreys(
     if seed is not None:
         set_seed(seed)
     best_acc = baseline_acc
+    best_ce = baseline_ce
+    best_j = baseline_j
     best_ep: Optional[int] = 0
-    best_state: Optional[dict] = copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
+    best_state: Optional[dict] = (
+        copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
+        if cfg.keep_best
+        else None
+    )
     for ep in range(epochs):
         train_student.train()
         n_batches = 0
         ep_t0 = time.perf_counter()
-        running_loss = 0.0
+        running_loss_t: Optional[torch.Tensor] = None
         for x, y in train_loader:
             x = x.to(device, dtype=dt, non_blocking=use_cuda)
             y = y.to(device, non_blocking=use_cuda)
@@ -217,8 +223,7 @@ def distill_student_from_teacher_jeffreys(
             train_scheduler.step()
             n_batches += 1
             global_step += 1
-            li = float(loss.item())
-            running_loss += li
+            running_loss_t = loss.detach() if running_loss_t is None else running_loss_t + loss.detach()
             if cfg.train_progress_interval > 0:
                 do_log = (
                     n_batches == 1
@@ -229,7 +234,8 @@ def distill_student_from_teacher_jeffreys(
                     do_log = True
                 if do_log:
                     elapsed = time.perf_counter() - ep_t0
-                    avg = running_loss / n_batches
+                    li = float(loss.item())
+                    avg = float(running_loss_t.item()) / n_batches
                     rate = n_batches / elapsed if elapsed > 0 else 0.0
                     left = steps_per_epoch - n_batches
                     eta_s = left / rate if rate > 0 else 0.0
@@ -244,9 +250,7 @@ def distill_student_from_teacher_jeffreys(
             if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
         if use_master_fp32:
-            _copy_trainable_state(train_student, student)
-        else:
-            student = train_student
+            _copy_state_into(train_student, student)
         acc, ce_v, j_v = eval_distillation_metrics(
             baseline_teacher,
             student,
@@ -256,34 +260,30 @@ def distill_student_from_teacher_jeffreys(
             progress_prefix=pf,
         )
         print(f"  {pf}epoch {ep + 1}/{epochs} | val acc={acc:.4f} ce={ce_v:.4f} jeffreys={j_v:.4f}", flush=True)
-        if cfg.keep_best and acc > best_acc:
-            best_acc = acc
+        if cfg.keep_best:
+            if acc > best_acc:
+                best_acc, best_ce, best_j = acc, ce_v, j_v
+                best_ep = ep + 1
+                best_state = copy.deepcopy(
+                    train_student.state_dict() if use_master_fp32 else student.state_dict()
+                )
+        else:
+            best_acc, best_ce, best_j = acc, ce_v, j_v
             best_ep = ep + 1
-            best_state = copy.deepcopy(train_student.state_dict() if use_master_fp32 else student.state_dict())
     if cfg.keep_best and best_state is not None:
         if use_master_fp32:
             train_student.load_state_dict(best_state)
-            _copy_trainable_state(train_student, student)
+            _copy_state_into(train_student, student)
         else:
             student.load_state_dict(best_state)
         print(f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})", flush=True)
-    if use_master_fp32:
-        _copy_trainable_state(train_student, student)
-    acc_f, ce_f, j_f = eval_distillation_metrics(
-        baseline_teacher,
-        student,
-        val_loader,
-        temperature=cfg.temperature,
-        progress_batches=cfg.val_progress_batches,
-        progress_prefix=pf,
-    )
     return {
         "baseline_val_acc": float(baseline_acc),
         "baseline_val_ce_mean": float(baseline_ce),
         "baseline_val_jeffreys_mean": float(baseline_j),
-        "val_acc": float(acc_f),
-        "val_ce_mean": float(ce_f),
-        "val_jeffreys_mean": float(j_f),
+        "val_acc": float(best_acc),
+        "val_ce_mean": float(best_ce),
+        "val_jeffreys_mean": float(best_j),
         "best_val_epoch": best_ep if cfg.keep_best else None,
     }
 
@@ -319,9 +319,6 @@ def merge_post_distill_into_surgery_meta(
     cal["student_post_distill_val_acc"] = float(val_acc)
     cal["student_post_distill_mean_ce"] = float(val_ce)
     cal["student_post_distill_mean_jeffreys"] = float(val_jeffreys)
-    cal["val_acc_post_ft"] = float(val_acc)
-    cal["val_ce_post_ft"] = float(val_ce)
-    cal["val_jeffreys_post_ft"] = float(val_jeffreys)
     if run_results is not None:
         cal["student_post_distill_runs"] = run_results
     if accuracy_summary is not None:
@@ -331,7 +328,6 @@ def merge_post_distill_into_surgery_meta(
     if best_run is not None:
         cal["student_post_distill_best_run_index"] = int(best_run["run_index"])
         cal["student_post_distill_best_seed"] = int(best_run["seed"])
-    cal.pop("val_loss_post_ft", None)
     raw["calibration"] = cal
     raw["calibration_legend"] = CALIBRATION_LEGEND_TEXT
     os.makedirs(os.path.dirname(os.path.abspath(meta_path)) or ".", exist_ok=True)
@@ -339,7 +335,7 @@ def merge_post_distill_into_surgery_meta(
         json.dump(raw, f, indent=2)
 
 
-def _log_distill_device_and_config_json(cfg: Any) -> None:
+def _log_distill_device_and_config_json(cfg: "JeffreysDistillConfig") -> None:
     print(
         f"device={describe_device(get_device())} surgery_dtype={describe_dtype(get_surgery_dtype())}",
         flush=True,
@@ -348,7 +344,7 @@ def _log_distill_device_and_config_json(cfg: Any) -> None:
         print(f"config_json={cfg.config_json_path}", flush=True)
 
 
-def _log_distill_session_line(cfg: Any, teacher_path: str) -> None:
+def _log_distill_session_line(cfg: "JeffreysDistillConfig", teacher_path: str) -> None:
     print(
         f"fine-tune CE+distill | teacher={teacher_path} mix={cfg.distill_weight} "
         f"epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay} "
@@ -382,29 +378,7 @@ def _log_distill_summary(summary: Dict[str, Any], best_run: Dict[str, Any]) -> N
     )
 
 
-def _write_distill_metadata(
-    meta_out: str,
-    adapter: Any,
-    best_run: Dict[str, Any],
-    run_results: List[Dict[str, Any]],
-    accuracy_summary: Dict[str, Any],
-) -> None:
-    merge_post_distill_into_surgery_meta(
-        meta_out,
-        float(best_run["val_acc"]),
-        float(best_run["val_ce_mean"]),
-        float(best_run["val_jeffreys_mean"]),
-        run_results=run_results,
-        accuracy_summary=accuracy_summary,
-        best_run=best_run,
-        model_key=adapter.key,
-        patient=adapter.patient_name,
-        dataset=adapter.dataset_name,
-    )
-    print(f"wrote {meta_out}", flush=True)
-
-
-def run_distill(cfg: Any) -> None:
+def run_distill(cfg: "JeffreysDistillConfig") -> None:
     """Load a surgery student, run CE/Jeffreys distillation, and save traceable artifacts."""
     pre_path = os.path.abspath(cfg.pre_checkpoint)
     out_abs = traceable_artifact_path(cfg.output, cfg, "ts-distill", extension=".pt")
@@ -481,12 +455,6 @@ def run_distill(cfg: Any) -> None:
             "distill_val_acc_mean": float(accuracy_summary["val_acc_mean"]),
             "distill_val_acc_std": float(accuracy_summary["val_acc_std"]),
             "best_distill_run": best_run,
-            "best_distill_run_index": int(best_run["run_index"]),
-            "best_distill_seed": int(best_run["seed"]),
-            "val_acc": float(best_run["val_acc"]),
-            "val_ce_mean": float(best_run["val_ce_mean"]),
-            "val_jeffreys_mean": float(best_run["val_jeffreys_mean"]),
-            "best_val_epoch": best_run.get("best_val_epoch"),
             "config_json": cfg.config_json_path,
             "surgery_dtype": describe_dtype(get_surgery_dtype()),
         }
@@ -497,4 +465,16 @@ def run_distill(cfg: Any) -> None:
         extra=out_extra,
     )
     print(f"wrote {out_abs}", flush=True)
-    _write_distill_metadata(meta_abs, adapter, best_run, run_results, accuracy_summary)
+    merge_post_distill_into_surgery_meta(
+        meta_abs,
+        float(best_run["val_acc"]),
+        float(best_run["val_ce_mean"]),
+        float(best_run["val_jeffreys_mean"]),
+        run_results=run_results,
+        accuracy_summary=accuracy_summary,
+        best_run=best_run,
+        model_key=adapter.key,
+        patient=adapter.patient_name,
+        dataset=adapter.dataset_name,
+    )
+    print(f"wrote {meta_abs}", flush=True)

@@ -138,12 +138,14 @@ def build_pet_loaders(
     train_set = OxfordIIITPet(root=data_dir, split="trainval", transform=train_tf, download=need_download)
     val_set = OxfordIIITPet(root=data_dir, split="test", transform=val_tf, download=need_download)
     pin = device.type == "cuda"
+    persistent = workers > 0
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
         num_workers=workers,
         pin_memory=pin,
+        persistent_workers=persistent,
     )
     val_loader = DataLoader(
         val_set,
@@ -151,6 +153,7 @@ def build_pet_loaders(
         shuffle=False,
         num_workers=workers,
         pin_memory=pin,
+        persistent_workers=persistent,
     )
     return train_loader, val_loader
 

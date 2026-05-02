@@ -654,8 +654,7 @@ CALIBRATION_LEGEND_TEXT = (
     "ref_val_acc / ref_val_loss: frozen timm teacher on val (mean CE). "
     "student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val "
     "after transform, before distill. "
-    "student_post_distill_* and val_*_post_ft: after Jeffreys distillation "
-    "(acc and mean CE / Jeffreys; legacy keys val_acc_post_ft retained). "
+    "student_post_distill_*: after Jeffreys distillation (acc and mean CE / Jeffreys). "
     "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
     "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
 )
