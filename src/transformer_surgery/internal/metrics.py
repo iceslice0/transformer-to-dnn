@@ -1,4 +1,10 @@
-"""Loss and diagnostic metrics used by surgery/distillation processes."""
+"""Functional divergences in the same spirit as ``torch.nn.functional`` (tensor in / tensor out, no state).
+
+Used by distillation (dense Jeffreys) and calibration (sparse top-k diagnostics). There is no
+drop-in ``nn`` module for symmetric Jeffreys or for the sparse Gibbs / naive-``q`` constructions; a
+dense implementation could be spelled with two ``F.kl_div`` calls plus the same dtype/temperature
+and stability choices you already encode here.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,11 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+def _logit_stable_rows(logits: torch.Tensor) -> torch.Tensor:
+    """Row-wise max-subtracted logits (same as stable softmax input)."""
+    return logits - logits.max(dim=-1, keepdim=True).values
 
 
 def _jeffreys_metric_eps(dt: torch.dtype) -> Tuple[float, float]:
@@ -51,7 +62,7 @@ def jeffreys_distance_sparse_teacher(
     tail_prob = float(gibbs_tail_prob_eps)
     if not 0.0 <= tail_prob < 1.0:
         raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
-    t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
+    t = _logit_stable_rows(teacher_logits)
     p = F.softmax(t, dim=-1)
     _, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
 
@@ -74,7 +85,7 @@ def jeffreys_naive_topk(
     nk: int,
     k: int,
 ) -> torch.Tensor:
-    t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
+    t = _logit_stable_rows(teacher_logits)
     p = F.softmax(t, dim=-1)
     kl_eps, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
     exp_vals = torch.exp(vals)

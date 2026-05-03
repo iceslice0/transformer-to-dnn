@@ -20,7 +20,7 @@ from transformer_surgery.ops import (
     RoutingStack,
     SurgeryAttention,
 )
-from transformer_surgery.internal.runtime import get_surgery_dtype
+from transformer_surgery.internal.util import get_surgery_dtype
 from transformer_surgery.internal.util import ensure_mapping
 
 

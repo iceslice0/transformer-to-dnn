@@ -24,8 +24,7 @@ from transformer_surgery.ops import (
     ptq_quantize_proxy,
     ptq_signed_qrange,
 )
-from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
-from transformer_surgery.internal.util import get_device
+from transformer_surgery.internal.util import get_device, get_surgery_dtype, maybe_surgery_cuda_autocast
 
 if TYPE_CHECKING:
     from transformer_surgery.cli.surgery_config import SurgeryConfig

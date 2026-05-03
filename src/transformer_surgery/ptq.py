@@ -53,13 +53,15 @@ from transformer_surgery.internal.reporting import (
     write_json,
     write_model_structure_txt,
 )
-from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast, set_surgery_dtype
 from transformer_surgery.internal.util import (
     ensure_mapping,
     get_device,
+    get_surgery_dtype,
+    maybe_surgery_cuda_autocast,
     namespace_from_mapping,
     namespace_to_mapping,
     save_model_checkpoint,
+    set_surgery_dtype,
 )
 
 

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath as _TimmDropPath
 
-from transformer_surgery.internal.runtime import get_surgery_dtype
+from transformer_surgery.internal.util import get_surgery_dtype
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Device/seed, namespaces, schedules, checkpoints, and validation metrics (no CLI logging)."""
+"""Device/seed, surgery dtype, namespaces, schedules, checkpoints, and validation metrics (no CLI logging)."""
 
 
 from __future__ import annotations
@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import random
 from collections.abc import Mapping
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,7 +16,23 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, S
 from torch.utils.data import DataLoader
 from torchmetrics.classification import MulticlassAccuracy
 
-from .runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
+_SURGERY_DTYPE: torch.dtype = torch.bfloat16
+
+
+def get_surgery_dtype() -> torch.dtype:
+    return _SURGERY_DTYPE
+
+
+def set_surgery_dtype(dt: torch.dtype) -> None:
+    global _SURGERY_DTYPE
+    _SURGERY_DTYPE = dt
+
+
+def maybe_surgery_cuda_autocast(device: torch.device, dt: torch.dtype):
+    if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dt)
+    return nullcontext()
+
 
 DEFAULT_MODEL_KEY = "deit_tiny_pet"
 

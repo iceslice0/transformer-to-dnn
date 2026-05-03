@@ -26,10 +26,11 @@ from transformer_surgery.internal.reporting import (
     traceable_artifact_path,
     write_json,
 )
-from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
     get_device,
+    get_surgery_dtype,
+    maybe_surgery_cuda_autocast,
     save_model_checkpoint,
     set_seed,
     warmup_cosine_scheduler,

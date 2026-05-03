@@ -23,7 +23,7 @@ from transformer_surgery.internal.calibration import (
     topk_tail_mass_stats,
 )
 from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
-from transformer_surgery.internal.runtime import get_surgery_dtype, set_surgery_dtype
+from transformer_surgery.internal.util import get_surgery_dtype, set_surgery_dtype
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
     ensure_mapping,

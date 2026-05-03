@@ -20,10 +20,10 @@ from transformer_surgery.internal.reporting import (
     write_json,
     write_model_structure_txt,
 )
-from transformer_surgery.internal.runtime import get_surgery_dtype
 from transformer_surgery.internal.util import (
     accuracy_and_loss,
     get_device,
+    get_surgery_dtype,
     namespace_from_mapping,
     namespace_to_mapping,
     save_model_checkpoint,

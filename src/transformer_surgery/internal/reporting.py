@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .runtime import get_surgery_dtype
+from .util import get_surgery_dtype
 
 CALIBRATION_LEGEND_TEXT = (
     "ref_val_acc / ref_val_loss: frozen timm teacher on val (mean CE). "
