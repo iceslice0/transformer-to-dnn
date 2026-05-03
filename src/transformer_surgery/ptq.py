@@ -118,19 +118,10 @@ def _module_device(module: nn.Module) -> torch.device:
     return get_device()
 
 
-def _get_module(root: nn.Module, name: str) -> nn.Module:
-    mod = root
-    for part in name.split("."):
-        mod = mod._modules[part]
-    return mod
-
-
 def _set_module(root: nn.Module, name: str, new_module: nn.Module) -> None:
-    parts = name.split(".")
-    parent = root
-    for part in parts[:-1]:
-        parent = parent._modules[part]
-    parent._modules[parts[-1]] = new_module
+    parent_name, _, leaf = name.rpartition(".")
+    parent = root.get_submodule(parent_name) if parent_name else root
+    setattr(parent, leaf, new_module)
 
 
 def _leading_examples(t: torch.Tensor) -> int:
@@ -189,7 +180,7 @@ class CalibrationController:
 
     def register(self, model: nn.Module) -> None:
         for name in self.selected:
-            hook = _get_module(model, name).register_forward_hook(self._hook(name))
+            hook = model.get_submodule(name).register_forward_hook(self._hook(name))
             self._hooks.append(hook)
 
     def close(self) -> None:
@@ -247,7 +238,7 @@ def _diagnostic_linear_conv_max_s_global_over_s_pc(
     for name, kind in selected.items():
         if kind not in ("linear", "conv2d"):
             continue
-        mod = _get_module(model, name)
+        mod = model.get_submodule(name)
         w = _extract_weight_tensor(mod, kind)
         if w is None:
             continue
@@ -272,20 +263,21 @@ def _weight_quant_axis(kind: str, cfg: Any) -> Optional[int]:
     return None
 
 
+_WEIGHT_ATTR_BY_KIND: Dict[str, str] = {
+    "linear": "weight",
+    "conv2d": "weight",
+    "affine_scale": "scale",
+    "affine_scale_bias": "weight",
+    "affine_fixed_mix": "weight",
+    "affine_contract": "coeff",
+}
+
+
 def _extract_weight_tensor(module: nn.Module, kind: str) -> Optional[torch.Tensor]:
-    if kind == "linear":
-        return module.weight.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "conv2d":
-        return module.weight.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "affine_scale":
-        return module.scale.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "affine_scale_bias":
-        return module.weight.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "affine_fixed_mix":
-        return module.weight.detach().to(dtype=torch.float32, device="cpu")
-    if kind == "affine_contract":
-        return module.coeff.detach().to(dtype=torch.float32, device="cpu")
-    return None
+    attr = _WEIGHT_ATTR_BY_KIND.get(kind)
+    if attr is None:
+        return None
+    return getattr(module, attr).detach().to(dtype=torch.float32, device="cpu")
 
 
 def _broadcast_last_dim(vec: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -347,6 +339,7 @@ def _fit_affine_dequant(
     *,
     channel_axis: Optional[int],
     per_output_channel: bool,
+    var_eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not acc_samples:
         return torch.tensor(1.0), torch.tensor(0.0)
@@ -358,9 +351,9 @@ def _fit_affine_dequant(
         my = y.mean()
         var = (x * x).mean() - mx * mx
         cov = (x * y).mean() - mx * my
-        if float(var.abs().item()) < 1e-8:
-            # Pooled quantized acc nearly constant; avoid y ≈ constant(my).
-            denom = (x * x).mean().clamp_min(1e-12)
+        if float(var.abs().item()) < var_eps:
+            # Pooled quantized acc nearly constant; fall back to second-moment OLS through origin.
+            denom = (x * x).mean().clamp_min(var_eps)
             s = (x * y).mean() / denom
             c = my - s * mx
             return s.to(dtype=torch.float32), c.to(dtype=torch.float32)
@@ -373,7 +366,9 @@ def _fit_affine_dequant(
     for acc, out in zip(acc_samples, out_samples):
         axis = channel_axis if channel_axis >= 0 else acc.ndim + channel_axis
         if axis < 0 or axis >= acc.ndim or acc.shape[axis] != out.shape[axis]:
-            return _fit_affine_dequant(acc_samples, out_samples, channel_axis=None, per_output_channel=False)
+            return _fit_affine_dequant(
+                acc_samples, out_samples, channel_axis=None, per_output_channel=False, var_eps=var_eps
+            )
         xs.append(acc.movedim(axis, -1).reshape(-1, acc.shape[axis]).to(dtype=torch.float32))
         ys.append(out.movedim(axis, -1).reshape(-1, out.shape[axis]).to(dtype=torch.float32))
     x = torch.cat(xs, dim=0)
@@ -382,7 +377,7 @@ def _fit_affine_dequant(
     my = y.mean(dim=0)
     var = (x * x).mean(dim=0) - mx * mx
     cov = (x * y).mean(dim=0) - mx * my
-    s = torch.where(var.abs() < 1e-8, torch.zeros_like(var), cov / var.clamp_min(1e-8))
+    s = torch.where(var.abs() < var_eps, torch.zeros_like(var), cov / var.clamp_min(var_eps))
     c = my - s * mx
     return s.to(dtype=torch.float32), c.to(dtype=torch.float32)
 
@@ -482,35 +477,36 @@ class CalibratedAffinePTQWrapper(nn.Module):
         self.per_output_channel_weights_config = bool(cfg.per_output_channel)
         self.input_arity = len(data.input_samples[0])
 
-        self.register_buffer("input_scale", _calibrated_input_scales(data, self.activation_bits))
+        input_scale = _calibrated_input_scales(data, self.activation_bits)
+        self.register_buffer("input_scale", input_scale)
+        self.register_buffer("input_inv_scale", input_scale.reciprocal().to(dtype=torch.float32))
         self.register_buffer("input_zero_point", torch.zeros(self.input_arity, dtype=torch.float32))
+        self._act_qmin, self._act_qmax = _signed_qrange(self.activation_bits)
 
         weight_axis_used: Optional[int] = None
         weight_fp = _extract_weight_tensor(module, self.kind)
+        q_weight: Optional[torch.Tensor] = None
         if weight_fp is not None:
             weight_axis_used = _weight_quant_axis(self.kind, cfg)
             weight_scale = _symmetric_scale(weight_fp, self.weight_bits, axis=weight_axis_used)
             q_weight = _quantize_proxy(weight_fp, weight_scale, self.weight_bits).to(dtype=torch.float32)
             self.register_buffer("weight_scale", weight_scale.to(dtype=torch.float32))
             self.register_buffer("weight_zero_point", torch.zeros_like(weight_scale, dtype=torch.float32))
-            self.register_buffer("q_weight", q_weight)
         else:
             self.register_buffer("weight_scale", torch.tensor(1.0, dtype=torch.float32))
             self.register_buffer("weight_zero_point", torch.tensor(0.0, dtype=torch.float32))
-            self.q_weight = None
         self.per_output_channel_weights_effective = weight_axis_used is not None
 
         acc_samples: List[torch.Tensor] = []
         for input_sample in data.input_samples:
-            fp_inputs = tuple(input_sample)
             q_inputs = [
-                _quantize_proxy(inp, self.input_scale[i], self.activation_bits).to(dtype=torch.float32)
-                for i, inp in enumerate(fp_inputs)
+                _quantize_proxy(inp, input_scale[i], self.activation_bits)
+                for i, inp in enumerate(input_sample)
             ]
             acc = _simulate_accumulator(
                 self.kind,
                 q_inputs,
-                q_weight=self.q_weight,
+                q_weight=q_weight,
                 stride=self.stride,
                 padding=self.padding,
                 dilation=self.dilation,
@@ -518,8 +514,8 @@ class CalibratedAffinePTQWrapper(nn.Module):
                 einsum_equation=self.einsum_equation,
             )
             acc_samples.append(acc.to(dtype=torch.float32))
-        if self.kind in ("linear", "conv2d") and self.q_weight is not None:
-            out_scale = _linear_conv_out_scale_from_quant_scales(self.kind, self.input_scale, self.weight_scale)
+        if self.kind in ("linear", "conv2d") and q_weight is not None:
+            out_scale = _linear_conv_out_scale_from_quant_scales(self.kind, input_scale, self.weight_scale)
             out_bias = _calibrated_out_bias_fixed_scale(
                 acc_samples,
                 data.output_samples,
@@ -534,18 +530,57 @@ class CalibratedAffinePTQWrapper(nn.Module):
                 data.output_samples,
                 channel_axis=self.output_channel_axis,
                 per_output_channel=self.per_channel_output_affine,
+                var_eps=float(cfg.dequant_var_eps),
             )
             self.out_scale_mode = "ols_affine"
-        self.register_buffer("out_scale", out_scale.to(dtype=torch.float32))
+
+        out_ref = data.output_samples[0]
+        out_rank = out_ref.ndim
+        if (
+            self.per_channel_output_affine
+            and self.output_channel_axis is not None
+            and out_rank > 0
+            and out_scale.ndim > 0
+        ):
+            axis = self.output_channel_axis if self.output_channel_axis >= 0 else out_rank + self.output_channel_axis
+            bshape = [1] * out_rank
+            bshape[axis] = -1
+            self._out_bcast_shape: Optional[Tuple[int, ...]] = tuple(bshape)
+        else:
+            self._out_bcast_shape = None
+
+        # For Linear/Conv2d, bake out_scale into q_weight (axis 0 of weight == output channel for both).
+        # Saves one multiply over the output tensor each forward.
+        self._skip_out_scale = False
+        if self.kind in ("linear", "conv2d") and q_weight is not None:
+            if out_scale.ndim == 0:
+                q_weight = q_weight * out_scale.to(dtype=torch.float32)
+            else:
+                wshape = [1] * q_weight.ndim
+                wshape[0] = -1
+                q_weight = q_weight * out_scale.view(*wshape).to(dtype=torch.float32)
+            self._skip_out_scale = True
+            self._out_scale_value = out_scale.detach().cpu().tolist()
+            out_scale_buf = torch.ones((), dtype=torch.float32)
+        else:
+            self._out_scale_value = out_scale.detach().cpu().tolist()
+            out_scale_buf = out_scale.to(dtype=torch.float32)
+
+        if q_weight is not None:
+            self.register_buffer("q_weight", q_weight)
+        else:
+            self.q_weight = None
+        self.register_buffer("out_scale", out_scale_buf)
         self.register_buffer("out_bias", out_bias.to(dtype=torch.float32))
 
         self.to(device=_module_device(module))
 
     def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
-        fp_inputs = tuple(inputs)
+        qmin, qmax = self._act_qmin, self._act_qmax
+        inv_scale = self.input_inv_scale
         q_inputs = [
-            _quantize_proxy(inp, self.input_scale[i], self.activation_bits).to(dtype=torch.float32)
-            for i, inp in enumerate(fp_inputs)
+            torch.clamp(torch.round(inp.float() * inv_scale[i]), qmin, qmax)
+            for i, inp in enumerate(inputs)
         ]
         acc = _simulate_accumulator(
             self.kind,
@@ -557,10 +592,19 @@ class CalibratedAffinePTQWrapper(nn.Module):
             groups=self.groups,
             einsum_equation=self.einsum_equation,
         )
-        out_scale = _broadcast_named_axis(self.out_scale, acc, self.output_channel_axis if self.per_channel_output_affine else None)
-        out_bias = _broadcast_named_axis(self.out_bias, acc, self.output_channel_axis if self.per_channel_output_affine else None)
-        out = out_scale.to(device=acc.device, dtype=torch.float32) * acc + out_bias.to(device=acc.device, dtype=torch.float32)
-        return out.to(dtype=fp_inputs[0].dtype)
+        bshape = self._out_bcast_shape
+        if bshape is not None:
+            out_bias_v = self.out_bias.view(bshape)
+            if self._skip_out_scale:
+                out = acc + out_bias_v
+            else:
+                out = self.out_scale.view(bshape) * acc + out_bias_v
+        else:
+            if self._skip_out_scale:
+                out = acc + self.out_bias
+            else:
+                out = self.out_scale * acc + self.out_bias
+        return out.to(dtype=inputs[0].dtype)
 
     def metadata(self) -> Dict[str, Any]:
         return {
@@ -579,7 +623,8 @@ class CalibratedAffinePTQWrapper(nn.Module):
             "weight_scale": self.weight_scale.detach().cpu().tolist(),
             "weight_zero_point": self.weight_zero_point.detach().cpu().tolist(),
             "out_scale_mode": self.out_scale_mode,
-            "out_scale": self.out_scale.detach().cpu().tolist(),
+            "out_scale": self._out_scale_value,
+            "out_scale_baked_into_weight": self._skip_out_scale,
             "out_bias": self.out_bias.detach().cpu().tolist(),
             "stride": list(self.stride) if self.stride is not None else None,
             "padding": list(self.padding) if self.padding is not None else None,
@@ -587,6 +632,63 @@ class CalibratedAffinePTQWrapper(nn.Module):
             "groups": self.groups,
             "einsum_equation": self.einsum_equation,
         }
+
+    def reload_config(self) -> Dict[str, Any]:
+        """Plain-attr config + buffer shapes needed to rebuild a skeleton wrapper before load_state_dict."""
+        buffer_shapes = {name: list(buf.shape) for name, buf in self.named_buffers(recurse=False)}
+        return {
+            "name": self.node_name,
+            "kind": self.kind,
+            "activation_bits": self.activation_bits,
+            "weight_bits": self.weight_bits,
+            "einsum_equation": self.einsum_equation,
+            "stride": list(self.stride) if self.stride is not None else None,
+            "padding": list(self.padding) if self.padding is not None else None,
+            "dilation": list(self.dilation) if self.dilation is not None else None,
+            "groups": self.groups,
+            "output_channel_axis": self.output_channel_axis,
+            "per_channel_output_affine": self.per_channel_output_affine,
+            "per_output_channel_weights_config": self.per_output_channel_weights_config,
+            "per_output_channel_weights_effective": self.per_output_channel_weights_effective,
+            "input_arity": self.input_arity,
+            "out_bcast_shape": list(self._out_bcast_shape) if self._out_bcast_shape is not None else None,
+            "skip_out_scale": self._skip_out_scale,
+            "out_scale_value": self._out_scale_value,
+            "out_scale_mode": self.out_scale_mode,
+            "buffer_shapes": buffer_shapes,
+        }
+
+    @classmethod
+    def from_reload_config(cls, config: Dict[str, Any]) -> "CalibratedAffinePTQWrapper":
+        """Build an empty skeleton with correct attrs and buffer shapes; load_state_dict fills values."""
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        instance.node_name = config["name"]
+        instance.kind = config["kind"]
+        instance.activation_group = _activation_group_for_kind(instance.kind)
+        instance.activation_bits = int(config["activation_bits"])
+        instance.weight_bits = int(config["weight_bits"])
+        instance.einsum_equation = config.get("einsum_equation")
+        instance.stride = tuple(config["stride"]) if config.get("stride") is not None else None
+        instance.padding = tuple(config["padding"]) if config.get("padding") is not None else None
+        instance.dilation = tuple(config["dilation"]) if config.get("dilation") is not None else None
+        instance.groups = int(config.get("groups", 1))
+        instance.output_channel_axis = config["output_channel_axis"]
+        instance.per_channel_output_affine = bool(config["per_channel_output_affine"])
+        instance.per_output_channel_weights_config = bool(config["per_output_channel_weights_config"])
+        instance.per_output_channel_weights_effective = bool(config["per_output_channel_weights_effective"])
+        instance.input_arity = int(config["input_arity"])
+        instance._act_qmin, instance._act_qmax = _signed_qrange(instance.activation_bits)
+        bshape = config.get("out_bcast_shape")
+        instance._out_bcast_shape = tuple(bshape) if bshape is not None else None
+        instance._skip_out_scale = bool(config["skip_out_scale"])
+        instance._out_scale_value = config.get("out_scale_value")
+        instance.out_scale_mode = config["out_scale_mode"]
+        for buf_name, shape in config["buffer_shapes"].items():
+            instance.register_buffer(buf_name, torch.zeros(shape, dtype=torch.float32))
+        if "q_weight" not in config["buffer_shapes"]:
+            instance.q_weight = None
+        return instance
 
 
 def _build_node_selection(model: nn.Module, cfg: Any) -> Dict[str, str]:
@@ -629,9 +731,9 @@ def validate_model(
     model.eval()
     device = get_device()
     use_cuda = device.type == "cuda"
+    loss_sum_t = torch.zeros((), device=device, dtype=torch.float64)
+    correct_t = torch.zeros((), device=device, dtype=torch.long)
     n = 0
-    correct = 0
-    loss_sum = 0.0
     try:
         input_dtype = next(model.parameters()).dtype
     except StopIteration:
@@ -643,10 +745,11 @@ def validate_model(
         if calibration is not None:
             calibration.current_batch = bi
         logits = model(x)
-        loss_sum += criterion(logits.float(), y).item() * y.size(0)
-        correct += (logits.argmax(dim=-1) == y).sum().item()
+        loss_sum_t += criterion(logits.float(), y).double() * y.size(0)
+        correct_t += (logits.argmax(dim=-1) == y).sum()
         n += y.size(0)
-    return correct / max(n, 1), loss_sum / max(n, 1)
+    denom = max(n, 1)
+    return correct_t.item() / denom, loss_sum_t.item() / denom
 
 
 def _build_wrapped_model(
@@ -654,17 +757,44 @@ def _build_wrapped_model(
     selected: Dict[str, str],
     calibration_cache: Dict[str, NodeCalibrationData],
     cfg: Any,
-) -> Tuple[nn.Module, List[Dict[str, Any]]]:
+) -> Tuple[nn.Module, List[Dict[str, Any]], List[Dict[str, Any]]]:
     wrapped = copy.deepcopy(fp_model)
     node_meta: List[Dict[str, Any]] = []
+    reload_configs: List[Dict[str, Any]] = []
     for name in selected:
         cal = calibration_cache[name]
-        wrapper = CalibratedAffinePTQWrapper(name, _get_module(wrapped, name), cal, cfg)
+        wrapper = CalibratedAffinePTQWrapper(name, wrapped.get_submodule(name), cal, cfg)
         _set_module(wrapped, name, wrapper)
         meta = wrapper.metadata()
         meta["calibration_debug"] = _node_debug_metadata(cal)
         node_meta.append(meta)
-    return wrapped, node_meta
+        reload_configs.append(wrapper.reload_config())
+    return wrapped, node_meta, reload_configs
+
+
+def load_ptq_wrapped_checkpoint(path: str, cfg: Any) -> Tuple[nn.Module, Dict[str, Any]]:
+    """Load a PTQ-wrapped checkpoint: rebuild the FP surgery template, install skeleton wrappers, then load_state_dict."""
+    device = get_device()
+    try:
+        payload = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
+    extra = dict(payload["extra"])
+    adapter = get_model_adapter(extra.get("model_key", getattr(cfg, "model_key", None)))
+    if getattr(cfg, "top_k", None) is not None:
+        extra["top_k"] = int(cfg.top_k)
+    if getattr(cfg, "eps", None) is not None:
+        extra["eps_ln"] = float(cfg.eps)
+    extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
+    extra.setdefault("model_key", adapter.key)
+    extra.setdefault("patient", adapter.patient_name)
+    extra.setdefault("dataset", adapter.dataset_name)
+    model = adapter.build_surgery_model_from_extra(extra, cfg).to(device=device, dtype=get_surgery_dtype())
+    for wc in extra.get("ptq_wrappers", []):
+        skeleton = CalibratedAffinePTQWrapper.from_reload_config(wc).to(device=device)
+        _set_module(model, wc["name"], skeleton)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    return model, extra
 
 
 def _ptq_summary(
@@ -705,12 +835,6 @@ def _ptq_summary(
             "affine_activation_bits": int(_activation_bits_for_kind("linear", cfg)),
             "matmul_activation_bits": int(_activation_bits_for_kind("matmul", cfg)),
             "per_output_channel": bool(cfg.per_output_channel),
-            "per_output_channel_weights": bool(cfg.per_output_channel),
-            "per_output_channel_linear_conv_weights": bool(cfg.per_output_channel),
-            "per_output_channel_note": (
-                "When true: per-output-channel weight scales for Linear/Conv2d. When false: global weight "
-                "scale for Linear/Conv2d. Affine/coeff: always global weight scale. Ignored for AffineMatMul/AffineHadamard."
-            ),
         },
         "calibration": {
             "batches": int(cfg.calibration_batches),
@@ -746,7 +870,6 @@ def run_ptq(
     adapter = get_model_adapter(fp_extra.get("model_key", getattr(cfg, "model_key", None)))
     _train_loader, val_loader = adapter.build_loaders(cfg)
     print(f"Using model adapter: {adapter.key}", flush=True)
-    print(f"Loaded checkpoint dtype: {describe_dtype(get_surgery_dtype())}", flush=True)
     selected = _build_node_selection(fp_model, cfg)
     if not selected:
         raise SystemExit("No PTQ-wrappable nodes selected by the current config.")
@@ -770,12 +893,27 @@ def run_ptq(
     if missing:
         raise SystemExit(f"Calibration samples missing for selected node(s): {missing}")
 
-    wrapped_model, node_meta = _build_wrapped_model(fp_model, selected, controller.cache, cfg)
-    ptq_acc, ptq_loss = validate_model(wrapped_model, val_loader, criterion)
+    wrapped_model, node_meta, reload_configs = _build_wrapped_model(
+        fp_model, selected, controller.cache, cfg
+    )
 
     linear_conv_max_sg_over_spc = _diagnostic_linear_conv_max_s_global_over_s_pc(
         fp_model, selected, int(cfg.weight_bits)
     )
+
+    os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+    out_extra = dict(fp_extra)
+    out_extra["ptq_meta_path"] = os.path.basename(meta_abs)
+    out_extra["ptq_wrappers"] = reload_configs
+    write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped Surgery Model")
+    save_model_checkpoint(out_abs, wrapped_model, extra=out_extra)
+    print(f"wrote {model_log_abs}", flush=True)
+    print(f"wrote {out_abs}", flush=True)
+
+    del wrapped_model
+    reloaded_model, _ = load_ptq_wrapped_checkpoint(out_abs, cfg)
+    print("reloaded wrapped checkpoint from disk for validation", flush=True)
+    ptq_acc, ptq_loss = validate_model(reloaded_model, val_loader, criterion)
 
     print(f"Wrapped model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}", flush=True)
     print(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}", flush=True)
@@ -797,26 +935,6 @@ def run_ptq(
         linear_conv_max_s_global_over_s_pc=linear_conv_max_sg_over_spc,
     )
 
-    os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(meta_abs) or ".", exist_ok=True)
-
-    out_extra = dict(fp_extra)
-    out_extra["ptq"] = {
-        "selected_nodes": list(selected.keys()),
-        "weight_bits": int(cfg.weight_bits),
-        "activation_bits": int(cfg.activation_bits),
-        "affine_activation_bits": int(_activation_bits_for_kind("linear", cfg)),
-        "matmul_activation_bits": int(_activation_bits_for_kind("matmul", cfg)),
-        "per_output_channel_weights": bool(cfg.per_output_channel),
-        "per_output_channel": bool(cfg.per_output_channel),
-        "calibration_batches": int(cfg.calibration_batches),
-        "calibration_examples_per_node": int(cfg.calibration_examples_per_node),
-    }
-    write_model_structure_txt(model_log_abs, wrapped_model, "PTQ-Wrapped Surgery Model")
-    save_model_checkpoint(out_abs, wrapped_model, extra=out_extra)
     with open(meta_abs, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-
-    print(f"wrote {model_log_abs}", flush=True)
-    print(f"wrote {out_abs}", flush=True)
     print(f"wrote {meta_abs}", flush=True)

@@ -38,6 +38,12 @@ class PTQSurgeryConfig:
     # affine/coeff (always one global weight scale) and for ``AffineMatMul``/``AffineHadamard`` (no weights). Output
     # ``out_scale``/``out_bias`` for Linear/Conv do not depend on this flag (analytical + residual bias).
     per_output_channel: bool = True
+    # Variance/eps threshold used by the OLS affine-dequant fit (Affine and MatMul kinds).
+    # When per-channel ``var(acc)`` falls below this, that channel's slope collapses to 0
+    # (output ≈ channel mean). Also used as the stability ``clamp_min`` for the OLS denominator.
+    # Lower → tighter fit but more numerical noise on near-constant channels; higher → more
+    # aggressive collapse to mean. Default 1e-8 is safe for fp32 calibration tensors.
+    dequant_var_eps: float = 1e-8
     top_k: Optional[int] = None
     eps: Optional[float] = None
     log_dir: str = "artifacts/logs"
@@ -56,6 +62,11 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",
     "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",
+    "dequant_var_eps": (
+        "OLS affine-dequant variance threshold for Affine/MatMul kinds. Channels with "
+        "var(acc) below this collapse to slope=0 (output equals the channel mean). "
+        "Also clamps the OLS denominator. Default 1e-8."
+    ),
 }
 
 CLI_PTQ_DESCRIPTION = "Standalone PTQ for surgery checkpoints"

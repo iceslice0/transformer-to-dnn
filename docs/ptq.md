@@ -155,28 +155,35 @@ For each wrapped affine node initialize:
 
 A. Weight and Input quantization scale, zeropoint
 
-Choose from float weights using either:
-- min, max
-- mean, std, sigma_scale (param, e.g. 3*sigma, 6*sigma)
+Symmetric, max-abs based. Single estimator:
+- ``scale = max(|x|) / qmax`` over the calibration tensor (channelwise for per-output-channel weights, tensor-wide for inputs).
+- Zero point is fixed at 0 (signed range).
+
+Max works well in practice for this stage; no percentile / k-sigma variant is needed.
 
 
 B. Output dequant parameters
 Fit affine dequantization from integer accumulator output to teacher fp output.
 
-Use either:
-- sampled moment matching (account for clamps/rounding in quantized input and weights)
-- least-squares affine fit
-
-
-Recommended output model:
+Output model:
 
 y_hat = s_out * y_int + c_out
 
-Fit per output channel:
-- s_out
-- c_out
+Two paths:
+- ``Linear``/``Conv2d``: ``s_out = s_in * s_w`` analytically (per output channel when per-output-channel
+  weight scales are enabled, scalar otherwise). Only ``c_out`` is calibrated, as the residual mean of
+  ``y_teacher - s_out * y_int``.
+- Affine and ``MatMul`` kinds: per-output-channel least-squares fit of both ``s_out`` and ``c_out`` against
+  cached teacher outputs.
 
-using cached teacher outputs.
+Variance fallback (OLS path only):
+
+Per-channel variance of the integer accumulator ``var(y_int)`` is checked against config
+``dequant_var_eps`` (default ``1e-8``). When ``|var| < dequant_var_eps`` the channel is treated as
+near-constant and its slope is collapsed to 0; ``c_out`` then equals the channel mean of the teacher
+output. The same threshold is used as the ``clamp_min`` of the OLS denominator. Tune lower for
+tighter fits on weakly-varying channels (at the cost of numerical noise) or higher to collapse more
+channels to their mean.
 
 This is the key calibration step.
 
