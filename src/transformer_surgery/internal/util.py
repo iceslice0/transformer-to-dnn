@@ -1,10 +1,10 @@
-"""Shared runtime, evaluation, checkpoint, and artifact helpers."""
+"""Device/seed, namespaces, schedules, checkpoints, and validation metrics (no CLI logging)."""
+
 
 from __future__ import annotations
 
 import os
 import random
-import re
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
@@ -47,61 +47,6 @@ def ensure_mapping(obj: Any) -> Dict[str, Any]:
     raise TypeError(f"expected Mapping or SimpleNamespace, got {type(obj).__name__}")
 
 
-def _slug_part(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_").lower()
-    return slug or "artifact"
-
-
-def config_artifact_stem(cfg_or_path: Any, tool_name: str) -> str:
-    """
-    Stable artifact stem from the CLI/tool and active JSON config name.
-
-    ``tool_name`` may be an entry point like ``ts-surgery``; filenames use a filesystem-safe
-    underscore slug such as ``ts_surgery_topk64_fast``.
-    """
-    if isinstance(cfg_or_path, (str, os.PathLike)):
-        config_path = os.fspath(cfg_or_path)
-    else:
-        cjp = cfg_or_path.config_json_path
-        config_path = os.fspath(cjp) if cjp else ""
-    config_name = os.path.splitext(os.path.basename(config_path))[0] if config_path else "config"
-    tool_parts = _slug_part(tool_name).split("_")
-    config_parts = _slug_part(config_name).split("_")
-    if tool_parts and config_parts and tool_parts[-1] == config_parts[0]:
-        config_parts = config_parts[1:]
-    return "_".join(tool_parts + config_parts)
-
-
-def traceable_artifact_path(
-    path: str,
-    cfg_or_path: Any,
-    tool_name: str,
-    artifact_name: str = "",
-    extension: Optional[str] = None,
-) -> str:
-    """Return ``path``'s directory plus ``<tool>_<config>[_artifact]<extension>``."""
-    original = os.path.abspath(path)
-    directory = os.path.dirname(original) or "."
-    ext = extension if extension is not None else os.path.splitext(original)[1]
-    stem = config_artifact_stem(cfg_or_path, tool_name)
-    artifact = _slug_part(artifact_name) if artifact_name else ""
-    filename = f"{stem}_{artifact}{ext}" if artifact else f"{stem}{ext}"
-    return os.path.join(directory, filename)
-
-
-def traceable_log_path(log_dir: str, cfg_or_path: Any, tool_name: str, log_name: str) -> str:
-    return os.path.join(
-        os.path.abspath(log_dir),
-        f"{config_artifact_stem(cfg_or_path, tool_name)}_{_slug_part(log_name)}.txt",
-    )
-
-
-def metadata_path_for_checkpoint(checkpoint_path: str, metadata_dir: str = "artifacts/metadata") -> str:
-    """Return the canonical metadata JSON path for a checkpoint basename."""
-    stem = os.path.splitext(os.path.basename(os.path.abspath(checkpoint_path)))[0]
-    return os.path.join(os.path.abspath(metadata_dir), f"{stem}.json")
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -128,19 +73,6 @@ def set_default_device(device: torch.device) -> torch.device:
 
 def get_device() -> torch.device:
     return TORCH_DEVICE
-
-
-def describe_device(device: torch.device) -> str:
-    if device.type == "cuda":
-        try:
-            return f"cuda ({torch.cuda.get_device_name(device)})"
-        except Exception:
-            return "cuda"
-    return str(device)
-
-
-def describe_dtype(dt: torch.dtype) -> str:
-    return str(dt).replace("torch.", "")
 
 
 def torch_dtype_from_name(name: str) -> torch.dtype:

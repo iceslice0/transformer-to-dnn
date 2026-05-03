@@ -16,17 +16,22 @@ from torch.utils.data import DataLoader
 
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
 from transformer_surgery.internal.metrics import jeffreys_divergence_dense
-from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT
+from transformer_surgery.internal.reporting import (
+    CALIBRATION_LEGEND_TEXT,
+    describe_device,
+    describe_dtype,
+    log_line,
+    log_wrote,
+    metadata_path_for_checkpoint,
+    traceable_artifact_path,
+    write_json,
+)
 from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
-    describe_device,
-    describe_dtype,
     get_device,
-    metadata_path_for_checkpoint,
     save_model_checkpoint,
     set_seed,
-    traceable_artifact_path,
     warmup_cosine_scheduler,
 )
 
@@ -123,10 +128,9 @@ def distill_student_from_teacher(
     warmup_steps = min(warmup_epochs * steps_per_epoch, max(total_steps - 1, 0))
     use_cuda = device.type == "cuda"
     pf = f"{log_prefix} " if log_prefix else ""
-    print(
+    log_line(
         f"  {pf}schedule: {epochs} epoch(s) x {steps_per_epoch} train batches "
-        f"-> {total_steps} optimizer steps | train log every {cfg.train_progress_interval} batch(es)",
-        flush=True,
+        f"-> {total_steps} optimizer steps | train log every {cfg.train_progress_interval} batch(es)"
     )
 
     global_step = 0
@@ -214,12 +218,11 @@ def distill_student_from_teacher(
                     left = steps_per_epoch - n_batches
                     eta_s = left / rate if rate > 0 else 0.0
                     lr_c = train_opt.param_groups[0]["lr"]
-                    print(
+                    log_line(
                         f"  {pf}epoch {ep + 1}/{epochs} train {n_batches}/{steps_per_epoch} "
                         f"step {global_step}/{total_steps} loss={li:.6f} loss_avg={avg:.6f} "
                         f"ce={float(ce_loss.item()):.6f} j={float(j_loss.item()):.6f} "
-                        f"lr={lr_c:.2e} {rate:.2f} batch/s epoch_eta~{eta_s / 60.0:.1f}m",
-                        flush=True,
+                        f"lr={lr_c:.2e} {rate:.2f} batch/s epoch_eta~{eta_s / 60.0:.1f}m"
                     )
             if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
@@ -247,7 +250,7 @@ def distill_student_from_teacher(
             _copy_state_into(train_student, student)
         else:
             student.load_state_dict(best_state)
-        print(f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})", flush=True)
+        log_line(f"  {pf}kept best val acc={best_acc:.4f} (epoch {best_ep}/{epochs})")
     return {
         "baseline_val_acc": float(baseline_acc),
         "baseline_val_ce_mean": float(baseline_ce),
@@ -298,32 +301,26 @@ def merge_post_distill_into_surgery_meta(
         cal["student_post_distill_best_seed"] = int(best_run["seed"])
     raw["calibration"] = cal
     raw["calibration_legend"] = CALIBRATION_LEGEND_TEXT
-    os.makedirs(os.path.dirname(os.path.abspath(meta_path)) or ".", exist_ok=True)
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
+    write_json(meta_path, raw)
 
 
 def _log_distill_device_and_config_json(cfg: "JeffreysDistillConfig") -> None:
-    print(
-        f"device={describe_device(get_device())} surgery_dtype={describe_dtype(get_surgery_dtype())}",
-        flush=True,
-    )
+    log_line(f"device={describe_device(get_device())} surgery_dtype={describe_dtype(get_surgery_dtype())}")
     if cfg.config_json_path:
-        print(f"config_json={cfg.config_json_path}", flush=True)
+        log_line(f"config_json={cfg.config_json_path}")
 
 
 def _log_distill_session_line(cfg: "JeffreysDistillConfig", teacher_path: str) -> None:
-    print(
+    log_line(
         f"fine-tune CE+distill | teacher={teacher_path} mix={cfg.distill_weight} "
         f"epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay} "
         f"num_trainings={cfg.num_trainings} base_seed={cfg.base_seed} "
-        f"train_progress_interval={cfg.train_progress_interval}",
-        flush=True,
+        f"train_progress_interval={cfg.train_progress_interval}"
     )
 
 
 def _log_distill_final_metrics(result: Dict[str, Any]) -> None:
-    print(
+    log_line(
         f"run {int(result['run_number'])}/{int(result['num_trainings'])} "
         f"seed={int(result['seed'])} final val acc={float(result['val_acc']):.4f} "
         f"ce={float(result['val_ce_mean']):.4f} jeffreys={float(result['val_jeffreys_mean']):.4f}"
@@ -331,18 +328,16 @@ def _log_distill_final_metrics(result: Dict[str, Any]) -> None:
             f" best_epoch={result['best_val_epoch']}"
             if result.get("best_val_epoch") is not None
             else ""
-        ),
-        flush=True,
+        )
     )
 
 
 def _log_distill_summary(summary: Dict[str, Any], best_run: Dict[str, Any]) -> None:
-    print(
+    log_line(
         f"validation accuracy over {int(summary['num_trainings'])} training run(s): "
         f"mean={float(summary['val_acc_mean']):.4f} std={float(summary['val_acc_std']):.4f}; "
         f"best run={int(best_run['run_number'])} seed={int(best_run['seed'])} "
-        f"acc={float(best_run['val_acc']):.4f}",
-        flush=True,
+        f"acc={float(best_run['val_acc']):.4f}"
     )
 
 
@@ -372,10 +367,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     baseline = eval_distillation_metrics(
         teacher, probe_student, baseline_val_loader, temperature=cfg.temperature
     )
-    print(
-        f"baseline val acc={baseline[0]:.4f} ce={baseline[1]:.4f} jeffreys={baseline[2]:.4f}",
-        flush=True,
-    )
+    log_line(f"baseline val acc={baseline[0]:.4f} ce={baseline[1]:.4f} jeffreys={baseline[2]:.4f}")
     del probe_student, baseline_val_loader
 
     run_results: List[Dict[str, Any]] = []
@@ -384,7 +376,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     for run_index in range(num_trainings):
         seed = base_seed + run_index
         run_number = run_index + 1
-        print(f"starting distill run {run_number}/{num_trainings} seed={seed}", flush=True)
+        log_line(f"starting distill run {run_number}/{num_trainings} seed={seed}")
         set_seed(seed)
         student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
         train_loader, val_loader = adapter.build_loaders(cfg)
@@ -435,7 +427,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         best_student,
         extra=out_extra,
     )
-    print(f"wrote {out_abs}", flush=True)
+    log_wrote(out_abs)
     merge_post_distill_into_surgery_meta(
         meta_abs,
         float(best_run["val_acc"]),
@@ -448,4 +440,4 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         patient=adapter.patient_name,
         dataset=adapter.dataset_name,
     )
-    print(f"wrote {meta_abs}", flush=True)
+    log_wrote(meta_abs)

@@ -9,7 +9,6 @@ moments -> remove hooks -> install wrappers -> save and validate.
 from __future__ import annotations
 
 import copy
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -42,19 +41,24 @@ from transformer_surgery.internal.ptq_calibration import (
     ptq_module_kind,
     ptq_wrapper_from_reload_config,
 )
-from transformer_surgery.internal.reporting import write_model_structure_txt
-from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast, set_surgery_dtype
-from transformer_surgery.internal.util import (
+from transformer_surgery.internal.reporting import (
     describe_device,
     describe_dtype,
+    log_line,
+    log_wrote,
+    metadata_path_for_checkpoint,
+    traceable_artifact_path,
+    traceable_log_path,
+    write_json,
+    write_model_structure_txt,
+)
+from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast, set_surgery_dtype
+from transformer_surgery.internal.util import (
     ensure_mapping,
     get_device,
-    metadata_path_for_checkpoint,
     namespace_from_mapping,
     namespace_to_mapping,
     save_model_checkpoint,
-    traceable_artifact_path,
-    traceable_log_path,
 )
 
 
@@ -425,36 +429,35 @@ def run_ptq(
     model_log_abs = traceable_log_path(cfg.log_dir, cfg, "ts-ptq", "model_after_ptq")
     cfg.output = out_abs
 
-    print(f"Using device: {describe_device(device)}", flush=True)
+    log_line(f"Using device: {describe_device(device)}")
     if cfg.config_json_path:
-        print(f"config_json={cfg.config_json_path}", flush=True)
+        log_line(f"config_json={cfg.config_json_path}")
 
     criterion = nn.CrossEntropyLoss()
     fp_model, fp_extra = load_surgery_student_checkpoint(os.path.abspath(cfg.fp_checkpoint), cfg, surgery_dtype=dtype)
-    print(f"Surgery dtype (from checkpoint): {describe_dtype(get_surgery_dtype())}", flush=True)
+    log_line(f"Surgery dtype (from checkpoint): {describe_dtype(get_surgery_dtype())}")
     adapter = get_model_adapter(fp_extra["model_key"])
     _train_loader, val_loader = adapter.build_loaders(cfg)
-    print(f"Using model adapter: {adapter.key}", flush=True)
+    log_line(f"Using model adapter: {adapter.key}")
 
     calibration_batches = _sample_calibration_batch_indices(len(val_loader), cfg.calibration_batches)
     if not calibration_batches:
         raise SystemExit("No validation batches available for PTQ calibration.")
     requested = "all" if cfg.calibration_batches is None else str(int(cfg.calibration_batches))
-    print(
+    log_line(
         f"PTQ calibration batches: requested={requested} "
-        f"sampled={len(calibration_batches)} indices={calibration_batches}",
-        flush=True,
+        f"sampled={len(calibration_batches)} indices={calibration_batches}"
     )
 
     selected = _build_node_selection(fp_model, cfg)
     if not selected:
         raise SystemExit("No PTQ-wrappable nodes selected by the current config.")
-    print(f"Selected {len(selected)} PTQ node(s).", flush=True)
+    log_line(f"Selected {len(selected)} PTQ node(s).")
     for name, kind in selected.items():
-        print(f"  {name}: {kind}", flush=True)
+        log_line(f"  {name}: {kind}")
 
     fp_acc, fp_loss = validate_model(fp_model, val_loader, criterion)
-    print(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}", flush=True)
+    log_line(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}")
 
     stats = gather_ptq_range_moments(fp_model, val_loader, selected, calibration_batches)
     missing = [name for name in selected if not stats[name].examples_by_batch]
@@ -478,29 +481,27 @@ def run_ptq(
         extra={**fp_extra, "ptq_meta_path": os.path.basename(meta_abs), "ptq_wrappers": reload_configs},
     )
     write_model_structure_txt(model_log_abs, ptq_model, "PTQ Surgery Model")
-    print(f"wrote {model_log_abs}", flush=True)
-    print(f"wrote {out_abs}", flush=True)
+    log_wrote(model_log_abs)
+    log_wrote(out_abs)
 
     del ptq_model
     reloaded_model, _ = load_ptq_checkpoint(out_abs, cfg)
-    print("reloaded PTQ checkpoint from disk for validation", flush=True)
+    log_line("reloaded PTQ checkpoint from disk for validation")
     ptq_acc, ptq_loss = validate_model(reloaded_model, val_loader, criterion)
-    print(f"PTQ model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}", flush=True)
-    print(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}", flush=True)
+    log_line(f"PTQ model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}")
+    log_line(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}")
 
-    with open(meta_abs, "w", encoding="utf-8") as f:
-        json.dump(
-            _ptq_summary(
-                cfg,
-                selected,
-                fp_acc,
-                fp_loss,
-                ptq_acc,
-                ptq_loss,
-                node_meta,
-                calibration_batch_indices=calibration_batches,
-            ),
-            f,
-            indent=2,
-        )
-    print(f"wrote {meta_abs}", flush=True)
+    write_json(
+        meta_abs,
+        _ptq_summary(
+            cfg,
+            selected,
+            fp_acc,
+            fp_loss,
+            ptq_acc,
+            ptq_loss,
+            node_meta,
+            calibration_batch_indices=calibration_batches,
+        ),
+    )
+    log_wrote(meta_abs)

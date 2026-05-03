@@ -17,11 +17,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.internal.metrics import jeffreys_distance_sparse_teacher, jeffreys_naive_topk
-from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT
+from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
 from transformer_surgery.internal.runtime import get_surgery_dtype, set_surgery_dtype
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
-    describe_dtype,
     ensure_mapping,
     get_device,
     namespace_from_mapping,
