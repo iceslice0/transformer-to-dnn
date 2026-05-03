@@ -6,12 +6,12 @@ import argparse
 import json
 import os
 from dataclasses import fields, replace
-from typing import Any, Dict, Mapping, Optional, Sequence, Type, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Optional, Sequence, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import torch
 
 from transformer_surgery.ops import set_surgery_dtype
-from transformer_surgery.util import set_default_device
+from transformer_surgery.util import set_default_device, torch_dtype_from_name
 
 
 TConfig = TypeVar("TConfig")
@@ -143,35 +143,11 @@ def parse_cli_config(
     return config_cls.load(args.config, cli_overrides_from_namespace(args, config_cls))
 
 
-def torch_dtype_from_name(name: str) -> torch.dtype:
-    normalized = str(name).strip().replace("torch.", "")
-    try:
-        value = getattr(torch, normalized)
-    except AttributeError as exc:
-        raise ValueError(f"Unknown torch dtype {name!r}") from exc
-    if not isinstance(value, torch.dtype):
-        raise ValueError(f"torch.{normalized} is not a dtype")
-    return value
+def apply_device_from_config(cfg: Any) -> torch.device:
+    return set_default_device(torch.device(str(cfg.device).strip()))
 
 
-def device_from_config(cfg: Union[Mapping[str, Any], Any]) -> torch.device:
-    name = str(cfg.get("device", "cuda")) if isinstance(cfg, Mapping) else str(cfg.device)
-    return torch.device(name.strip())
-
-
-def apply_device_from_config(cfg: Union[Mapping[str, Any], Any]) -> torch.device:
-    return set_default_device(device_from_config(cfg))
-
-
-def surgery_dtype_from_config(cfg: Union[Mapping[str, Any], Any]) -> torch.dtype:
-    if isinstance(cfg, Mapping):
-        name = str(cfg.get("surgery_dtype", "bfloat16"))
-    else:
-        name = str(getattr(cfg, "surgery_dtype", "bfloat16"))
-    return torch_dtype_from_name(name)
-
-
-def apply_dtype_from_config(cfg: Union[Mapping[str, Any], Any]) -> torch.dtype:
-    dt = surgery_dtype_from_config(cfg)
+def apply_dtype_from_config(cfg: Any) -> torch.dtype:
+    dt = torch_dtype_from_name(str(cfg.surgery_dtype))
     set_surgery_dtype(dt)
     return dt

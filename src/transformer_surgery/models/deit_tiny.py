@@ -4,7 +4,7 @@ DeiT-Tiny rewritten in the pseudo-hardware basis: explicit affine + nonlinear un
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,10 @@ from transformer_surgery.ops import (
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
 )
-from transformer_surgery.util import get_device
+from transformer_surgery.util import ensure_mapping, get_device
+
+if TYPE_CHECKING:
+    from transformer_surgery.cli.surgery_config import SurgeryConfig
 
 
 class PatchEmbed(nn.Module):
@@ -204,17 +207,18 @@ class DeiTTinySurgeryModel(nn.Module):
         )
 
     @classmethod
-    def from_pretrained_extra(cls, ex: Dict[str, Any], *, num_classes: int) -> "DeiTTinySurgeryModel":
-        """Restore architecture from a checkpoint ``extra`` dict (e.g. ``surgery.pt``)."""
+    def from_pretrained_extra(cls, ex: Any, *, num_classes: int) -> "DeiTTinySurgeryModel":
+        """Restore architecture from checkpoint ``extra`` (plain ``dict`` or nested ``SimpleNamespace``)."""
+        d = ensure_mapping(ex)
         return cls(
             num_classes=num_classes,
-            top_k=int(ex["top_k"]),
-            eps_ln=float(ex["eps_ln"]),
-            gibbs_tail_prob_eps=float(ex["gibbs_tail_prob_eps"]),
-            use_surgery_layernorm=not bool(ex["disable_layernorm_replacement"]),
-            use_attention_surgery=not bool(ex["disable_attention_surgery"]),
-            use_surgery_softmax=not bool(ex["disable_softmax_replacement"]),
-            allow_matmul=bool(ex["allow_matmul"]),
+            top_k=int(d["top_k"]),
+            eps_ln=float(d["eps_ln"]),
+            gibbs_tail_prob_eps=float(d["gibbs_tail_prob_eps"]),
+            use_surgery_layernorm=not bool(d["disable_layernorm_replacement"]),
+            use_attention_surgery=not bool(d["disable_attention_surgery"]),
+            use_surgery_softmax=not bool(d["disable_softmax_replacement"]),
+            allow_matmul=bool(d["allow_matmul"]),
         )
 
     def _init_weights(self) -> None:
@@ -262,27 +266,26 @@ class DeiTTinySurgeryModel(nn.Module):
                     self.blocks[i].norm1.bias.copy_(rb.norm1.bias)
                     self.blocks[i].norm2.weight.copy_(rb.norm2.weight)
                     self.blocks[i].norm2.bias.copy_(rb.norm2.bias)
-            if hasattr(ref, "norm"):
-                if isinstance(self.fc_norm, RewrittenLayerNorm):
-                    copy_ln_params_to_rewritten(self.fc_norm, ref.norm)
-                else:
-                    self.fc_norm.weight.copy_(ref.norm.weight)
-                    self.fc_norm.bias.copy_(ref.norm.bias)
+            if isinstance(self.fc_norm, RewrittenLayerNorm):
+                copy_ln_params_to_rewritten(self.fc_norm, ref.norm)
+            else:
+                self.fc_norm.weight.copy_(ref.norm.weight)
+                self.fc_norm.bias.copy_(ref.norm.bias)
         return mapping
 
 
 def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
     for m in model.modules():
         if isinstance(m, RewrittenLayerNorm):
-            if hasattr(m, "log_eps"):
-                m.log_eps.eps.requires_grad = False
-            if hasattr(m, "inv_sqrt_var"):
+            if m.allow_matmul:
                 m.inv_sqrt_var.eps.requires_grad = False
+            else:
+                m.log_eps.eps.requires_grad = False
         if isinstance(m, GibbsTopKSoftmax):
-            if hasattr(m, "log_z"):
-                m.log_z.eps.requires_grad = False
-            if hasattr(m, "inv_z"):
+            if m.allow_matmul:
                 m.inv_z.eps.requires_grad = False
+            else:
+                m.log_z.eps.requires_grad = False
 
 
 def timm_attention_scores(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -294,7 +297,9 @@ def timm_attention_scores(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def calibrate_timm_deit_reference(reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+def calibrate_timm_deit_reference(
+    reference: nn.Module, loader: DataLoader, cfg: "SurgeryConfig"
+) -> Dict[str, Any]:
     device = get_device()
     dt = get_surgery_dtype()
     reference.eval()
@@ -302,7 +307,7 @@ def calibrate_timm_deit_reference(reference: nn.Module, loader: DataLoader, cfg:
     eps = float(cfg.eps)
     gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
     disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
-    calibration_batches = max(1, int(getattr(cfg, "gibbs_tail_calibration_batches", 1)))
+    calibration_batches = max(1, int(cfg.gibbs_tail_calibration_batches))
     top_k = int(cfg.top_k)
     use_cuda = device.type == "cuda"
     mse_acc = 0.0

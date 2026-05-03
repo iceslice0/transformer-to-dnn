@@ -16,6 +16,8 @@ from transformer_surgery.util import (
     describe_dtype,
     get_device,
     metadata_path_for_checkpoint,
+    namespace_from_mapping,
+    namespace_to_mapping,
     save_model_checkpoint,
     traceable_artifact_path,
     traceable_log_path,
@@ -44,7 +46,7 @@ def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
 
 def surgery(cfg: "SurgeryConfig") -> None:
     """Load reference, build the surgery student, calibrate, and save traceable artifacts."""
-    adapter = get_model_adapter(cfg)
+    adapter = get_model_adapter(cfg.model_key)
     device = get_device()
     dtype = get_surgery_dtype()
 
@@ -103,27 +105,30 @@ def surgery(cfg: "SurgeryConfig") -> None:
     cfg.pre_ft_checkpoint = pre_path
     meta_path = metadata_path_for_checkpoint(pre_path)
 
-    meta = adapter.build_surgery_meta(
-        cfg,
-        calibration=cal,
-        reference_checkpoint_abs=reference_path,
-        module_mapping=adapter.build_module_mapping(cfg, model),
+    meta = namespace_from_mapping(
+        adapter.build_surgery_meta_dict(
+            cfg,
+            calibration=cal,
+            reference_checkpoint_abs=reference_path,
+            module_mapping=adapter.build_module_mapping(cfg, model),
+        )
     )
     if applied_mean is not None:
         meta.gibbs_tail_prob_eps = float(applied_mean)
-    meta.calibration["ref_val_acc"] = float(ref_acc)
-    meta.calibration["ref_val_loss"] = float(ref_loss)
-    meta.calibration["student_pre_ft_val_acc"] = float(pre_acc)
-    meta.calibration["student_pre_ft_mean_ce"] = float(pre_loss)
+    meta.calibration.ref_val_acc = float(ref_acc)
+    meta.calibration.ref_val_loss = float(ref_loss)
+    meta.calibration.student_pre_ft_val_acc = float(pre_acc)
+    meta.calibration.student_pre_ft_mean_ce = float(pre_loss)
 
     os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
-    meta.to_json(meta_path)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(namespace_to_mapping(meta), f, indent=2)
 
-    checkpoint_extra = adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path)
+    ck = namespace_from_mapping(adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path))
     if applied_mean is not None:
-        checkpoint_extra["gibbs_tail_prob_eps"] = float(applied_mean)
-    save_model_checkpoint(pre_path, model, extra=checkpoint_extra)
+        ck.gibbs_tail_prob_eps = float(applied_mean)
+    save_model_checkpoint(pre_path, model, extra=namespace_to_mapping(ck))
 
     print(f"wrote {meta_path}", flush=True)
     print(f"wrote {pre_path}", flush=True)

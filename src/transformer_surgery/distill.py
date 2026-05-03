@@ -8,6 +8,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -103,7 +104,7 @@ def eval_distillation_metrics(
     return correct_t.item() / denom, ce_sum_t.item() / denom, j_sum_t.item() / denom
 
 
-def distill_student_from_teacher_jeffreys(
+def distill_student_from_teacher(
     student: nn.Module,
     teacher: nn.Module,
     train_loader: DataLoader,
@@ -357,8 +358,6 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     meta_abs = metadata_path_for_checkpoint(out_abs)
     cfg.output = out_abs
     num_trainings = int(cfg.num_trainings)
-    if num_trainings < 1:
-        raise ValueError("num_trainings must be >= 1")
     base_seed = int(cfg.base_seed)
 
     probe_student, student_extra = load_surgery_student_checkpoint(
@@ -398,7 +397,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
             pre_path, cfg, adapter=adapter, surgery_dtype=get_surgery_dtype()
         )
         train_loader, val_loader = adapter.build_loaders(cfg)
-        result = distill_student_from_teacher_jeffreys(
+        result = distill_student_from_teacher(
             student,
             teacher,
             train_loader,
@@ -421,8 +420,6 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         if best_run is None or float(result["val_acc"]) > float(best_run["val_acc"]):
             best_run = result
             best_state = _clone_state_dict_to_cpu(student)
-    if best_run is None or best_state is None:
-        raise RuntimeError("distillation produced no runs")
     accuracy_summary = _validation_accuracy_summary(run_results)
     _log_distill_summary(accuracy_summary, best_run)
 
@@ -432,25 +429,18 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     best_student.load_state_dict(best_state, strict=True)
 
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    out_extra = dict(student_extra)
-    out_extra.update(
-        {
-            "distill": "mix_ce_jeffreys",
-            "model_key": adapter.key,
-            "temperature": float(cfg.temperature),
-            "distill_weight": float(cfg.distill_weight),
-            "reference_checkpoint": teacher_path,
-            "student_pre_checkpoint": pre_path,
-            "base_seed": base_seed,
-            "num_trainings": num_trainings,
-            "distill_runs": run_results,
-            "distill_val_acc_mean": float(accuracy_summary["val_acc_mean"]),
-            "distill_val_acc_std": float(accuracy_summary["val_acc_std"]),
-            "best_distill_run": best_run,
-            "config_json": cfg.config_json_path,
-            "surgery_dtype": describe_dtype(get_surgery_dtype()),
-        }
-    )
+    out_extra = {
+        **student_extra,
+        "distill": "mix_ce_jeffreys",
+        "distill_config": asdict(cfg),
+        "teacher_checkpoint": teacher_path,
+        "student_pre_checkpoint": pre_path,
+        "distill_runs": run_results,
+        "distill_val_acc_mean": float(accuracy_summary["val_acc_mean"]),
+        "distill_val_acc_std": float(accuracy_summary["val_acc_std"]),
+        "best_distill_run": best_run,
+        "surgery_dtype": describe_dtype(get_surgery_dtype()),
+    }
     save_model_checkpoint(
         out_abs,
         best_student,

@@ -143,7 +143,7 @@ def main() -> None:
 
     criterion = nn.CrossEntropyLoss()
     reloaded = load_timm_deit_pet_checkpoint(out_abs)
-    acc2, loss2 = accuracy_and_loss(reloaded, val_loader, criterion)
+    acc2, _ = accuracy_and_loss(reloaded, val_loader, criterion)
     log_reload_verify(acc, acc2)
 
 

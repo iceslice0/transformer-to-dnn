@@ -185,7 +185,7 @@ def train_timm_deit_on_pet(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    cfg: "PretrainPetConfig",
+    cfg: Any,
     *,
     resume_val_acc: Optional[float] = None,
 ) -> Tuple[float, float, Optional[int], int]:

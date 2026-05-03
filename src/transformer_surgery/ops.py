@@ -5,10 +5,8 @@ for the DeiT-Tiny pseudo-hardware surgery graph.
 
 from __future__ import annotations
 
-import json
 import math
 import os
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -863,40 +861,3 @@ def write_model_structure_txt(
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-
-@dataclass
-class SurgeryMeta:
-    model_key: str = "deit_tiny_pet"
-    patient: str = "DeiT-Tiny"
-    dataset: str = "Oxford-IIIT Pet"
-    eps: float = 1e-5
-    gibbs_tail_prob_eps: float = 1e-5
-    disable_calib_gibbs_tail_prob: bool = False
-    top_k: int = 32
-    surgery_dtype: str = "bfloat16"
-    calibration: Dict[str, Any] = field(default_factory=dict)
-    module_mapping: Dict[str, str] = field(default_factory=dict)
-    reference_checkpoint: str = ""
-    allow_matmul: bool = False
-
-    def to_json(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "model_key": self.model_key,
-                    "patient": self.patient,
-                    "dataset": self.dataset,
-                    "eps": self.eps,
-                    "gibbs_tail_prob_eps": self.gibbs_tail_prob_eps,
-                    "disable_calib_gibbs_tail_prob": self.disable_calib_gibbs_tail_prob,
-                    "top_k": self.top_k,
-                    "surgery_dtype": self.surgery_dtype,
-                    "calibration": self.calibration,
-                    "calibration_legend": CALIBRATION_LEGEND_TEXT,
-                    "module_mapping": self.module_mapping,
-                    "reference_checkpoint": self.reference_checkpoint,
-                    "allow_matmul": self.allow_matmul,
-                },
-                f,
-                indent=2,
-            )

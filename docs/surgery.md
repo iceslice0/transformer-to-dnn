@@ -280,7 +280,8 @@ The CLI writes:
 
 - `artifacts/checkpoints/ts_surgery_<config>.pt` - pre-finetune surgery checkpoint
   (`save_model_checkpoint` with adapter-supplied `extra`).
-- `artifacts/metadata/ts_surgery_<config>.json` - `SurgeryMeta` JSON with `model_key`,
+- `artifacts/metadata/ts_surgery_<config>.json` - JSON metadata: full surgery config fields plus
+  `calibration`, `module_mapping`, `reference_checkpoint`, and `calibration_legend`,
   `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `calibration`, `module_mapping`,
   `reference_checkpoint`, `allow_matmul`, `gibbs_tail_prob_eps`, and
   `disable_calib_gibbs_tail_prob`.

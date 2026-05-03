@@ -9,6 +9,7 @@ metadata.
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
@@ -16,25 +17,24 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.ops import (
-    SurgeryMeta,
+    CALIBRATION_LEGEND_TEXT,
     get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
     jeffreys_naive_topk,
     set_surgery_dtype,
 )
-from transformer_surgery.util import DEFAULT_MODEL_KEY, describe_dtype, get_device
+from transformer_surgery.util import (
+    DEFAULT_MODEL_KEY,
+    describe_dtype,
+    ensure_mapping,
+    get_device,
+    namespace_from_mapping,
+    torch_dtype_from_name,
+)
 
 
 def _is_set(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
-
-
-def _model_key_from_config_or_extra(cfg: Any = None, extra: Optional[Mapping[str, Any]] = None) -> str:
-    if extra is not None and _is_set(extra.get("model_key")):
-        return str(extra["model_key"]).strip()
-    if cfg is not None and _is_set(getattr(cfg, "model_key", None)):
-        return str(getattr(cfg, "model_key")).strip()
-    return DEFAULT_MODEL_KEY
 
 
 def sample_topk_scores(
@@ -103,13 +103,13 @@ def apply_gibbs_tail_calibration(model: nn.Module, calibration: Mapping[str, Any
     if bool(calibration.get("disable_calib_gibbs_tail_prob", False)):
         return {}
     values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
-    if not isinstance(values, list) or not values or not hasattr(model, "blocks"):
+    if not isinstance(values, list) or not values:
         return {}
     applied = []
     with torch.no_grad():
         for block_idx, blk in enumerate(model.blocks):
-            gibbs = getattr(getattr(blk, "attn", None), "gibbs", None)
-            param = getattr(gibbs, "gibbs_tail_prob_eps", None)
+            gibbs = blk.attn.gibbs
+            param = gibbs.gibbs_tail_prob_eps
             if not isinstance(param, nn.Parameter):
                 continue
             raw_value = float(values[min(block_idx, len(values) - 1)])
@@ -131,7 +131,7 @@ class SurgeryModelAdapter:
     dataset_name: str = "unknown"
 
     def reference_checkpoint_path(self, cfg: Any) -> str:
-        path = getattr(cfg, "reference_checkpoint", None)
+        path = cfg.reference_checkpoint
         if not _is_set(path):
             raise ValueError(f"No reference checkpoint configured for model adapter {self.key!r}")
         return os.path.abspath(str(path))
@@ -163,49 +163,39 @@ class SurgeryModelAdapter:
     def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
         return {}
 
-    def build_surgery_meta(
+    def build_surgery_meta_dict(
         self,
         cfg: Any,
         *,
         calibration: Dict[str, Any],
         reference_checkpoint_abs: str,
         module_mapping: Dict[str, str],
-    ) -> SurgeryMeta:
-        return SurgeryMeta(
-            model_key=self.key,
-            patient=self.patient_name,
-            dataset=self.dataset_name,
-            eps=float(cfg.eps),
-            gibbs_tail_prob_eps=float(cfg.gibbs_tail_prob_eps),
-            disable_calib_gibbs_tail_prob=bool(cfg.disable_calib_gibbs_tail_prob),
-            top_k=int(cfg.top_k),
-            surgery_dtype=str(cfg.surgery_dtype),
-            calibration=dict(calibration),
-            module_mapping=module_mapping,
-            reference_checkpoint=reference_checkpoint_abs,
-            allow_matmul=bool(cfg.allow_matmul),
-        )
-
-    def pre_ft_checkpoint_extra(self, cfg: Any, *, mapping: Dict[str, Any], metadata_path: str) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         return {
+            **asdict(cfg),
             "model_key": self.key,
             "patient": self.patient_name,
             "dataset": self.dataset_name,
-            "reference_checkpoint": self.reference_checkpoint_path(cfg),
-            "meta_ref": os.path.basename(metadata_path),
-            "mapping": mapping,
-            "top_k": int(cfg.top_k),
-            "eps_ln": float(cfg.eps),
-            "gibbs_tail_prob_eps": float(cfg.gibbs_tail_prob_eps),
-            "gibbs_tail_calibration_batches": int(cfg.gibbs_tail_calibration_batches),
-            "disable_calib_gibbs_tail_prob": bool(cfg.disable_calib_gibbs_tail_prob),
-            "config_json": cfg.config_json_path,
-            "disable_layernorm_replacement": cfg.disable_layernorm_replacement,
-            "disable_attention_surgery": cfg.disable_attention_surgery,
-            "disable_softmax_replacement": cfg.disable_softmax_replacement,
-            "allow_matmul": cfg.allow_matmul,
-            "surgery_dtype": str(cfg.surgery_dtype),
+            "calibration": dict(calibration),
+            "module_mapping": module_mapping,
+            "reference_checkpoint": reference_checkpoint_abs,
+            "calibration_legend": CALIBRATION_LEGEND_TEXT,
         }
+
+    def pre_ft_checkpoint_extra(self, cfg: Any, *, mapping: Dict[str, Any], metadata_path: str) -> Dict[str, Any]:
+        ex = asdict(cfg)
+        ex.update(
+            {
+                "model_key": self.key,
+                "patient": self.patient_name,
+                "dataset": self.dataset_name,
+                "reference_checkpoint": self.reference_checkpoint_path(cfg),
+                "meta_ref": os.path.basename(metadata_path),
+                "mapping": mapping,
+                "eps_ln": float(cfg.eps),
+            }
+        )
+        return ex
 
 
 class DeiTTinyPetAdapter(SurgeryModelAdapter):
@@ -272,7 +262,7 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
                 )
                 attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax+{mix})"
         mapping: Dict[str, str] = {}
-        depth = len(model.blocks) if model is not None and hasattr(model, "blocks") else 12
+        depth = len(model.blocks) if model is not None else 12
         for i in range(depth):
             mapping[f"blocks.{i}.norm1"] = ln
             mapping[f"blocks.{i}.attn"] = attn
@@ -289,28 +279,21 @@ def register_model_adapter(adapter: SurgeryModelAdapter) -> None:
     _ADAPTERS[adapter.key] = adapter
 
 
-def surgery_dtype_from_extra(extra: Mapping[str, Any]) -> torch.dtype:
+def surgery_dtype_from_extra(extra: Any) -> torch.dtype:
     """Parse ``extra['surgery_dtype']`` written at checkpoint save time (e.g. ``float16``)."""
-    if "surgery_dtype" not in extra:
-        raise KeyError("checkpoint extra missing required key 'surgery_dtype'")
-    name = str(extra["surgery_dtype"]).strip().replace("torch.", "")
-    try:
-        v = getattr(torch, name)
-    except AttributeError as exc:
-        raise ValueError(f"Unknown surgery_dtype in checkpoint extra: {extra['surgery_dtype']!r}") from exc
-    if not isinstance(v, torch.dtype):
-        raise ValueError(f"Invalid surgery_dtype in checkpoint extra: {extra['surgery_dtype']!r}")
-    return v
+    return torch_dtype_from_name(str(ensure_mapping(extra)["surgery_dtype"]))
 
 
-def get_model_adapter(key_or_cfg: Any = None, *, extra: Optional[Mapping[str, Any]] = None) -> SurgeryModelAdapter:
-    key = key_or_cfg if isinstance(key_or_cfg, str) else _model_key_from_config_or_extra(key_or_cfg, extra)
-    key = str(key).strip() if _is_set(key) else DEFAULT_MODEL_KEY
-    try:
-        return _ADAPTERS[key]
-    except KeyError as exc:
-        known = ", ".join(sorted(_ADAPTERS))
-        raise KeyError(f"Unknown model adapter {key!r}. Available adapters: {known}") from exc
+def get_model_adapter(model_key: str) -> SurgeryModelAdapter:
+    key = str(model_key).strip() if _is_set(model_key) else DEFAULT_MODEL_KEY
+    return _ADAPTERS[key]
+
+
+def apply_load_cfg_overrides(extra_ns: Any, cfg: Any) -> None:
+    if cfg.top_k is not None:
+        extra_ns.top_k = int(cfg.top_k)
+    if cfg.eps is not None:
+        extra_ns.eps_ln = float(cfg.eps)
 
 
 def load_surgery_student_checkpoint(
@@ -322,22 +305,21 @@ def load_surgery_student_checkpoint(
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     device = get_device()
     payload = torch.load(path, map_location=device, weights_only=False)
-    extra = dict(payload["extra"])
+    extra_ns = namespace_from_mapping(dict(payload["extra"]))
     state_dict = payload["model_state_dict"]
     if surgery_dtype is None:
-        surgery_dtype = surgery_dtype_from_extra(extra)
+        surgery_dtype = surgery_dtype_from_extra(extra_ns)
     set_surgery_dtype(surgery_dtype)
     if adapter is None:
-        adapter = get_model_adapter(extra["model_key"])
-    if getattr(cfg, "top_k", None) is not None:
-        extra["top_k"] = int(cfg.top_k)
-    if getattr(cfg, "eps", None) is not None:
-        extra["eps_ln"] = float(cfg.eps)
-    extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
-    model = adapter.build_surgery_model_from_extra(extra, cfg).to(device=device, dtype=get_surgery_dtype())
+        adapter = get_model_adapter(extra_ns.model_key)
+    apply_load_cfg_overrides(extra_ns, cfg)
+    extra_ns.surgery_dtype = describe_dtype(get_surgery_dtype())
+    model = adapter.build_surgery_model_from_extra(ensure_mapping(extra_ns), cfg).to(
+        device=device, dtype=get_surgery_dtype()
+    )
     model.load_state_dict(state_dict, strict=True)
     adapter.freeze_surgery_parameters(model)
-    return model, extra
+    return model, ensure_mapping(extra_ns)
 
 
 register_model_adapter(DeiTTinyPetAdapter())

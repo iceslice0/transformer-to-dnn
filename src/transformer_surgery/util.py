@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import random
 import re
+from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -15,6 +17,33 @@ from torchmetrics.classification import MulticlassAccuracy
 
 
 DEFAULT_MODEL_KEY = "deit_tiny_pet"
+
+
+def namespace_from_mapping(obj: Any) -> Any:
+    """Recursively turn dict trees into ``types.SimpleNamespace`` (lists preserved element-wise)."""
+    if isinstance(obj, Mapping) and not isinstance(obj, (str, bytes, bytearray)):
+        return SimpleNamespace(**{str(k): namespace_from_mapping(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [namespace_from_mapping(v) for v in obj]
+    return obj
+
+
+def namespace_to_mapping(obj: Any) -> Any:
+    """Inverse of :func:`namespace_from_mapping` for JSON / ``torch.save`` payloads."""
+    if isinstance(obj, SimpleNamespace):
+        return {k: namespace_to_mapping(v) for k, v in vars(obj).items()}
+    if isinstance(obj, list):
+        return [namespace_to_mapping(v) for v in obj]
+    return obj
+
+
+def ensure_mapping(obj: Any) -> Dict[str, Any]:
+    """Shallow ``dict`` from a ``Mapping``, or recursive plain dict from a nested ``SimpleNamespace``."""
+    if isinstance(obj, SimpleNamespace):
+        return namespace_to_mapping(obj)
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    raise TypeError(f"expected Mapping or SimpleNamespace, got {type(obj).__name__}")
 
 
 def _slug_part(value: str) -> str:
@@ -32,7 +61,8 @@ def config_artifact_stem(cfg_or_path: Any, tool_name: str) -> str:
     if isinstance(cfg_or_path, (str, os.PathLike)):
         config_path = os.fspath(cfg_or_path)
     else:
-        config_path = str(getattr(cfg_or_path, "config_json_path", "") or "")
+        cjp = cfg_or_path.config_json_path
+        config_path = os.fspath(cjp) if cjp else ""
     config_name = os.path.splitext(os.path.basename(config_path))[0] if config_path else "config"
     tool_parts = _slug_part(tool_name).split("_")
     config_parts = _slug_part(config_name).split("_")
@@ -110,6 +140,15 @@ def describe_device(device: torch.device) -> str:
 
 def describe_dtype(dt: torch.dtype) -> str:
     return str(dt).replace("torch.", "")
+
+
+def torch_dtype_from_name(name: str) -> torch.dtype:
+    key = str(name).strip().replace("torch.", "")
+    try:
+        value = getattr(torch, key)
+    except AttributeError as exc:
+        raise ValueError(f"Unknown torch dtype {name!r}") from exc
+    return value
 
 
 @torch.no_grad()

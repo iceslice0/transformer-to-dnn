@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformer_surgery.models.adapters import (
+    apply_load_cfg_overrides,
     get_model_adapter,
     load_surgery_student_checkpoint,
     surgery_dtype_from_extra,
@@ -26,8 +27,11 @@ from transformer_surgery.models.adapters import (
 from transformer_surgery.util import (
     describe_device,
     describe_dtype,
+    ensure_mapping,
     get_device,
     metadata_path_for_checkpoint,
+    namespace_from_mapping,
+    namespace_to_mapping,
     save_model_checkpoint,
     traceable_artifact_path,
     traceable_log_path,
@@ -141,8 +145,6 @@ def _sample_calibration_batch_indices(
 ) -> List[int]:
     total = int(total_batches)
     requested = int(requested_batches)
-    if requested < 1:
-        raise ValueError("calibration_batches must be >= 1")
     if total < 1:
         return []
     keep = min(total, requested)
@@ -666,12 +668,16 @@ def _build_quant_setup(name: str, module: nn.Module, data: NodeCalibrationData, 
         q_weight = _quantize_proxy(weight_fp, weight_scale, weight_bits).to(dtype=torch.float32, device="cpu")
     else:
         weight_scale = torch.tensor(1.0, dtype=torch.float32)
+    if isinstance(module, (AffineFixedMix, AffineContract)):
+        einsum_equation = module.einsum_equation
+    else:
+        einsum_equation = None
     return NodeQuantSetup(
         name=name,
         kind=kind,
         activation_bits=activation_bits,
         weight_bits=weight_bits,
-        einsum_equation=getattr(module, "einsum_equation", None),
+        einsum_equation=einsum_equation,
         stride=tuple(module.stride) if isinstance(module, nn.Conv2d) else None,
         padding=tuple(module.padding) if isinstance(module, nn.Conv2d) else None,
         dilation=tuple(module.dilation) if isinstance(module, nn.Conv2d) else None,
@@ -960,21 +966,21 @@ def load_ptq_checkpoint(path: str, cfg: Any) -> Tuple[nn.Module, Dict[str, Any]]
     """Load a PTQ checkpoint: rebuild the surgery template, install skeleton PTQ modules, then load_state_dict."""
     device = get_device()
     payload = torch.load(path, map_location=device, weights_only=False)
-    extra = dict(payload["extra"])
-    adapter = get_model_adapter(extra["model_key"])
-    if cfg.top_k is not None:
-        extra["top_k"] = int(cfg.top_k)
-    if cfg.eps is not None:
-        extra["eps_ln"] = float(cfg.eps)
+    extra_ns = namespace_from_mapping(dict(payload["extra"]))
+    adapter = get_model_adapter(extra_ns.model_key)
+    apply_load_cfg_overrides(extra_ns, cfg)
     state_dict = payload["model_state_dict"]
-    set_surgery_dtype(surgery_dtype_from_extra(extra))
-    extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
-    model = adapter.build_surgery_model_from_extra(extra, cfg).to(device=device, dtype=get_surgery_dtype())
-    for wc in extra["ptq_wrappers"]:
-        skeleton = CalibratedAffinePTQWrapper.from_reload_config(wc).to(device=device)
-        _set_module(model, wc["name"], skeleton)
+    set_surgery_dtype(surgery_dtype_from_extra(extra_ns))
+    extra_ns.surgery_dtype = describe_dtype(get_surgery_dtype())
+    model = adapter.build_surgery_model_from_extra(ensure_mapping(extra_ns), cfg).to(
+        device=device, dtype=get_surgery_dtype()
+    )
+    for wc in extra_ns.ptq_wrappers:
+        wc_d = namespace_to_mapping(wc)
+        skeleton = CalibratedAffinePTQWrapper.from_reload_config(wc_d).to(device=device)
+        _set_module(model, wc_d["name"], skeleton)
     model.load_state_dict(state_dict, strict=True)
-    return model, extra
+    return model, ensure_mapping(extra_ns)
 
 
 def _ptq_summary(
@@ -1107,9 +1113,11 @@ def run_ptq(
     )
 
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    out_extra = dict(fp_extra)
-    out_extra["ptq_meta_path"] = os.path.basename(meta_abs)
-    out_extra["ptq_wrappers"] = reload_configs
+    out_extra = {
+        **fp_extra,
+        "ptq_meta_path": os.path.basename(meta_abs),
+        "ptq_wrappers": reload_configs,
+    }
     write_model_structure_txt(model_log_abs, ptq_model, "PTQ Surgery Model")
     save_model_checkpoint(out_abs, ptq_model, extra=out_extra)
     print(f"wrote {model_log_abs}", flush=True)
