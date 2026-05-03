@@ -4,9 +4,9 @@
   "epochs": 1,
   "batch_size": 64,
   "workers": 2,
-  "lr": 0.00005,
+  "lr": 5e-05,
   "weight_decay": 0.05,
-  "warmup_epochs":0,
+  "warmup_epochs": 0,
   "grad_clip": 1.0,
   "cosine_eta_min": 0.0,
   "temperature": 1.0,
@@ -22,6 +22,5 @@
   "ra_magnitude": 9,
   "random_erasing_prob": 0.0,
   "device": "cuda",
-  "train_progress_interval": 1,
-  "val_progress_batches": 5
+  "train_progress_interval": 1
 }

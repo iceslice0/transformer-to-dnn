@@ -39,7 +39,6 @@ class JeffreysDistillConfig:
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
     train_progress_interval: int = 10
-    val_progress_batches: int = 20
     top_k: Optional[int] = None
     eps: Optional[float] = None
     config_json_path: Optional[str] = None

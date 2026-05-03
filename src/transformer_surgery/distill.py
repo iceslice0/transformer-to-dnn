@@ -78,9 +78,6 @@ def eval_distillation_metrics(
     student: nn.Module,
     val_loader: DataLoader,
     temperature: float = 1.0,
-    *,
-    progress_batches: int = 0,
-    progress_prefix: str = "",
 ) -> Tuple[float, float, float]:
     """Student accuracy, mean CE, and mean Jeffreys divergence against a teacher."""
     device = get_device()
@@ -91,10 +88,8 @@ def eval_distillation_metrics(
     j_sum_t = torch.zeros((), device=device, dtype=torch.float64)
     correct_t = torch.zeros((), device=device, dtype=torch.long)
     n = 0
-    n_val = len(val_loader)
-    t0 = time.perf_counter()
     dt = get_surgery_dtype()
-    for bi, (x, y) in enumerate(val_loader):
+    for x, y in val_loader:
         x = x.to(device, dtype=dt, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
         with _maybe_cuda_autocast(device, dt):
@@ -104,16 +99,6 @@ def eval_distillation_metrics(
         j_sum_t += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().double()
         correct_t += (s_log.argmax(dim=-1) == y).sum()
         n += y.size(0)
-        if progress_batches > 0 and n_val > 0:
-            if bi == 0 or (bi + 1) % progress_batches == 0 or (bi + 1) == n_val:
-                elapsed = time.perf_counter() - t0
-                rate = (bi + 1) / elapsed if elapsed > 0 else 0.0
-                eta = (n_val - bi - 1) / rate if rate > 0 else 0.0
-                print(
-                    f"  {progress_prefix}val {bi + 1}/{n_val} batches "
-                    f"~{rate:.2f} batch/s eta~{eta:.0f}s",
-                    flush=True,
-                )
     denom = max(n, 1)
     return correct_t.item() / denom, ce_sum_t.item() / denom, j_sum_t.item() / denom
 
@@ -127,6 +112,7 @@ def distill_student_from_teacher_jeffreys(
     *,
     log_prefix: str = "distill",
     seed: Optional[int] = None,
+    baseline: Optional[Tuple[float, float, float]] = None,
 ) -> Dict[str, Any]:
     """Train any classifier student with mixed hard-label CE plus Jeffreys teacher matching."""
     if seed is not None:
@@ -143,12 +129,7 @@ def distill_student_from_teacher_jeffreys(
     pf = f"{log_prefix} " if log_prefix else ""
     print(
         f"  {pf}schedule: {epochs} epoch(s) x {steps_per_epoch} train batches "
-        f"-> {total_steps} optimizer steps | train log every {cfg.train_progress_interval} batch(es)"
-        + (
-            f" | val log every {cfg.val_progress_batches} batch(es)"
-            if cfg.val_progress_batches > 0
-            else " | val silent"
-        ),
+        f"-> {total_steps} optimizer steps | train log every {cfg.train_progress_interval} batch(es)",
         flush=True,
     )
 
@@ -171,19 +152,16 @@ def distill_student_from_teacher_jeffreys(
     for p in baseline_teacher.parameters():
         p.requires_grad = False
     baseline_teacher.eval()
-    baseline_student = train_student if use_master_fp32 else student
-    baseline_acc, baseline_ce, baseline_j = eval_distillation_metrics(
-        baseline_teacher,
-        baseline_student,
-        val_loader,
-        temperature=cfg.temperature,
-        progress_batches=cfg.val_progress_batches,
-        progress_prefix=pf,
-    )
-    print(
-        f"  {pf}baseline val acc={baseline_acc:.4f} ce={baseline_ce:.4f} jeffreys={baseline_j:.4f}",
-        flush=True,
-    )
+    if baseline is None:
+        baseline_student = train_student if use_master_fp32 else student
+        baseline_acc, baseline_ce, baseline_j = eval_distillation_metrics(
+            baseline_teacher,
+            baseline_student,
+            val_loader,
+            temperature=cfg.temperature,
+        )
+    else:
+        baseline_acc, baseline_ce, baseline_j = baseline
     if seed is not None:
         set_seed(seed)
     best_acc = baseline_acc
@@ -256,10 +234,7 @@ def distill_student_from_teacher_jeffreys(
             student,
             val_loader,
             temperature=cfg.temperature,
-            progress_batches=cfg.val_progress_batches,
-            progress_prefix=pf,
         )
-        print(f"  {pf}epoch {ep + 1}/{epochs} | val acc={acc:.4f} ce={ce_v:.4f} jeffreys={j_v:.4f}", flush=True)
         if cfg.keep_best:
             if acc > best_acc:
                 best_acc, best_ce, best_j = acc, ce_v, j_v
@@ -349,7 +324,7 @@ def _log_distill_session_line(cfg: "JeffreysDistillConfig", teacher_path: str) -
         f"fine-tune CE+distill | teacher={teacher_path} mix={cfg.distill_weight} "
         f"epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay} "
         f"num_trainings={cfg.num_trainings} base_seed={cfg.base_seed} "
-        f"train_progress_interval={cfg.train_progress_interval} val_progress_batches={cfg.val_progress_batches}",
+        f"train_progress_interval={cfg.train_progress_interval}",
         flush=True,
     )
 
@@ -390,15 +365,28 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     base_seed = int(cfg.base_seed)
 
     probe_student, student_extra = load_surgery_student_checkpoint(pre_path, cfg)
-    del probe_student
     adapter = get_model_adapter(student_extra.get("model_key", getattr(cfg, "model_key", None)))
     teacher_path = adapter.reference_checkpoint_path(cfg)
     _log_distill_device_and_config_json(cfg)
     teacher = adapter.load_reference_checkpoint(teacher_path).to(
         device=get_device(), dtype=get_surgery_dtype()
     )
+    for p in teacher.parameters():
+        p.requires_grad = False
+    teacher.eval()
 
     _log_distill_session_line(cfg, teacher_path)
+
+    _, baseline_val_loader = adapter.build_loaders(cfg)
+    baseline = eval_distillation_metrics(
+        teacher, probe_student, baseline_val_loader, temperature=cfg.temperature
+    )
+    print(
+        f"baseline val acc={baseline[0]:.4f} ce={baseline[1]:.4f} jeffreys={baseline[2]:.4f}",
+        flush=True,
+    )
+    del probe_student, baseline_val_loader
+
     run_results: List[Dict[str, Any]] = []
     best_run: Optional[Dict[str, Any]] = None
     best_state: Optional[Dict[str, torch.Tensor]] = None
@@ -417,6 +405,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
             cfg,
             log_prefix=f"distill[{run_number}/{num_trainings}]",
             seed=seed,
+            baseline=baseline,
         )
         result.update(
             {
