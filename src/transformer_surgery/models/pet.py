@@ -166,17 +166,8 @@ def load_timm_deit_pet_checkpoint(path: str) -> nn.Module:
     device = get_device()
     path = os.path.abspath(path)
     model = create_deit_tiny_pet(pretrained=False).to(device)
-    try:
-        payload = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location=device)
-    if isinstance(payload, dict) and "model_state_dict" in payload:
-        sd = payload["model_state_dict"]
-    elif isinstance(payload, dict):
-        sd = payload
-    else:
-        sd = payload
-    model.load_state_dict(sd, strict=True)
+    payload = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
     model.eval()
     return model
 

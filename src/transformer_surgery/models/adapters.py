@@ -20,6 +20,7 @@ from transformer_surgery.ops import (
     get_surgery_dtype,
     jeffreys_distance_sparse_teacher,
     jeffreys_naive_topk,
+    set_surgery_dtype,
 )
 from transformer_surgery.util import DEFAULT_MODEL_KEY, describe_dtype, get_device
 
@@ -288,6 +289,20 @@ def register_model_adapter(adapter: SurgeryModelAdapter) -> None:
     _ADAPTERS[adapter.key] = adapter
 
 
+def surgery_dtype_from_extra(extra: Mapping[str, Any]) -> torch.dtype:
+    """Parse ``extra['surgery_dtype']`` written at checkpoint save time (e.g. ``float16``)."""
+    if "surgery_dtype" not in extra:
+        raise KeyError("checkpoint extra missing required key 'surgery_dtype'")
+    name = str(extra["surgery_dtype"]).strip().replace("torch.", "")
+    try:
+        v = getattr(torch, name)
+    except AttributeError as exc:
+        raise ValueError(f"Unknown surgery_dtype in checkpoint extra: {extra['surgery_dtype']!r}") from exc
+    if not isinstance(v, torch.dtype):
+        raise ValueError(f"Invalid surgery_dtype in checkpoint extra: {extra['surgery_dtype']!r}")
+    return v
+
+
 def get_model_adapter(key_or_cfg: Any = None, *, extra: Optional[Mapping[str, Any]] = None) -> SurgeryModelAdapter:
     key = key_or_cfg if isinstance(key_or_cfg, str) else _model_key_from_config_or_extra(key_or_cfg, extra)
     key = str(key).strip() if _is_set(key) else DEFAULT_MODEL_KEY
@@ -303,26 +318,24 @@ def load_surgery_student_checkpoint(
     cfg: Any,
     *,
     adapter: Optional[SurgeryModelAdapter] = None,
+    surgery_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     device = get_device()
-    try:
-        payload = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=False)
     extra = dict(payload["extra"])
+    state_dict = payload["model_state_dict"]
+    if surgery_dtype is None:
+        surgery_dtype = surgery_dtype_from_extra(extra)
+    set_surgery_dtype(surgery_dtype)
     if adapter is None:
-        adapter = get_model_adapter(cfg, extra=extra)
+        adapter = get_model_adapter(extra["model_key"])
     if getattr(cfg, "top_k", None) is not None:
         extra["top_k"] = int(cfg.top_k)
     if getattr(cfg, "eps", None) is not None:
         extra["eps_ln"] = float(cfg.eps)
-    runtime_dtype = get_surgery_dtype()
-    extra["surgery_dtype"] = describe_dtype(runtime_dtype)
-    extra.setdefault("model_key", adapter.key)
-    extra.setdefault("patient", adapter.patient_name)
-    extra.setdefault("dataset", adapter.dataset_name)
+    extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
     model = adapter.build_surgery_model_from_extra(extra, cfg).to(device=device, dtype=get_surgery_dtype())
-    model.load_state_dict(payload["model_state_dict"], strict=True)
+    model.load_state_dict(state_dict, strict=True)
     adapter.freeze_surgery_parameters(model)
     return model, extra
 

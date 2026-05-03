@@ -4,6 +4,7 @@ from transformer_surgery.models.adapters import (
     DeiTTinyPetAdapter,
     SurgeryModelAdapter,
     get_model_adapter,
+    surgery_dtype_from_extra,
     load_surgery_student_checkpoint,
     register_model_adapter,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "SurgeryModelAdapter",
     "freeze_eps_parameters",
     "get_model_adapter",
+    "surgery_dtype_from_extra",
     "load_surgery_student_checkpoint",
     "register_model_adapter",
 ]

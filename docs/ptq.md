@@ -29,8 +29,9 @@ fields are:
 - `model_key`: adapter key, default `deit_tiny_pet`.
 - dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
   `randaugment`, `ra_magnitude`, `random_erasing_prob`.
-- runtime fields: `device`, `surgery_dtype`, `log_dir`.
-- calibration fields: `calibration_batches`, `calibration_examples_per_node`.
+- runtime fields: `device`, `log_dir`. Surgery compute dtype is taken from the float checkpoint
+  (``extra["surgery_dtype"]`` on the checkpoint).
+- calibration fields: `calibration_batches` (each sampled minibatch contributes all examples per node).
 - selection fields: `wrap_linear_conv`, `wrap_affine`, `wrap_matmul`, `include_names`,
   `exclude_names`.
 - quantization fields: `weight_bits`, `activation_bits`, `affine_activation_bits`,
@@ -39,9 +40,9 @@ fields are:
 - `output`: desired checkpoint directory/name. The final filename is normalized from the tool and
   config name.
 
-PTQ does not train the model and does not run QAT. It performs one calibration/evaluation pass on
-the float model, constructs wrappers, reloads the saved wrapped checkpoint, and evaluates that
-checkpoint.
+PTQ does not train the model and does not run QAT. It validates the float model, runs two
+forward-only calibration passes (ranges, then dequant moments) on the sampled batches, constructs
+wrappers, reloads the saved wrapped checkpoint, and evaluates that checkpoint.
 
 ## Node Selection
 
@@ -60,18 +61,19 @@ not PTQ-wrapped.
 
 ## Calibration
 
-`CalibrationController` registers forward hooks on the selected float-model nodes. During
-validation it stores up to `calibration_examples_per_node` leading examples per selected node, and
-only for batches with index lower than `calibration_batches`.
+Forward hooks on selected nodes accumulate statistics from full calibration minibatches. PTQ first
+runs full validation (no hooks), samples up to `calibration_batches` validation indices with
+`torch.randperm`, then runs hooks over those minibatches twice: ranges, then accumulator/output
+moments for the dequant fit. Each pass is streaming (no activation cache across batches).
 
-For each node it records:
+Per node:
 
-- input tensor samples, including both operands for matmul-like nodes.
-- float output tensor samples.
-- call count and stored-example count for debug metadata.
+- tensor input ranges (every operand for matmul-like nodes);
+- running residual or OLS moments for dequantization;
+- batch indices and example counts (for metadata).
 
 The float validation pass reports `fp_val_acc` and `fp_val_loss`. If any selected node receives no
-samples, PTQ stops before writing a wrapped checkpoint.
+statistics on the sampled batches, PTQ stops before writing a wrapped checkpoint.
 
 ## Quantization
 
@@ -120,28 +122,27 @@ channel mean as the output.
 
 The CLI writes traceable artifacts based on the active config name:
 
-- `artifacts/checkpoints/ts_ptq_<config>_wrapped.pt`: wrapped PTQ checkpoint.
-- `artifacts/metadata/ts_ptq_<config>_wrapped.json`: metadata path derived from the checkpoint
-  basename.
-- `artifacts/logs/ts_ptq_<config>_model_after_ptq.txt`: wrapped model structure log.
+- `artifacts/checkpoints/ts_ptq_<config>.pt`: PTQ checkpoint (same basename stem as configs’ `output` intent).
+- `artifacts/metadata/ts_ptq_<config>.json`: metadata path derived from the checkpoint basename.
+- `artifacts/logs/ts_ptq_<config>_model_after_ptq.txt`: model structure log.
 
 The checkpoint `extra` keeps the source checkpoint metadata plus:
 
 - `ptq_meta_path`: metadata JSON basename.
-- `ptq_wrappers`: wrapper skeleton configs needed to reload the wrapped checkpoint.
+- `ptq_wrappers`: wrapper skeleton configs needed to reload the PTQ checkpoint.
 
 The metadata JSON records:
 
 - source and output checkpoint paths.
 - selection flags and selected node names.
 - quantization bit widths and per-output-channel setting.
-- calibration batch/example settings.
+- calibration batch/example settings, sampled batch indices, and per-node examples by batch.
 - float and PTQ validation accuracy/loss plus deltas.
-- per-node quant/dequant parameters and calibration debug stats.
+- per-node quant/dequant parameters and aggregated calibration debug stats.
 
 ## Reload
 
-`load_ptq_wrapped_checkpoint` rebuilds the float surgery template through the recorded adapter,
+`load_ptq_checkpoint` rebuilds the surgery template through the recorded adapter,
 installs skeleton `CalibratedAffinePTQWrapper` modules from `ptq_wrappers`, and then loads the
 checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
 are checked through the same path downstream code uses.

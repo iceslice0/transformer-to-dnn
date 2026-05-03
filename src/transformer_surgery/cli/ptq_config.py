@@ -21,9 +21,7 @@ class PTQSurgeryConfig:
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
     device: str = "cuda"
-    surgery_dtype: str = "bfloat16"
     calibration_batches: int = 4
-    calibration_examples_per_node: int = 4
     wrap_linear_conv: bool = True
     wrap_affine: bool = False
     wrap_matmul: bool = False
@@ -58,7 +56,10 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "fp_checkpoint": "Float checkpoint to wrap with PTQ modules.",
     "output": "PTQ checkpoint output path.",
-    "surgery_dtype": "torch dtype name for model load/eval, e.g. bfloat16, float16, or float32.",
+    "calibration_batches": (
+        "Number of validation minibatches sampled at random for PTQ; each minibatch contributes all its examples "
+        "per wrapped node."
+    ),
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",
     "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",

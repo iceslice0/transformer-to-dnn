@@ -73,13 +73,9 @@ def load_pretrain_model(
     best_acc_ref: Optional[float] = None
     if resume_path is not None:
         log_init_from_checkpoint(resume_path)
-        try:
-            payload_pre = torch.load(resume_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload_pre = torch.load(resume_path, map_location="cpu")
-        if isinstance(payload_pre, dict) and payload_pre.get("val_acc") is not None:
-            best_acc_ref = float(payload_pre["val_acc"])
-            log_resume_best_acc(best_acc_ref)
+        payload_pre = torch.load(resume_path, map_location="cpu", weights_only=False)
+        best_acc_ref = float(payload_pre["val_acc"])
+        log_resume_best_acc(best_acc_ref)
         model = load_timm_deit_pet_checkpoint(resume_path)
         model.train()
     else:

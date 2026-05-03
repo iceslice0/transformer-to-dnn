@@ -109,6 +109,61 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(probs, expected, atol=1e-6))
         self.assertTrue(torch.equal(q_tail, torch.zeros_like(q_tail)))
 
+    def test_ptq_calibration_samples_random_batches(self) -> None:
+        import torch
+        import torch.nn as nn
+        from types import SimpleNamespace
+
+        from transformer_surgery.ptq import (
+            CalibratedAffinePTQWrapper,
+            _build_quant_setup,
+            _sample_calibration_batch_indices,
+            gather_ptq_dequant_moments,
+            gather_ptq_range_moments,
+        )
+
+        gen = torch.Generator().manual_seed(123)
+        expected_gen = torch.Generator().manual_seed(123)
+        indices = _sample_calibration_batch_indices(10, 4, generator=gen)
+        expected = sorted(torch.randperm(10, generator=expected_gen)[:4].tolist())
+        self.assertEqual(indices, expected)
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(set(indices)), 4)
+
+        model = nn.Sequential(nn.Linear(3, 2, bias=False))
+        selected = {"0": "linear"}
+        batch_indices = [1, 3]
+        loader = [(torch.full((4, 3), float(i)), torch.zeros(4, dtype=torch.long)) for i in range(5)]
+        stats = gather_ptq_range_moments(model, loader, selected, batch_indices)
+        data = stats["0"]
+        self.assertEqual(data.batch_indices, [1, 3])
+        self.assertEqual(data.examples_by_batch, {1: 4, 3: 4})
+        self.assertEqual(data.stored_examples, 8)
+        self.assertEqual(data.range_calls, 2)
+        self.assertGreaterEqual(data.input_max_abs[0].item(), 3.0)
+
+        cfg = SimpleNamespace(
+            weight_bits=8,
+            activation_bits=8,
+            affine_activation_bits=None,
+            matmul_activation_bits=None,
+            per_output_channel=True,
+            dequant_var_eps=1e-8,
+        )
+        setup = _build_quant_setup("0", model[0], data, cfg)
+        gather_ptq_dequant_moments(
+            model,
+            loader,
+            selected,
+            stats,
+            {"0": setup},
+            batch_indices,
+        )
+        self.assertEqual(data.dequant_examples_by_batch, {1: 4, 3: 4})
+        self.assertGreater(data.bias_fit.count, 0)
+        wrapper = CalibratedAffinePTQWrapper(setup, data, cfg)
+        self.assertEqual(wrapper.input_arity, 1)
+
     def test_traceable_artifact_names(self) -> None:
         from transformer_surgery.util import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
 
@@ -145,9 +200,9 @@ class PackageSmokeTests(unittest.TestCase):
                 "artifacts/checkpoints/anything.pt",
                 str(ptq_cfg),
                 "ts-ptq",
-                "wrapped",
+                "",
                 ".pt",
-            ).endswith("artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit_wrapped.pt")
+            ).endswith("artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit.pt")
         )
         self.assertTrue(
             metadata_path_for_checkpoint(surgery_pt).endswith(

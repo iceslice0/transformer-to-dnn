@@ -73,7 +73,7 @@ Generated outputs are git-ignored:
 - `artifacts/metadata/` - metadata JSON
 - `artifacts/logs/` - model structure dumps for surgery and PTQ
 
-Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64_fast.pt`, `ts_distill_64_fast_jeffreys.pt`, `ts_ptq_64_fast_jeffreys_8bit_wrapped.pt`, plus matching metadata where the stage writes it and surgery/PTQ logs.
+Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64_fast.pt`, `ts_distill_64_fast_jeffreys.pt`, `ts_ptq_64_fast_jeffreys_8bit.pt`, plus matching metadata where the stage writes it and surgery/PTQ logs.
 
 ## Method Notes
 

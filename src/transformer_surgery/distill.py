@@ -287,10 +287,7 @@ def merge_post_distill_into_surgery_meta(
             "calibration": {},
             "meta_note": "Stub created before distill (no prior surgery metadata at this path).",
         }
-    raw.setdefault("model_key", model_key)
-    raw.setdefault("patient", patient)
-    raw.setdefault("dataset", dataset)
-    cal = raw.get("calibration") or {}
+    cal = dict(raw["calibration"])
     cal["student_post_distill_val_acc"] = float(val_acc)
     cal["student_post_distill_mean_ce"] = float(val_ce)
     cal["student_post_distill_mean_jeffreys"] = float(val_jeffreys)
@@ -364,8 +361,10 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         raise ValueError("num_trainings must be >= 1")
     base_seed = int(cfg.base_seed)
 
-    probe_student, student_extra = load_surgery_student_checkpoint(pre_path, cfg)
-    adapter = get_model_adapter(student_extra.get("model_key", getattr(cfg, "model_key", None)))
+    probe_student, student_extra = load_surgery_student_checkpoint(
+        pre_path, cfg, surgery_dtype=get_surgery_dtype()
+    )
+    adapter = get_model_adapter(student_extra["model_key"])
     teacher_path = adapter.reference_checkpoint_path(cfg)
     _log_distill_device_and_config_json(cfg)
     teacher = adapter.load_reference_checkpoint(teacher_path).to(
@@ -395,7 +394,9 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         run_number = run_index + 1
         print(f"starting distill run {run_number}/{num_trainings} seed={seed}", flush=True)
         set_seed(seed)
-        student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
+        student, _ = load_surgery_student_checkpoint(
+            pre_path, cfg, adapter=adapter, surgery_dtype=get_surgery_dtype()
+        )
         train_loader, val_loader = adapter.build_loaders(cfg)
         result = distill_student_from_teacher_jeffreys(
             student,
@@ -425,7 +426,9 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     accuracy_summary = _validation_accuracy_summary(run_results)
     _log_distill_summary(accuracy_summary, best_run)
 
-    best_student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
+    best_student, _ = load_surgery_student_checkpoint(
+        pre_path, cfg, adapter=adapter, surgery_dtype=get_surgery_dtype()
+    )
     best_student.load_state_dict(best_state, strict=True)
 
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
