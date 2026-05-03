@@ -1,305 +1,147 @@
-LEAN CUT-PASTE AGENT PLAN FOR STANDALONE PTQ SCRIPT
+# PTQ
 
-Goal
+PTQ is a post-training quantization stage for an already distilled surgery checkpoint. It loads the
+float surgery student through the model adapter, calibrates selected affine/matmul nodes on
+validation data, replaces those nodes with calibrated PTQ wrappers, validates the wrapped model, and
+saves a traceable checkpoint plus metadata.
 
-Create one standalone Python + PyTorch script that performs PTQ on a selected subset of affine nodes in an already surged fp model. Model-specific reconstruction and validation loaders come from the configured model adapter.
+PTQ is included to test whether the surgery compile is genuine. The failure hypothesis is that a
+cosmetic rewrite would still rely on dynamic high-precision floating-point arithmetic to carry the
+model semantics; in that case fixed-scale PTQ wrappers should break accuracy. The PTQ pass leaves
+routing and nonlinear scalar ops explicit, but replaces selected affine, bilinear, and matmul-like
+numerical work with ordinary per-node calibrated integer proxies. If the wrapped model keeps
+accuracy, those arithmetic paths do not need special dynamic floating-point behavior; their scale
+can be replaced by calibrated constants. That is the hardware-facing point of the method: a
+transformer should look like a DNN over a compact primitive vocabulary that can map to homogeneous
+dedicated NPU hardware, instead of depending on a heterogeneous CPU/NPU or GPU implementation with
+special-purpose floating-point kernels.
 
-The script should:
+The core code lives in [src/transformer_surgery/ptq.py](../src/transformer_surgery/ptq.py). The CLI
+wrapper is `python -m transformer_surgery.cli.ptq` or `ts-ptq`.
 
-1. load the fp model and checkpoint
-2. attach hooks to collect calibration data from selected affine/matmul nodes
-3. run validation on the fp model while collecting calibration data
-4. build a wrapped model by replacing selected affine/matmul nodes with quantize -> integer affine/matmul -> dequantize wrappers
-5. initialize wrapper parameters from collected calibration data
-6. validate the wrapped model
+## Inputs
 
-No training.
-No QAT.
-Only PTQ initialization and evaluation.
+The CLI config is defined in
+[src/transformer_surgery/cli/ptq_config.py](../src/transformer_surgery/cli/ptq_config.py). The main
+fields are:
 
-Use python -m transformer_surgery.cli.surgery as reference, reuse code if possible
+- `fp_checkpoint`: float surgery/distill checkpoint to wrap.
+- `model_key`: adapter key, default `deit_tiny_pet`.
+- dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
+  `randaugment`, `ra_magnitude`, `random_erasing_prob`.
+- runtime fields: `device`, `surgery_dtype`, `log_dir`.
+- calibration fields: `calibration_batches`, `calibration_examples_per_node`.
+- selection fields: `wrap_linear_conv`, `wrap_affine`, `wrap_matmul`, `include_names`,
+  `exclude_names`.
+- quantization fields: `weight_bits`, `activation_bits`, `affine_activation_bits`,
+  `matmul_activation_bits`, `per_output_channel`, `dequant_var_eps`.
+- optional architecture overrides: `top_k`, `eps`.
+- `output`: desired checkpoint directory/name. The final filename is normalized from the tool and
+  config name.
 
-File to create
+PTQ does not train the model and does not run QAT. It performs one calibration/evaluation pass on
+the float model, constructs wrappers, reloads the saved wrapped checkpoint, and evaluates that
+checkpoint.
 
-python -m transformer_surgery.cli.ptq
+## Node Selection
 
+`_build_node_selection` walks `model.named_modules()` and selects supported modules by type and
+substring filters. `exclude_names` wins first. A node is selected when either its type is enabled by
+the wrap flags or its name contains one of the `include_names` substrings.
 
-Inputs
+Supported node kinds:
 
-JSON Config file with
-1. path to fp checkpoint
-2. node selection flags (Linear/Conv, Affine, MatMul)
-3. explicit node include/exclude lists by name
-5. calibration subset size
-6. quantization config:
-   - weight bits = 8
-   - activation bits = 8
-   - ``per_output_channel``: for ``Linear``/``Conv2d`` only — **True** = per-output-channel weight scales, **False** = one global weight scale (usually very bad accuracy). Affine/unary/coeff always use one global weight scale; ``MatMul`` has no weights. Output **scale** for ``Linear``/``Conv2d`` is ``s_in * s_w``; only **bias** is calibrated. **Input** activations: one scale per input tensor (tensor-wide max).
+- `nn.Linear`, `nn.Conv2d` when `wrap_linear_conv=true`.
+- `AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` when `wrap_affine=true`.
+- `AffineMatMul`, `AffineHadamard` when `wrap_matmul=true`.
 
+Routing ops, nonlinear unary ops, top-k/gather wiring, dropout, and other non-affine modules are
+not PTQ-wrapped.
 
-Outputs
+## Calibration
 
-1. wrapped model checkpoint
-2. wrapper metadata json
-3. printed validation metrics:
-   - fp model metrics
-   - wrapped model metrics
-4. optional debug stats per wrapped node (mean, std for inputs and outputs)
+`CalibrationController` registers forward hooks on the selected float-model nodes. During
+validation it stores up to `calibration_examples_per_node` leading examples per selected node, and
+only for batches with index lower than `calibration_batches`.
 
-Scope
+For each node it records:
 
-Wrap only selected affine/matmul nodes.
-Leave all other nodes untouched.
+- input tensor samples, including both operands for matmul-like nodes.
+- float output tensor samples.
+- call count and stored-example count for debug metadata.
 
-Affine/Matmul nodes means explicit modules of the form:
-- Linear, Conv
-- Affine
-- MatMul
+The float validation pass reports `fp_val_acc` and `fp_val_loss`. If any selected node receives no
+samples, PTQ stops before writing a wrapped checkpoint.
 
-High-level flow
+## Quantization
 
-Step 1
-Load fp model definition and checkpoint through the model adapter recorded in the checkpoint or selected by config.
+Each selected module is replaced in a deep copy of the float model with
+`CalibratedAffinePTQWrapper`.
 
-Step 2
-Select affine/matmul nodes to calibrate/wrap.
+Activations use signed symmetric max-abs quantization with one scale per input tensor:
 
-Step 3
-Attach forward hooks to selected affine nodes in the fp model.
-For each wrapped candidate collect statistics on:
-- input activation x (x, w for matmul)
-- output activation y_fp
+```
+scale = max(abs(x)) / qmax
+zero_point = 0
+```
 
-Step 4
-Run validation on the fp model with hooks enabled.
-Use validation subset of required size
+Weights use the same signed symmetric estimator. For `Linear` and `Conv2d`,
+`per_output_channel=true` uses one weight scale per output channel/filter along axis 0. When
+`per_output_channel=false`, one global scale is used. Affine coefficient tensors always use one
+global scale. `AffineMatMul` and `AffineHadamard` have no stored weight tensor.
 
-At the end you should have cached calibration tensors/statistics for each selected affine/matmul node.
+The wrapper forward path quantizes inputs with proxy integer tensors, runs the selected affine or
+matmul accumulator, then dequantizes back to the incoming float dtype.
 
-Step 5
-Create wrapped model by deep-copying the fp model.
+## Dequant Fit
 
-Step 6
-Replace selected affine/matmul nodes in the copied model with PTQ wrappers.
+For `Linear` and `Conv2d`, the output scale is analytical:
 
-Step 7
-Initialize each wrapper from:
-- original float weights/bias
-- collected calibration input/output data
+```
+out_scale = input_scale * weight_scale
+```
 
-Step 8
-Run validation on the wrapped model.
+Only output bias is calibrated as the mean residual between the float teacher output and the
+scaled integer accumulator. The scale is baked into `q_weight` for these nodes, so the forward path
+does not need a separate output multiply.
 
-Step 9
-Save wrapped model checkpoint and metadata.
+For surgery affine and matmul kinds, PTQ fits:
 
+```
+y_hat = out_scale * accumulator + out_bias
+```
 
-Required components
+The fit is ordinary least squares, per output channel when the output shape exposes a channel axis,
+otherwise global. `dequant_var_eps` is the variance threshold and denominator floor for this fit.
+Channels with accumulator variance below this threshold collapse to slope 0 and use the teacher
+channel mean as the output.
 
-1. Node selection helper
-Given model.named_modules(), select affine/matmul nodes by:
-- module type
-- name patterns
-- explicit include/exclude lists
+## Outputs
 
+The CLI writes traceable artifacts based on the active config name:
 
-2. Calibration hooks
+- `artifacts/checkpoints/ts_ptq_<config>_wrapped.pt`: wrapped PTQ checkpoint.
+- `artifacts/metadata/ts_ptq_<config>_wrapped.json`: metadata path derived from the checkpoint
+  basename.
+- `artifacts/logs/ts_ptq_<config>_model_after_ptq.txt`: wrapped model structure log.
 
-For each selected affine node attach a forward hook that stores:
-- x_in = module input tensor
-- w_in = module weight tensor (for MatMul)
-- y_out = module output tensor
+The checkpoint `extra` keeps the source checkpoint metadata plus:
 
-Keep storage bounded by using channelwise running moments min/max and/or histograms
+- `ptq_meta_path`: metadata JSON basename.
+- `ptq_wrappers`: wrapper skeleton configs needed to reload the wrapped checkpoint.
 
-Minimum needed per node:
-- sample of input tensor values
-- sample of output tensor values
-- float weight tensor
-- float bias tensor if present
+The metadata JSON records:
 
-3. Quantization wrapper
+- source and output checkpoint paths.
+- selection flags and selected node names.
+- quantization bit widths and per-output-channel setting.
+- calibration batch/example settings.
+- float and PTQ validation accuracy/loss plus deltas.
+- per-node quant/dequant parameters and calibration debug stats.
 
-Create one common wrapper class, e.g.
+## Reload
 
-CalibratedAffinePTQWrapper
-
-The wrapper should contain:
-- original affine structure
-- quantized weight representation or weight quantizer for MatMul
-- input quantizer params
-- output dequant params
-
-Forward logic should be conceptually:
-
-x_fp, w_fp, x_zeropoint_fp, w_zeropoint_fp, x_scale_fp, w_scale_fp, out_scale_fp, out_zeropoint_fp
--> quantize input to int_n proxy
--> quantize weight to int_n proxy
--> integer affine accumulator
--> dequantize out by fp affine
--> return out fp tensor
-
-Important:
-the implementation semantics should be:
-- input quantized
-- weight quantized
-- accumulator integer
-- output dequantized back to fp
-
-Absorb bias into output dequant affine map.
-
-
-4. Wrapper parameters to initialize
-
-For each wrapped affine node initialize:
-
-A. Weight and Input quantization scale, zeropoint
-
-Symmetric, max-abs based. Single estimator:
-- ``scale = max(|x|) / qmax`` over the calibration tensor (channelwise for per-output-channel weights, tensor-wide for inputs).
-- Zero point is fixed at 0 (signed range).
-
-Max works well in practice for this stage; no percentile / k-sigma variant is needed.
-
-
-B. Output dequant parameters
-Fit affine dequantization from integer accumulator output to teacher fp output.
-
-Output model:
-
-y_hat = s_out * y_int + c_out
-
-Two paths:
-- ``Linear``/``Conv2d``: ``s_out = s_in * s_w`` analytically (per output channel when per-output-channel
-  weight scales are enabled, scalar otherwise). Only ``c_out`` is calibrated, as the residual mean of
-  ``y_teacher - s_out * y_int``.
-- Affine and ``MatMul`` kinds: per-output-channel least-squares fit of both ``s_out`` and ``c_out`` against
-  cached teacher outputs.
-
-Variance fallback (OLS path only):
-
-Per-channel variance of the integer accumulator ``var(y_int)`` is checked against config
-``dequant_var_eps`` (default ``1e-8``). When ``|var| < dequant_var_eps`` the channel is treated as
-near-constant and its slope is collapsed to 0; ``c_out`` then equals the channel mean of the teacher
-output. The same threshold is used as the ``clamp_min`` of the OLS denominator. Tune lower for
-tighter fits on weakly-varying channels (at the cost of numerical noise) or higher to collapse more
-channels to their mean.
-
-This is the key calibration step.
-
-
-5. Initialization procedure per wrapped node
-
-For each selected affine node:
-
-1. read float weights and bias
-2. compute weight quant scale
-3. quantize weights
-4. read cached input calibration tensor
-5. compute input activation scale
-6. quantize cached input
-7. run simulated integer affine on cached input
-8. fit output dequant parameters to teacher output:
-   - either by moment matching
-   - or by least-squares affine fit
-
-Preferred:
-- least-squares affine fit per output channel
-
-
-6. Validation passes
-
-Run two validations:
-
-A. Float validation
-- original model
-- hooks enabled
-- collect calibration data
-- log baseline metrics
-
-B. Wrapped validation
-- wrapped model
-- no hooks needed unless debugging
-- log wrapped metrics
-
-Report:
-- original accuracy/loss
-- wrapped accuracy/loss
-- difference
-
-
-7. Save artifacts
-
-Save:
-- wrapped checkpoint
-- metadata json
-
-Metadata should include:
-- selected wrapped node names
-- calibration batch count
-- quantization config
-- per-node scales
-- per-node dequant params
-- validation metrics before/after wrapping
-
-
-Implementation details to keep it lean
-
-1. Do not quantize Not Affine/MatMul nodes (Unary, selection/routing).
-Do not quantize selection/routing ops.
-Only wrap selected affine nodes.
-
-2. Do not do global optimization.
-Per-node one-pass calibration only.
-
-3. Do not do iterative refinement.
-Single pass only.
-
-4. Do not require integer-only output chaining.
-Returning dequantized fp output from wrappers is acceptable for the PTQ baseline.
-
-
-Suggested internal structure of ptq_wrap_validate.py
-
-1. parse args
-2. load model
-3. load checkpoint
-4. build dataloaders
-5. select nodes
-6. register hooks
-7. validate fp model and collect calibration data
-8. remove hooks
-9. deepcopy model
-10. replace selected nodes with wrappers and initialize wrappers from calibration data
-11. validate wrapped model
-12. save checkpoint and metadata
-
-
-Acceptance criteria
-
-The script is acceptable if:
-
-1. it runs end-to-end from checkpoint to wrapped checkpoint
-2. it can wrap only a selected subset of affine nodes
-3. it collects calibration data from the fp teacher model in one pass
-4. it initializes wrapper params from calibration data
-5. it validates both original and wrapped models
-6. it saves wrapped checkpoint and metadata
-
-
-Final instruction to agent
-
-Implement the minimal standalone PTQ script.
-
-Focus on:
-- one-pass teacher calibration
-- selected affine node wrapping
-- per-node scale fitting
-- output affine dequant fitting
-- before/after validation
-
-Do not add:
-- QAT
-- vendor runtime
-- full-graph quantization
-- unary and selection/routing quantization
+`load_ptq_wrapped_checkpoint` rebuilds the float surgery template through the recorded adapter,
+installs skeleton `CalibratedAffinePTQWrapper` modules from `ptq_wrappers`, and then loads the
+checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
+are checked through the same path downstream code uses.

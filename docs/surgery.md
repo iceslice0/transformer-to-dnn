@@ -1,8 +1,8 @@
 # Surgery
 
-Surgery is the first stage of the pipeline. It loads a pretrained classifier through a model
-adapter, builds a surgery student in a restricted op vocabulary (affine + local unary + selection
-/routing), copies reference weights into the student, runs a calibration pass, and saves the
+Surgery is the compile stage. It loads a pretrained classifier through a model adapter, builds a
+surgery student in a restricted op vocabulary (affine + local unary + selection/routing), copies
+reference weights into the student, runs a calibration pass, and saves the
 pre-finetune checkpoint with metadata and model-structure logs.
 
 The core code lives in [src/transformer_surgery/surgery.py](../src/transformer_surgery/surgery.py)
@@ -16,14 +16,16 @@ wrapper is `python -m transformer_surgery.cli.surgery` or `ts-surgery`.
 - dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
   `randaugment`, `ra_magnitude`, `random_erasing_prob`.
 - surgery shape/numerics fields: `top_k`, `eps`, `gibbs_tail_prob_eps`,
-  `disable_calib_gibbs_tail_prob`, `surgery_dtype`.
+  `gibbs_tail_calibration_batches`, `disable_calib_gibbs_tail_prob`, `surgery_dtype`.
 - transform flags: `disable_layernorm_replacement`, `disable_attention_surgery`,
   `disable_softmax_replacement`, `allow_matmul`.
 - output paths: `pre_ft_checkpoint`, `log_dir`.
 
-Surgery code stays model-agnostic. It uses `get_model_adapter` so dataset
-loaders, reference loading, surgery-model construction, weight copy, and calibration diagnostics
-stay inside the adapter layer. Default adapter:
+Surgery code stays model-agnostic. It uses `get_model_adapter` for dataset loaders, reference
+loading, surgery-model construction, and weight copy. Generic adapter utilities own common
+calibration math such as top-k row sampling, tail-mass stats, Jeffreys summaries, and Gibbs
+parameter application. Timm/DeiT-specific traversal lives next to the model implementation. Default
+adapter:
 
 - patient: DeiT-Tiny from timm, fine-tuned on Oxford-IIIT Pet.
 - dataset: Oxford-IIIT Pet classification (37 classes).
@@ -43,11 +45,11 @@ match exports from `transformer_surgery.ops`.
 Everything linear, including parameterized layers, fixed-coefficient contractions, and linear
 unary reductions/scalings:
 
-- `nn.Linear`, `nn.Conv2d` (patch embed) — standard parameterized layers.
-- `AffineScaleBias` — per-channel `y = x * weight + bias`; carries LayerNorm `gamma`/`beta`.
-- `AffineContract(einsum_equation, coeffs)` — fixed coefficient contraction over operand or head
+- `nn.Linear`, `nn.Conv2d` (patch embed) - standard parameterized layers.
+- `AffineScaleBias` - per-channel `y = x * weight + bias`; carries LayerNorm `gamma`/`beta`.
+- `AffineContract(einsum_equation, coeffs)` - fixed coefficient contraction over operand or head
   dims via `torch.einsum` on a registered `coeff` buffer. One graph node per logical affine.
-- `AffineFixedMix(einsum_equation, matrix)` — fixed 2×2 mix on the operand axis (default builds
+- `AffineFixedMix(einsum_equation, matrix)` - fixed 2x2 mix on the operand axis (default builds
   plus/minus combinations for the square identity).
 - Linear unary reductions and scalings: `AffineMean`, `AffineSum`, `AffineScale`.
 - Variable bilinear ops (`allow_matmul` only): `AffineMatMul` (`torch.matmul(a, b)`) and
@@ -75,21 +77,20 @@ set from the run config and frozen at training time by `freeze_eps_parameters`.
 
 ### Routing
 
-Pure tensor wiring and discrete selection — no arithmetic, no parameters:
+Pure tensor wiring and discrete selection - no arithmetic, no parameters:
 
 - Shape and layout: `reshape`/`view`, `transpose`, `expand`, `cat`, `stack`,
   `broadcast_tensors`, `unsqueeze`.
-- Discrete selection: `torch.topk`, `torch.gather`, `torch.max` for row max (Gibbs
-  stabilization), `F.relu` (sign split in the LN strict path), `Dropout`/`DropPath`.
+- Discrete selection: `torch.topk`, `torch.gather`, `F.relu` (sign split in the LN strict path),
+  `Dropout`/`DropPath`.
 
-`F.relu` and `torch.max` are classified as routing — they choose between operands or zero
-rather than computing a smooth nonlinearity, so they live with `topk` and `gather`, not with
-`NLSquare`/`NLExp`.
+`F.relu` is classified as routing - it chooses between an operand and zero rather than computing a
+smooth nonlinearity, so it lives with `topk` and `gather`, not with `NLSquare`/`NLExp`.
 
 The routing surface is also re-exported from `transformer_surgery.ops` under `Routing*`
 aliases (`RoutingTranspose`, `RoutingCat`, `RoutingStack`, `RoutingUnsqueeze`, `RoutingExpand`,
 `RoutingExpandAs`, `RoutingSqueeze`, `RoutingBroadcastTensors`, `RoutingTopK`, `RoutingGather`,
-`RoutingMax`, `RoutingFullLike`, `RoutingReLU`, `RoutingDropPath`) so the routing vocabulary is
+`RoutingFullLike`, `RoutingReLU`, `RoutingDropPath`) so the routing vocabulary is
 discoverable alongside the `Affine*` and `NL*` classes. The op implementations use these aliases
 for routing inside `ops.py`; the aliases are names for tensor wiring, not extra graph modules.
 
@@ -105,11 +106,11 @@ Common prefix:
 
 Strict path (`allow_matmul=False`, default):
 
-- `au = stack(F.relu(u), F.relu(-u), dim=-2)` — magnitude split, no `abs`.
+- `au = stack(F.relu(u), F.relu(-u), dim=-2)` - magnitude split, no `abs`.
 - `log_num = NLLogPlusEps(eps)(au)`.
 - `log_den = NLLogPlusEps(eps)(r2)` broadcast to match `log_num`.
 - `t = AffineContract("q,...qpc->...pc", [2, -1])(stack(log_num, log_den, dim=2))`.
-- `a_mag = NLSqrtExp()(t)` (= `sqrt(exp(t))`, equivalent to `exp(log_num - ½·log_den)`).
+- `a_mag = NLSqrtExp()(t)` (= `sqrt(exp(t))`, equivalent to `exp(log_num - 0.5*log_den)`).
 - `z = AffineContract("p,...pc->...c", [1, -1])(a_mag)`.
 
 Fast path (`allow_matmul=True`):
@@ -124,10 +125,12 @@ from `cfg.eps` and frozen by `freeze_eps_parameters` (it is not copied from `src
 ## Transform 2: Variable Matrix-Multiplication Replacement in Attention
 
 Attention is implemented in `SurgeryAttention` (in
-[src/transformer_surgery/models/deit_tiny.py](../src/transformer_surgery/models/deit_tiny.py)).
+[src/transformer_surgery/ops.py](../src/transformer_surgery/ops.py)). Model adapters only select
+the replacement; the attention op owns the QKV projection, surgery score path, Gibbs top-k softmax,
+tail redistribution, and output projection.
 
-In strict mode (`allow_matmul=False`) there is no variable `matmul` for QKᵀ score computation
-or for sparse value mixing PV. Both use the identity `a*b = ((a+b)² - (a-b)²)/4` through
+In strict mode (`allow_matmul=False`) there is no variable `matmul` for QK^T score computation
+or for sparse value mixing PV. Both use the identity `a*b = ((a+b)^2 - (a-b)^2)/4` through
 `SquareIdentityOperandChain`:
 
 ```
@@ -139,15 +142,51 @@ stack((a, b), dim=-2)
 
 Two attention modules use the chain with different einsum equations and coefficients:
 
-- `PairwiseDotBySquare(head_dim)` — Q/K grid → scores. Mix `pq,...qd->...pd`,
-  contract `p,...pd->...`, coeffs `±1/(4√d)`. Operands are broadcast Q/K.
-- `SparseWeightedSumBySquare()` — sparse probs and gathered values → output. Mix
-  `pq,...kqd->...kpd`, contract `p,...kpd->...d`, coeffs `(¼, −¼)`. Operands are expanded probs
+- `PairwiseDotBySquare(head_dim)` - Q/K grid -> scores. Mix `pq,...qd->...pd`,
+  contract `p,...pd->...`, coeffs `+/-1/(4*sqrt(d))`. Operands are broadcast Q/K.
+- `SparseWeightedSumBySquare()` - sparse probs and gathered values -> output. Mix
+  `pq,...kqd->...kpd`, contract `p,...kpd->...d`, coeffs `(1/4, -1/4)`. Operands are expanded probs
   and `torch.gather`-ed values per top-k slot.
 
-When `allow_matmul=True`, `PairwiseDotBySquare` falls back to `(q/√d) @ kᵀ` via `AffineMatMul`, and
+When `allow_matmul=True`, `PairwiseDotBySquare` falls back to `(q/sqrt(d)) @ k^T` via `AffineMatMul`, and
 `SparseWeightedSumBySquare` falls back to `probs.unsqueeze(-2) @ v_g` via `AffineMatMul`. Only the
 modules for the chosen mode are registered.
+
+### Tail-Mass Redistribution
+
+The top-k softmax leaves a `gibbs_tail_prob_eps` fraction of probability mass outside the kept
+indices. `SurgeryAttention` redistributes that tail **uniformly over the dropped positions** so
+total probability per query sums to 1. With `q_tail = eps`, `N` keys, `K` kept, this is:
+
+```
+                  per-position weight on V_n
+top-K position k:   p_tilde_k              (the same as dense softmax to first order)
+dropped position:   q_tail / (N - K)
+```
+
+Algebraically the attention output becomes
+
+```
+attn = sum_{k in topK} (p_tilde_k - q_tail/(N-K)) * V[idx_k] + (N/(N-K)) * q_tail * mean_keys(V)
+       [SparseWeightedSumBySquare on adjusted probs]          [AffineMean]
+```
+
+The `q_tail/(N-K)` subtraction cancels the over-counting that `mean_V` (which averages over **all**
+keys, including those in top-K) would otherwise introduce on the kept positions. The two constants
+`1/(N-K)` and `N/(N-K)` are static for a given block and are folded into `AffineContract`
+coefficients, not extra modules:
+
+- `adj_probs_contract` - `AffineContract("i,...i->...", [1, -1/(N-K)])` over `stack(probs, q_tail)`,
+  yielding `adjusted_probs = probs - q_tail/(N-K)`.
+- `mean_v` - `AffineMean(dim=-2, keepdim=True)`.
+- `scale_mean_v_by_tail` - `AffineHadamard(mean_V, q_tail)` produces `q_tail * mean_V`.
+- `attn_tail_sum` - `AffineContract("i,...i->...", [1, N/(N-K)])` over a stack of the sparse-mix
+  result and the scaled `mean_V`.
+
+All three coefficients are pure-number constants from `seq_len` and `top_k`; the only learned
+scalar in this branch remains `gibbs_tail_prob_eps`. Without this correction the attention output
+would lose the `q_tail` mass entirely, attenuating each block's output by `(1 - q_tail)` and
+forcing distillation to absorb the bias into trainable parameters elsewhere.
 
 ## Transform 3: Softmax Replacement
 
@@ -155,10 +194,13 @@ modules for the chosen mode are registered.
 returns sparse probabilities on the top-k indices, the index tensor, and a tail-mass scalar
 `q_tail`.
 
-Score stabilization, tail-sum aggregation, and logit normalization are exposed as
-`AffineContract` submodules so the graph lists explicit affine nodes:
+Top-k selection, score stabilization, tail-sum aggregation, and logit normalization are exposed as
+routing plus `AffineContract` submodules so the graph lists explicit affine nodes:
 
-- `scores_stable_contract` (`[1, -1]`) implements `scores - row_max` over a stacked operand.
+- `RoutingTopK(..., sorted=True)` first selects ordered top-k logits. The first selected value is
+  the row maximum, so no separate max routing op is used.
+- `top_vals_stable_contract` (`[1, -1]`) implements `top_vals - top_vals[..., :1]` over a stacked
+  operand.
 - `gibbs_tail_prob_eps` is a scalar module parameter that reserves omitted-tail probability mass.
 - `scale_top_probs_by_tail` (`AffineHadamard`) applies `1 - gibbs_tail_prob_eps` to the top-k
   probabilities.
@@ -188,11 +230,11 @@ The CLI config (in
 [src/transformer_surgery/cli/surgery_config.py](../src/transformer_surgery/cli/surgery_config.py))
 exposes four debug flags that selectively bypass the rewrites:
 
-- `disable_layernorm_replacement` — keep `nn.LayerNorm` instead of `RewrittenLayerNorm`.
-- `disable_attention_surgery` — keep dense scaled-dot QKᵀ + softmax + dense `@V`.
-- `disable_softmax_replacement` — keep `PairwiseDotBySquare` for QKᵀ but use full softmax then
+- `disable_layernorm_replacement` - keep `nn.LayerNorm` instead of `RewrittenLayerNorm`.
+- `disable_attention_surgery` - keep dense scaled-dot QK^T + softmax + dense `@V`.
+- `disable_softmax_replacement` - keep `PairwiseDotBySquare` for QK^T but use full softmax then
   dense `@V` (or a Hadamard expansion when `allow_matmul=True`).
-- `allow_matmul` — switch the strict subgraphs to the matmul/Hadamard fast paths in
+- `allow_matmul` - switch the strict subgraphs to the matmul/Hadamard fast paths in
   `RewrittenLayerNorm`, `PairwiseDotBySquare`, `SparseWeightedSumBySquare`, and
   `GibbsTopKSoftmax`.
 
@@ -201,26 +243,29 @@ exposes four debug flags that selectively bypass the rewrites:
 
 ## Calibration
 
-`adapter.calibrate_reference` runs once on a single validation minibatch and reports adapter
-diagnostics. For `deit_tiny_pet` these are:
+`adapter.calibrate_reference` walks up to `gibbs_tail_calibration_batches` validation minibatches.
+For `deit_tiny_pet`, the model-local helper walks the timm DeiT blocks and calls common adapter
+helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reported diagnostics are:
 
-- `ln_rewrite_mse_layer0_minibatch` — MSE of `RewrittenLayerNorm` against the reference LN at
+- `ln_rewrite_mse_layer0_minibatch` - MSE of `RewrittenLayerNorm` against the reference LN at
   block 0 on the cached batch.
-- `ln_rewrite_mse_all_norms_mean` — mean MSE across all `norm1`/`norm2` and the final `norm`
+- `ln_rewrite_mse_all_norms_mean` - mean MSE across all `norm1`/`norm2` and the final `norm`
   while replaying the residual stream of the reference model.
-- `jeffreys_gibbs_mean_cached` and `jeffreys_naive_mean_cached` — mean Jeffreys divergence of
+- `jeffreys_gibbs_mean_cached` and `jeffreys_naive_mean_cached` - mean Jeffreys divergence of
   the Gibbs Top-K and naive Top-K approximations against the dense softmax on cached attention
   scores from block 0. Gibbs uses the block-0 calibrated `gibbs_tail_prob_eps` value for this
   metric.
-- `jeffreys_improvement_naive_minus_gibbs_cached` — signed gap between naive and Gibbs Top-K under
+- `jeffreys_improvement_naive_minus_gibbs_cached` - signed gap between naive and Gibbs Top-K under
   the active tail behavior.
-- `gibbs_tail_prob_eps_calibrated_by_block` — per-block estimates of the true omitted dense-softmax
-  probability mass outside the top-k set on the calibration minibatch.
-- `gibbs_tail_prob_eps_calibrated_mean` plus per-block min/max variants — summary statistics for
+- `gibbs_tail_calibration_batches` - actual number of validation minibatches used.
+- `gibbs_tail_prob_eps_calibrated_by_block` - per-block estimates of the true omitted dense-softmax
+  probability mass outside the top-k set over the calibration batches.
+- `gibbs_tail_prob_eps_calibrated_mean` plus per-block min/max variants - summary statistics for
   those omitted-tail estimates. The surgery CLI prints the by-block values.
-- `gibbs_tail_prob_eps_applied_by_block` — values copied into each `GibbsTopKSoftmax` scalar
+- `gibbs_tail_prob_eps_calibration_rows_by_block` - sampled row count used per block.
+- `gibbs_tail_prob_eps_applied_by_block` - values copied into each `GibbsTopKSoftmax` scalar
   parameter.
-- `disable_calib_gibbs_tail_prob` — when true, the by-block tail estimate and parameter copy are
+- `disable_calib_gibbs_tail_prob` - when true, the by-block tail estimate and parameter copy are
   skipped; metrics use the configured `gibbs_tail_prob_eps`.
 - Synthetic `*_synthetic` variants on a Gaussian score tensor of the same shape, for
   cross-checking.
@@ -233,14 +278,14 @@ The surgery driver then runs full-validation passes on both the reference (`ref_
 
 The CLI writes:
 
-- `artifacts/checkpoints/ts_surgery_<config>.pt` — pre-finetune surgery checkpoint
+- `artifacts/checkpoints/ts_surgery_<config>.pt` - pre-finetune surgery checkpoint
   (`save_model_checkpoint` with adapter-supplied `extra`).
-- `artifacts/metadata/ts_surgery_<config>.json` — `SurgeryMeta` JSON with `model_key`,
+- `artifacts/metadata/ts_surgery_<config>.json` - `SurgeryMeta` JSON with `model_key`,
   `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `calibration`, `module_mapping`,
   `reference_checkpoint`, `allow_matmul`, `gibbs_tail_prob_eps`, and
   `disable_calib_gibbs_tail_prob`.
 - `artifacts/logs/ts_surgery_<config>_model_before_surgery.txt` and `_model_after_surgery.txt`
-  — `write_model_structure_txt` dumps with `repr(model)`, parameter counts, the
+  - `write_model_structure_txt` dumps with `repr(model)`, parameter counts, the
   `named_modules` listing, and per-module forward output tensor shapes from one `eval` pass on
   a dummy batch.
 
