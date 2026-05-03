@@ -45,7 +45,6 @@ RoutingUnsqueeze = torch.unsqueeze
 RoutingBroadcastTensors = torch.broadcast_tensors
 RoutingTopK = torch.topk
 RoutingGather = torch.gather
-RoutingMax = torch.max
 RoutingFullLike = torch.full_like
 RoutingReLU = F.relu
 RoutingDropPath = _TimmDropPath
@@ -71,7 +70,7 @@ def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
 #   NL*      — strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
 #              reciprocal+eps, GELU).
 #   Routing* — pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
-#              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, torch.max, Dropout/DropPath); see the
+#              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, Dropout/DropPath); see the
 #              ``Routing*`` aliases above.
 # ---------------------------------------------------------------------------
 
@@ -434,7 +433,7 @@ class GibbsTopKSoftmax(nn.Module):
         e = float(eps)
         self.exp = NLExp()
         self.sum_exp_vals = AffineSum(-1, keepdim=True)
-        self.scores_stable_contract = AffineContract(
+        self.top_vals_stable_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
         )
@@ -456,10 +455,10 @@ class GibbsTopKSoftmax(nn.Module):
         """
         _b, _h, _nq, nk = scores.shape
         k = min(self.top_k, nk)
-        row_max = RoutingMax(scores, dim=-1, keepdim=True).values
-        _s, _r = RoutingBroadcastTensors(scores, row_max)
-        scores_stable = self.scores_stable_contract(RoutingStack((_s, _r), dim=-1))
-        vals, idx = RoutingTopK(scores_stable, k=k, dim=-1, largest=True, sorted=True)
+        raw_vals, idx = RoutingTopK(scores, k=k, dim=-1, largest=True, sorted=True)
+        row_max = raw_vals[..., :1]
+        _v, _r = RoutingBroadcastTensors(raw_vals, row_max)
+        vals = self.top_vals_stable_contract(RoutingStack((_v, _r), dim=-1))
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
         normalizer = self.sum_exp_vals(exp_vals)
@@ -536,6 +535,108 @@ class SparseWeightedSumBySquare(nn.Module):
         p = RoutingUnsqueeze(probs, -1)
         p_b = RoutingExpand(p, -1, -1, -1, -1, d)
         return self.square_chain(p_b, v_g)
+
+
+# ---------------------------------------------------------------------------
+# Attention replacement
+# ---------------------------------------------------------------------------
+
+
+class SurgeryAttention(nn.Module):
+    """ViT multi-head attention assembled from surgery op modules."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        seq_len: int,
+        top_k: int,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        use_attention_surgery: bool = True,
+        use_surgery_softmax: bool = True,
+        allow_matmul: bool = False,
+        eps_ln: float = 1e-5,
+        gibbs_tail_prob_eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.use_attention_surgery = use_attention_surgery
+        self.use_surgery_softmax = use_surgery_softmax
+        self.allow_matmul = allow_matmul
+        if use_attention_surgery and not use_surgery_softmax and allow_matmul:
+            self.matmul = AffineMatMul()
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        if use_attention_surgery:
+            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
+            if use_surgery_softmax:
+                self.gibbs = GibbsTopKSoftmax(
+                    seq_len,
+                    top_k,
+                    eps=eps_ln,
+                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
+                    allow_matmul=allow_matmul,
+                )
+                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
+                k_eff = min(int(top_k), int(seq_len))
+                n_dropped = max(int(seq_len) - k_eff, 1)
+                inv_dropped = 1.0 / n_dropped
+                n_over_dropped = float(seq_len) / n_dropped
+                self.mean_v = AffineMean(dim=-2, keepdim=True)
+                self.scale_mean_v_by_tail = AffineHadamard()
+                self.adj_probs_contract = AffineContract(
+                    "i,...i->...",
+                    torch.tensor([1.0, -inv_dropped], dtype=get_surgery_dtype()),
+                )
+                self.attn_tail_sum = AffineContract(
+                    "i,...i->...",
+                    torch.tensor([1.0, n_over_dropped], dtype=get_surgery_dtype()),
+                )
+            else:
+                self.attn_drop = nn.Dropout(attn_drop)
+        else:
+            self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
+            self.attn_drop = nn.Dropout(attn_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        if not self.use_attention_surgery:
+            s = self.attn_scale.to(device=q.device, dtype=q.dtype)
+            qs = q * s
+            kt = RoutingTranspose(k, -2, -1)
+            attn = qs @ kt
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            attn = attn @ v
+        elif self.use_surgery_softmax:
+            scores = self.dot(q, k)
+            probs, idx, q_tail = self.gibbs(scores)
+            _p, _qt = RoutingBroadcastTensors(probs, q_tail)
+            adjusted_probs = self.adj_probs_contract(RoutingStack((_p, _qt), dim=-1))
+            attn_top = self.sparse_mix(adjusted_probs, idx, v)
+            mean_v = self.mean_v(v)
+            tail_contrib = self.scale_mean_v_by_tail(mean_v, q_tail)
+            _a, _t = RoutingBroadcastTensors(attn_top, tail_contrib)
+            attn = self.attn_tail_sum(RoutingStack((_a, _t), dim=-1))
+        else:
+            scores = self.dot(q, k)
+            attn = scores.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            if self.allow_matmul:
+                attn = self.matmul(attn, v)
+            else:
+                _, _, nq, nk = attn.shape
+                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
+                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
+        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
+        attn = self.proj(attn)
+        attn = self.proj_drop(attn)
+        return attn
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(models, "DeiTTinySurgeryModel"))
         self.assertEqual(get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
         self.assertTrue(hasattr(ops, "AffineContract"))
+        self.assertTrue(hasattr(ops, "SurgeryAttention"))
+        self.assertFalse(hasattr(ops, "RoutingMax"))
         self.assertEqual(pet.PET_NUM_CLASSES, 37)
         self.assertTrue(hasattr(util, "traceable_artifact_path"))
         self.assertTrue(hasattr(surgery, "surgery"))
@@ -59,7 +61,8 @@ class PackageSmokeTests(unittest.TestCase):
         for path in glob.glob(str(ROOT / "configs/pretrain/*.json")):
             PretrainPetConfig.load(path)
         for path in glob.glob(str(ROOT / "configs/surgery/*.json")):
-            SurgeryConfig.load(path)
+            cfg = SurgeryConfig.load(path)
+            self.assertGreaterEqual(cfg.gibbs_tail_calibration_batches, 1)
         for path in glob.glob(str(ROOT / "configs/distill/*.json")):
             cfg = JeffreysDistillConfig.load(path)
             self.assertEqual(cfg.base_seed, 42)
@@ -71,6 +74,40 @@ class PackageSmokeTests(unittest.TestCase):
         for path in glob.glob(str(ROOT / "configs/**/*.json"), recursive=True):
             with open(path, encoding="utf-8") as f:
                 self.assertNotIn(forbidden_metadata_field, json.load(f), path)
+
+    def test_gibbs_tail_calibration_helpers(self) -> None:
+        import torch
+
+        from transformer_surgery.models.adapters import sample_topk_scores, topk_tail_mass_stats
+
+        scores = torch.arange(4 * 7, dtype=torch.float32).reshape(4, 7)
+        teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k=3, max_rows=2)
+        self.assertEqual(tuple(teacher.shape), (2, 7))
+        self.assertEqual(tuple(vals.shape), (2, 3))
+        stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
+        self.assertEqual(stats["count"], 2)
+        self.assertGreaterEqual(stats["mean"], 0.0)
+
+    def test_gibbs_topk_stabilizes_from_ordered_topk(self) -> None:
+        import torch
+
+        from transformer_surgery.ops import GibbsTopKSoftmax
+
+        scores = torch.tensor([[[[1.0, 5.0, 3.0, -2.0, 4.0]]]])
+        gibbs = GibbsTopKSoftmax(
+            seq_len=5,
+            top_k=3,
+            eps=1e-6,
+            gibbs_tail_prob_eps=0.0,
+            allow_matmul=False,
+        )
+        probs, idx, q_tail = gibbs(scores)
+        raw_vals, expected_idx = torch.topk(scores, k=3, dim=-1, largest=True, sorted=True)
+        stable = raw_vals - raw_vals[..., :1]
+        expected = torch.exp(stable) / (torch.exp(stable).sum(dim=-1, keepdim=True) + 1e-6)
+        self.assertTrue(torch.equal(idx, expected_idx))
+        self.assertTrue(torch.allclose(probs, expected, atol=1e-6))
+        self.assertTrue(torch.equal(q_tail, torch.zeros_like(q_tail)))
 
     def test_traceable_artifact_names(self) -> None:
         from transformer_surgery.util import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
@@ -184,11 +221,15 @@ class PackageSmokeTests(unittest.TestCase):
         import torch.nn.functional as F
 
         from transformer_surgery.models import DeiTTinySurgeryModel
+        from transformer_surgery.models import adapters
+        from transformer_surgery.models import deit_tiny
         from transformer_surgery.models.adapters import get_model_adapter
+        from transformer_surgery.ops import SurgeryAttention
 
         model = DeiTTinySurgeryModel(num_classes=37).cpu()
         self.assertEqual(model.num_classes, 37)
         self.assertEqual(model.seq_len, 197)
+        self.assertIsInstance(model.blocks[0].attn, SurgeryAttention)
         self.assertEqual(sum(p.numel() for p in model.blocks[0].mlp.act.parameters()), 0)
         x = torch.linspace(-3.0, 3.0, 9)
         self.assertTrue(torch.equal(model.blocks[0].mlp.act(x), F.gelu(x)))
@@ -198,6 +239,14 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(model.blocks[0].attn.gibbs, "scale_top_probs_by_tail"))
 
         adapter = get_model_adapter("deit_tiny_pet")
+        for helper_name in ("_attention_scores", "_sample_topk_scores", "_topk_tail_mass_stats"):
+            self.assertFalse(hasattr(adapter, helper_name), helper_name)
+        self.assertTrue(hasattr(adapters, "sample_topk_scores"))
+        self.assertTrue(hasattr(adapters, "topk_tail_mass_stats"))
+        self.assertTrue(hasattr(adapters, "apply_gibbs_tail_calibration"))
+        self.assertTrue(hasattr(deit_tiny, "calibrate_timm_deit_reference"))
+        self.assertTrue(hasattr(deit_tiny, "timm_attention_scores"))
+
         disabled_calibration = DeiTTinySurgeryModel(
             num_classes=37,
             depth=1,

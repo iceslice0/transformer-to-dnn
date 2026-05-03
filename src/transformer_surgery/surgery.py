@@ -29,7 +29,12 @@ def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
     by_block = cal.get("gibbs_tail_prob_eps_calibrated_by_block")
     if isinstance(by_block, list) and by_block:
         values = ", ".join(f"{float(v):.6g}" for v in by_block)
-        print(f"Calibrated gibbs_tail_prob_eps by block: [{values}]", flush=True)
+        batches = cal.get("gibbs_tail_calibration_batches")
+        rows = cal.get("gibbs_tail_prob_eps_calibration_rows_by_block")
+        suffix = f" over {int(batches)} batch(es)" if batches is not None else ""
+        if isinstance(rows, list) and rows:
+            suffix += f"; rows/block min={min(int(r) for r in rows)} max={max(int(r) for r in rows)}"
+        print(f"Calibrated gibbs_tail_prob_eps by block{suffix}: [{values}]", flush=True)
     elif cal.get("disable_calib_gibbs_tail_prob"):
         print(
             f"gibbs_tail_prob_eps calibration disabled; using configured value {configured:.6g}",

@@ -4,28 +4,30 @@ DeiT-Tiny rewritten in the pseudo-hardware basis: explicit affine + nonlinear un
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformer_surgery.models.adapters import (
+    add_sparse_topk_jeffreys_stats,
+    sample_topk_scores,
+    topk_tail_mass_stats,
+)
 from transformer_surgery.ops import (
     AffineContract,
-    AffineMatMul,
     GibbsTopKSoftmax,
     NLGELU,
-    PairwiseDotBySquare,
     RewrittenLayerNorm,
     RoutingBroadcastTensors,
     RoutingCat,
     RoutingDropPath,
-    RoutingExpand,
     RoutingStack,
-    RoutingTranspose,
-    RoutingUnsqueeze,
-    SparseWeightedSumBySquare,
+    SurgeryAttention,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
 )
+from transformer_surgery.util import get_device
 
 
 class PatchEmbed(nn.Module):
@@ -39,81 +41,6 @@ class PatchEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         return x.flatten(2).transpose(1, 2)
-
-
-class SurgeryAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        seq_len: int,
-        top_k: int,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        use_attention_surgery: bool = True,
-        use_surgery_softmax: bool = True,
-        allow_matmul: bool = False,
-        eps_ln: float = 1e-5,
-        gibbs_tail_prob_eps: float = 1e-5,
-    ) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.use_attention_surgery = use_attention_surgery
-        self.use_surgery_softmax = use_surgery_softmax
-        self.allow_matmul = allow_matmul
-        if use_attention_surgery and not use_surgery_softmax and allow_matmul:
-            self.matmul = AffineMatMul()
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
-            if use_surgery_softmax:
-                self.gibbs = GibbsTopKSoftmax(
-                    seq_len,
-                    top_k,
-                    eps=eps_ln,
-                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
-                    allow_matmul=allow_matmul,
-                )
-                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
-            else:
-                self.attn_drop = nn.Dropout(attn_drop)
-        else:
-            self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
-            self.attn_drop = nn.Dropout(attn_drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, n, c = x.shape
-        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        if not self.use_attention_surgery:
-            s = self.attn_scale.to(device=q.device, dtype=q.dtype)
-            qs = q * s
-            kt = RoutingTranspose(k, -2, -1)
-            attn = qs @ kt
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            attn = attn @ v
-        elif self.use_surgery_softmax:
-            scores = self.dot(q, k)
-            probs, idx, _q_tail = self.gibbs(scores)
-            attn = self.sparse_mix(probs, idx, v)
-        else:
-            scores = self.dot(q, k)
-            attn = scores.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            if self.allow_matmul:
-                attn = self.matmul(attn, v)
-            else:
-                _, _, nq, nk = attn.shape
-                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
-                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
-        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
-        attn = self.proj(attn)
-        attn = self.proj_drop(attn)
-        return attn
 
 
 class SurgeryMlp(nn.Module):
@@ -356,3 +283,158 @@ def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
                 m.log_z.eps.requires_grad = False
             if hasattr(m, "inv_z"):
                 m.inv_z.eps.requires_grad = False
+
+
+def timm_attention_scores(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    b, n, c = x.shape
+    head_dim = c // int(attn.num_heads)
+    qkv = attn.qkv(x).reshape(b, n, 3, attn.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+    q, k = qkv[0], qkv[1]
+    return (q @ k.transpose(-2, -1)) * float(attn.scale)
+
+
+@torch.no_grad()
+def calibrate_timm_deit_reference(reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+    device = get_device()
+    dt = get_surgery_dtype()
+    reference.eval()
+    stats: Dict[str, Any] = {}
+    eps = float(cfg.eps)
+    gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
+    disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
+    calibration_batches = max(1, int(getattr(cfg, "gibbs_tail_calibration_batches", 1)))
+    top_k = int(cfg.top_k)
+    use_cuda = device.type == "cuda"
+    mse_acc = 0.0
+    n_ln = 0
+    tail_eps_sum_by_block = []
+    tail_eps_count_by_block = []
+    tail_eps_min_by_block = []
+    tail_eps_max_by_block = []
+    block0_teachers = []
+    block0_vals_list = []
+    block0_idx_list = []
+    block0_nk = 0
+    block0_k_top = 0
+    processed_batches = 0
+
+    for batch_idx, (batch, _) in enumerate(loader):
+        if batch_idx >= calibration_batches:
+            break
+        processed_batches += 1
+        batch = batch.to(device, dtype=dt, non_blocking=use_cuda)
+
+        b = batch.shape[0]
+        x = reference.patch_embed(batch)
+        x = torch.cat((reference.cls_token.expand(b, -1, -1), x), dim=1) + reference.pos_embed
+        x = reference.pos_drop(x)
+        if batch_idx == 0:
+            y_ref0 = reference.blocks[0].norm1(x)
+            rw0 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                device=device, dtype=dt
+            )
+            copy_ln_params_to_rewritten(rw0, reference.blocks[0].norm1)
+            y_rw0 = rw0(x)
+            stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
+
+        h = x
+        for block_idx, blk in enumerate(reference.blocks):
+            n1 = blk.norm1(h)
+            rw = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                device=device, dtype=dt
+            )
+            copy_ln_params_to_rewritten(rw, blk.norm1)
+            mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
+            n_ln += 1
+            if block_idx == 0 or not disable_tail_calib:
+                scores = timm_attention_scores(blk.attn, n1)
+                teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k)
+                if not disable_tail_calib:
+                    tail_stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
+                    count = int(tail_stats["count"])
+                    while len(tail_eps_sum_by_block) <= block_idx:
+                        tail_eps_sum_by_block.append(0.0)
+                        tail_eps_count_by_block.append(0)
+                        tail_eps_min_by_block.append(float("inf"))
+                        tail_eps_max_by_block.append(float("-inf"))
+                    tail_eps_sum_by_block[block_idx] += float(tail_stats["mean"]) * count
+                    tail_eps_count_by_block[block_idx] += count
+                    tail_eps_min_by_block[block_idx] = min(tail_eps_min_by_block[block_idx], float(tail_stats["min"]))
+                    tail_eps_max_by_block[block_idx] = max(tail_eps_max_by_block[block_idx], float(tail_stats["max"]))
+                if block_idx == 0:
+                    block0_teachers.append(teacher)
+                    block0_vals_list.append(vals)
+                    block0_idx_list.append(idx)
+                    block0_nk = nk
+                    block0_k_top = k_top
+            h = h + blk.attn(n1)
+            n2 = blk.norm2(h)
+            rw2 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                device=device, dtype=dt
+            )
+            copy_ln_params_to_rewritten(rw2, blk.norm2)
+            mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
+            n_ln += 1
+            h = h + blk.mlp(n2)
+        h_pre = h
+        h_out = reference.norm(h_pre)
+        rwf = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+            device=device, dtype=dt
+        )
+        copy_ln_params_to_rewritten(rwf, reference.norm)
+        mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
+        n_ln += 1
+
+    if processed_batches == 0:
+        raise ValueError("gibbs tail calibration requires at least one validation batch")
+    stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
+
+    stats["disable_calib_gibbs_tail_prob"] = disable_tail_calib
+    stats["gibbs_tail_calibration_batches_requested"] = calibration_batches
+    stats["gibbs_tail_calibration_batches"] = processed_batches
+    stats["gibbs_tail_prob_eps_configured"] = gibbs_tail_prob_eps
+    if disable_tail_calib:
+        metric_tail_prob_eps = gibbs_tail_prob_eps
+    else:
+        tail_eps_by_block = [
+            tail_sum / max(tail_count, 1)
+            for tail_sum, tail_count in zip(tail_eps_sum_by_block, tail_eps_count_by_block)
+        ]
+        stats["gibbs_tail_prob_eps_calibrated_by_block"] = tail_eps_by_block
+        stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
+        stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
+        stats["gibbs_tail_prob_eps_calibration_rows_by_block"] = tail_eps_count_by_block
+        stats["gibbs_tail_prob_eps_calibrated_mean"] = float(sum(tail_eps_by_block) / max(len(tail_eps_by_block), 1))
+        metric_tail_prob_eps = tail_eps_by_block[0] if tail_eps_by_block else gibbs_tail_prob_eps
+    stats["gibbs_tail_prob_eps_metric"] = float(metric_tail_prob_eps)
+
+    if not block0_teachers or not block0_vals_list or not block0_idx_list:
+        return stats
+    block0_teacher = torch.cat(block0_teachers, dim=0)
+    block0_vals = torch.cat(block0_vals_list, dim=0)
+    block0_idx = torch.cat(block0_idx_list, dim=0)
+    add_sparse_topk_jeffreys_stats(
+        stats,
+        block0_teacher,
+        block0_vals,
+        block0_idx,
+        block0_nk,
+        block0_k_top,
+        gibbs_tail_prob_eps=metric_tail_prob_eps,
+        prefix="cached",
+    )
+
+    teacher2 = torch.randn(4096, block0_nk, device=device, dtype=dt)
+    t2 = teacher2 - teacher2.max(dim=-1, keepdim=True).values
+    vals2, idx2 = torch.topk(t2, k=block0_k_top, dim=-1, largest=True, sorted=True)
+    add_sparse_topk_jeffreys_stats(
+        stats,
+        teacher2,
+        vals2,
+        idx2,
+        block0_nk,
+        block0_k_top,
+        gibbs_tail_prob_eps=metric_tail_prob_eps,
+        prefix="synthetic",
+    )
+    return stats
