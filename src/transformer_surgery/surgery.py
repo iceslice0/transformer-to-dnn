@@ -9,8 +9,9 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch.nn as nn
 
 from transformer_surgery.models.adapters import get_model_adapter
-from transformer_surgery.ops import get_surgery_dtype, write_model_structure_txt
-from transformer_surgery.util import (
+from transformer_surgery.internal.reporting import write_model_structure_txt
+from transformer_surgery.internal.runtime import get_surgery_dtype
+from transformer_surgery.internal.util import (
     accuracy_and_loss,
     describe_device,
     describe_dtype,

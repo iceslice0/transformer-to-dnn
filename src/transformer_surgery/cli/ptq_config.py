@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
-from transformer_surgery.util import DEFAULT_MODEL_KEY
+from transformer_surgery.internal.util import DEFAULT_MODEL_KEY
 
 
 @dataclass

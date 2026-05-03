@@ -16,8 +16,13 @@ transformer should look like a DNN over a compact primitive vocabulary that can 
 dedicated NPU hardware, instead of depending on a heterogeneous CPU/NPU or GPU implementation with
 special-purpose floating-point kernels.
 
-The core code lives in [src/transformer_surgery/ptq.py](../src/transformer_surgery/ptq.py). The CLI
-wrapper is `python -m transformer_surgery.cli.ptq` or `ts-ptq`.
+The procedural runner lives in [src/transformer_surgery/ptq.py](../src/transformer_surgery/ptq.py).
+The explicit forward wrapper lives in [src/transformer_surgery/ops.py](../src/transformer_surgery/ops.py)
+as `CalibratedAffinePTQWrapper`. It owns a `PTQInputQuantizer` and reuses the module being wrapped
+as its `accumulator` submodule (`nn.Linear`, `nn.Conv2d`, `AffineMatMul`, `AffineHadamard`, and so
+on), so the PTQ checkpoint structure stays human-readable. Calibration stats, wrapper construction, and reload metadata live
+in [src/transformer_surgery/internal/ptq_calibration.py](../src/transformer_surgery/internal/ptq_calibration.py). The
+CLI wrapper is `python -m transformer_surgery.cli.ptq` or `ts-ptq`.
 
 ## Inputs
 
@@ -92,8 +97,8 @@ Weights use the same signed symmetric estimator. For `Linear` and `Conv2d`,
 `per_output_channel=false`, one global scale is used. Affine coefficient tensors always use one
 global scale. `AffineMatMul` and `AffineHadamard` have no stored weight tensor.
 
-The wrapper forward path quantizes inputs with proxy integer tensors, runs the selected affine or
-matmul accumulator, then dequantizes back to the incoming float dtype.
+The wrapper forward path quantizes inputs with proxy integer tensors, runs its explicit accumulator
+submodule, then dequantizes back to the incoming float dtype.
 
 ## Dequant Fit
 
@@ -122,7 +127,7 @@ channel mean as the output.
 
 The CLI writes traceable artifacts based on the active config name:
 
-- `artifacts/checkpoints/ts_ptq_<config>.pt`: PTQ checkpoint (same basename stem as configs’ `output` intent).
+- `artifacts/checkpoints/ts_ptq_<config>.pt`: PTQ checkpoint (same basename stem as config `output` intent).
 - `artifacts/metadata/ts_ptq_<config>.json`: metadata path derived from the checkpoint basename.
 - `artifacts/logs/ts_ptq_<config>_model_after_ptq.txt`: model structure log.
 

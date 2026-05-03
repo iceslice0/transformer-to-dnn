@@ -24,14 +24,18 @@ from transformer_surgery.ops import (
     RoutingDropPath,
     RoutingStack,
     SurgeryAttention,
-    copy_ln_params_to_rewritten,
-    get_surgery_dtype,
-    maybe_surgery_cuda_autocast,
 )
-from transformer_surgery.util import ensure_mapping, get_device
+from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
+from transformer_surgery.internal.util import ensure_mapping, get_device
 
 if TYPE_CHECKING:
     from transformer_surgery.cli.surgery_config import SurgeryConfig
+
+
+def copy_ln_params_to_rewritten(dst: RewrittenLayerNorm, src: nn.LayerNorm) -> None:
+    with torch.no_grad():
+        dst.affine.weight.copy_(torch.nan_to_num(src.weight.detach(), nan=1.0, posinf=1.0, neginf=1.0))
+        dst.affine.bias.copy_(torch.nan_to_num(src.bias.detach(), nan=0.0, posinf=0.0, neginf=0.0))
 
 
 class PatchEmbed(nn.Module):

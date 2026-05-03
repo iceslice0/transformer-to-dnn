@@ -117,9 +117,13 @@ class PackageSmokeTests(unittest.TestCase):
         import torch.nn as nn
         from types import SimpleNamespace
 
+        from transformer_surgery.internal.ptq_calibration import (
+            build_ptq_wrapper,
+            build_ptq_node_setup,
+            make_ptq_wrapper,
+            ptq_wrapper_from_reload_config,
+        )
         from transformer_surgery.ptq import (
-            CalibratedAffinePTQWrapper,
-            _build_quant_setup,
             _sample_calibration_batch_indices,
             gather_ptq_dequant_moments,
             gather_ptq_range_moments,
@@ -141,10 +145,7 @@ class PackageSmokeTests(unittest.TestCase):
         loader = [(torch.full((4, 3), float(i)), torch.zeros(4, dtype=torch.long)) for i in range(5)]
         stats = gather_ptq_range_moments(model, loader, selected, batch_indices)
         data = stats["0"]
-        self.assertEqual(data.batch_indices, [1, 3])
         self.assertEqual(data.examples_by_batch, {1: 4, 3: 4})
-        self.assertEqual(data.stored_examples, 8)
-        self.assertEqual(data.range_calls, 2)
         self.assertGreaterEqual(data.input_max_abs[0].item(), 3.0)
 
         cfg = SimpleNamespace(
@@ -155,7 +156,16 @@ class PackageSmokeTests(unittest.TestCase):
             per_output_channel=True,
             dequant_var_eps=1e-8,
         )
-        setup = _build_quant_setup("0", model[0], data, cfg)
+        setup = build_ptq_node_setup(
+            "0",
+            model[0],
+            data,
+            weight_bits=cfg.weight_bits,
+            activation_bits=cfg.activation_bits,
+            affine_activation_bits=cfg.affine_activation_bits,
+            matmul_activation_bits=cfg.matmul_activation_bits,
+            per_output_channel=cfg.per_output_channel,
+        )
         gather_ptq_dequant_moments(
             model,
             loader,
@@ -166,11 +176,16 @@ class PackageSmokeTests(unittest.TestCase):
         )
         self.assertEqual(data.dequant_examples_by_batch, {1: 4, 3: 4})
         self.assertGreater(data.bias_fit.count, 0)
-        wrapper = CalibratedAffinePTQWrapper(setup, data, cfg)
-        self.assertEqual(wrapper.input_arity, 1)
+        wrapper = make_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
+        self.assertEqual(wrapper.quantizer.input_scale.numel(), 1)
+        self.assertIsInstance(wrapper.accumulator, nn.Linear)
+        built = build_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
+        skeleton = ptq_wrapper_from_reload_config(built.reload_config, nn.Linear(3, 2, bias=False))
+        skeleton.load_state_dict(built.module.state_dict(), strict=True)
+        self.assertEqual(tuple(skeleton(torch.ones(2, 3)).shape), (2, 2))
 
     def test_traceable_artifact_names(self) -> None:
-        from transformer_surgery.util import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
+        from transformer_surgery.internal.util import metadata_path_for_checkpoint, traceable_artifact_path, traceable_log_path
 
         pretrain_cfg = ROOT / "configs/pretrain/pet_deit_tiny.json"
         surgery_cfg = ROOT / "configs/surgery/topk64_fast.json"

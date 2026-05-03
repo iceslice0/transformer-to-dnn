@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
-from transformer_surgery.util import accuracy_and_loss, get_device, warmup_cosine_scheduler
+from transformer_surgery.internal.util import accuracy_and_loss, get_device, warmup_cosine_scheduler
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)

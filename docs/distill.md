@@ -48,9 +48,9 @@ Trainable:
 
 Not trainable:
 
-- ``AffineContract`` and ``AffineFixedMix`` coefficients — registered as buffers (``coeff``,
+- ``AffineContract`` and ``AffineFixedMix`` coefficients - registered as buffers (``coeff``,
   ``weight``), so they never enter ``parameters()``.
-- fixed ``eps`` floors in ``NLLogPlusEps``/``NLRsqrtPlusEps``/``NLReciprocalPlusEps`` — registered
+- fixed ``eps`` floors in ``NLLogPlusEps``/``NLRsqrtPlusEps``/``NLReciprocalPlusEps`` - registered
   as buffers.
 - teacher parameters (``requires_grad`` is set to ``False`` before training).
 

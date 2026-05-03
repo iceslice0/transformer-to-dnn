@@ -15,13 +15,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
-from transformer_surgery.ops import (
-    CALIBRATION_LEGEND_TEXT,
-    get_surgery_dtype,
-    jeffreys_divergence_dense,
-    maybe_surgery_cuda_autocast,
-)
-from transformer_surgery.util import (
+from transformer_surgery.internal.metrics import jeffreys_divergence_dense
+from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT
+from transformer_surgery.internal.runtime import get_surgery_dtype, maybe_surgery_cuda_autocast
+from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
     describe_device,
     describe_dtype,

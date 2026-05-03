@@ -1,45 +1,21 @@
-"""
-Discovery, calibration, replacement helpers, validation metrics, and checkpoint export
-for the DeiT-Tiny pseudo-hardware surgery graph.
-"""
+"""Forward op vocabulary for the surgery graph."""
 
 from __future__ import annotations
 
 import math
-import os
-from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath as _TimmDropPath
 
-# Process-wide dtype for surgery tensor literals and ``.to(dtype=...)`` (set via ``apply_dtype_from_config``).
-_SURGERY_DTYPE: torch.dtype = torch.bfloat16
-
-
-def get_surgery_dtype() -> torch.dtype:
-    """Current surgery compute dtype (default ``bfloat16``; set with :func:`set_surgery_dtype`)."""
-    return _SURGERY_DTYPE
-
-
-def set_surgery_dtype(dt: torch.dtype) -> None:
-    """Set global surgery dtype (mirrors the process device pattern in ``transformer_surgery.util``)."""
-    global _SURGERY_DTYPE
-    _SURGERY_DTYPE = dt
-
-
-def maybe_surgery_cuda_autocast(device: torch.device, dt: torch.dtype):
-    """CUDA autocast for fp16/bf16 forwards — matches distill eval and mixed-precision training."""
-    if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
-        return torch.autocast(device_type="cuda", dtype=dt)
-    return nullcontext()
+from transformer_surgery.internal.runtime import get_surgery_dtype
 
 
 # ---------------------------------------------------------------------------
 # Routing vocabulary: aliases to torch / F / nn ops that carry no parameters and do no
-# arithmetic — pure tensor wiring and discrete selection. Defined here, before the op classes,
+# arithmetic - pure tensor wiring and discrete selection. Defined here, before the op classes,
 # so internal call sites in this module use ``Routing*`` names rather than ``torch.*``/``F.*``
 # directly. External callers may import them to make the routing surface explicit.
 # ---------------------------------------------------------------------------
@@ -70,12 +46,12 @@ def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------
 # Op vocabulary: three groups.
-#   Affine*  — linear in each operand: parameterized layers, fixed-coeff einsum, per-channel
+#   Affine*  - linear in each operand: parameterized layers, fixed-coeff einsum, per-channel
 #              scale+bias, fixed 2x2 mixes, linear unary reductions/scalings, and the variable
 #              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul.
-#   NL*      — strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
+#   NL*      - strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
 #              reciprocal+eps, GELU).
-#   Routing* — pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
+#   Routing* - pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
 #              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, Dropout/DropPath); see the
 #              ``Routing*`` aliases above.
 # ---------------------------------------------------------------------------
@@ -136,7 +112,7 @@ class NLLogPlusEps(nn.Module):
 
 
 class NLSquare(nn.Module):
-    """Unary square ``x * x`` (e.g. variance and (a+b)²−(a−b)² identities)."""
+    """Unary square ``x * x``."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * x
@@ -186,7 +162,7 @@ class NLExp(nn.Module):
 
 
 class NLSqrtExp(nn.Module):
-    """``sqrt(exp(x))`` — use in strict LN as ``SqrtExp(2·log|u| - log(r2))`` instead of ``exp(x - ½·y)``."""
+    """``sqrt(exp(x))``."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(torch.exp(x))
@@ -194,8 +170,8 @@ class NLSqrtExp(nn.Module):
 
 class AffineFixedMix(nn.Module):
     """
-    Fixed 2×2 linear mix on the operand channel:
-    ``y[...,p,:] = Σ_q M[p,q] * x[...,q,:]`` via ``torch.einsum`` (default ``M`` builds plus/minus).
+    Fixed 2x2 linear mix on the operand channel:
+    ``y[...,p,:] = sum_q M[p,q] * x[...,q,:]`` via ``torch.einsum``.
     Exposed as a submodule so surgery graphs list an explicit affine node, like LN submodules.
     """
 
@@ -217,8 +193,7 @@ class AffineFixedMix(nn.Module):
 
 class AffineContract(nn.Module):
     """
-    Contract operand / head dims with a fixed coefficient vector (e.g. ``(w,−w)`` for scaled
-    ``plus²−minus²``). One graph node for the output affine of the square-identity chain.
+    Contract operand / head dims with a fixed coefficient vector.
     """
 
     def __init__(self, einsum_equation: str, coeffs: torch.Tensor) -> None:
@@ -233,11 +208,11 @@ class AffineContract(nn.Module):
 
 class SquareIdentityOperandChain(nn.Module):
     """
-    ``((a+b)²-(a-b)²)/4`` implemented as ``torch.stack((a,b), dim=-2)`` (operand layout only) →
-    fixed 2×2 mix → :class:`NLSquare` → coeff contraction. :class:`PairwiseDotBySquare` and
+    ``((a+b)^2-(a-b)^2)/4`` as operand stack, fixed 2x2 mix, square, coeff contraction.
+    :class:`PairwiseDotBySquare` and
     :class:`SparseWeightedSumBySquare` share this chain; they differ only in how ``a`` and ``b`` are
     formed (QK broadcast vs gathered ``p``/``v``) and in the ``einsum`` equations / coefficient
-    vector (attention includes ``1/√d``, value mix does not).
+    vector (attention includes ``1/sqrt(d)``, value mix does not).
     """
 
     def __init__(
@@ -274,7 +249,7 @@ class AffineMean(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: relu± stack + affine reductions + NLSqrtExp
+# LayerNorm rewrite: relu+/- stack + affine reductions + NLSqrtExp
 # ---------------------------------------------------------------------------
 
 
@@ -284,8 +259,8 @@ class RewrittenLayerNorm(nn.Module):
 
     **``allow_matmul=False`` (default, strict):** ``au = stack(relu(u),relu(-u))`` (dim ``-2``);
     ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
-    ``t = AffineContract([2,-1])(stack(log_num, log_den))`` (= ``2·log_num - log_den``);
-    ``a_mag = NLSqrtExp(t)`` (= ``sqrt(exp(t))``, same value as ``exp(log_num - ½·log_den)``);
+    ``t = AffineContract([2,-1])(stack(log_num, log_den))``.
+    ``a_mag = NLSqrtExp(t)``.
     ``z = out_contract(a_mag)``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
@@ -334,18 +309,6 @@ class RewrittenLayerNorm(nn.Module):
         return self.affine(z)
 
 
-def copy_ln_params_to_rewritten(dst: RewrittenLayerNorm, src: nn.LayerNorm) -> None:
-    """
-    Copy ``gamma``/``beta`` from a timm ``LayerNorm`` into :class:`RewrittenLayerNorm`.
-
-    **Does not** copy ``src.eps`` into ``dst``: ``dst.log_eps.eps`` is fixed at construction from
-    ``eps_ln`` (run config). Weight and bias are copied from the reference checkpoint.
-    """
-    with torch.no_grad():
-        dst.affine.weight.copy_(torch.nan_to_num(src.weight.detach(), nan=1.0, posinf=1.0, neginf=1.0))
-        dst.affine.bias.copy_(torch.nan_to_num(src.bias.detach(), nan=0.0, posinf=0.0, neginf=0.0))
-
-
 # ---------------------------------------------------------------------------
 # Pairwise dot via square identity
 # ---------------------------------------------------------------------------
@@ -356,10 +319,9 @@ class PairwiseDotBySquare(nn.Module):
     scores[b,h,i,j] = (1/sqrt(d)) * sum_l q[b,h,i,l] * k[b,h,j,l]
 
     **Strict form (default):** uses :class:`SquareIdentityOperandChain` with
-    mix ``pq,...qd→...pd``, contract ``p,...pd→...``, coeffs ``±1/(4√d)``. Operands ``a,b`` are the
-    broadcast Q/K grid. **No** ``torch.matmul`` for QKᵀ.
+    mix ``pq,...qd->...pd``, contract ``p,...pd->...``. Operands are the broadcast Q/K grid.
 
-    Optional ``allow_matmul=True`` replaces this with fused ``(q/sqrt(d)) @ kᵀ`` for
+    Optional ``allow_matmul=True`` replaces this with fused ``(q/sqrt(d)) @ k.T`` for
     speed / debugging only; that path **does** use matrix multiply and is not valid for the
     strict surgery demonstration.
     """
@@ -499,8 +461,8 @@ class SparseWeightedSumBySquare(nn.Module):
     """
     y[b,h,nq,d] = sum_{k in top} p[b,h,nq,k] * v[b,h, idx[b,h,nq,k], d]
 
-    **Strict form (default):** uses :class:`SquareIdentityOperandChain` with mix ``pq,...kqd→...kpd``,
-    contract ``p,...kpd→...d``, coeffs ``(¼,−¼)``. Operands ``a,b`` are expanded prob and gathered
+    **Strict form (default):** uses :class:`SquareIdentityOperandChain` with mix ``pq,...kqd->...kpd``,
+    contract ``p,...kpd->...d``. Operands are expanded prob and gathered
     value per top-k slot. No dense ``matmul`` for attention-value mixing.
 
     ``allow_matmul=True`` uses ``p * v`` then sum (faster; invalid for strict demo).
@@ -658,214 +620,69 @@ class NLGELU(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Metrics: Jeffreys, KL, LN MSE
+# PTQ forward wrapper
 # ---------------------------------------------------------------------------
 
 
-def _jeffreys_metric_eps(dt: torch.dtype) -> Tuple[float, float]:
-    """``(kl_clamp, denom_add)`` for Jeffreys helpers: scalars must survive ``dt`` (fp16 cannot hold 1e-30)."""
-    f = torch.finfo(dt)
-    smn = float(f.smallest_normal)
-    sms = float(getattr(f, "smallest_subnormal", smn))
-    return (max(1e-12, sms), max(1e-30, smn))
+def ptq_signed_qrange(bits: int) -> Tuple[int, int]:
+    qmax = (1 << (int(bits) - 1)) - 1
+    qmin = -(1 << (int(bits) - 1))
+    return qmin, qmax
 
 
-def _kl_safe(p: torch.Tensor, q: torch.Tensor, eps: Optional[float] = None) -> torch.Tensor:
-    if eps is None:
-        eps, _ = _jeffreys_metric_eps(p.dtype)
-    p = p.clamp_min(eps)
-    q = q.clamp_min(eps)
-    return (p * (p.log() - q.log())).sum(dim=-1)
+def ptq_quantize_proxy(x: torch.Tensor, scale: torch.Tensor, bits: int) -> torch.Tensor:
+    qmin, qmax = ptq_signed_qrange(bits)
+    s = scale.to(device=x.device, dtype=torch.float32)
+    return torch.clamp(torch.round(x.to(dtype=torch.float32) / s), qmin, qmax)
 
 
-def jeffreys_divergence_dense(
-    teacher_logits: torch.Tensor,
-    student_logits: torch.Tensor,
-    *,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    """
-    Symmetric Jeffreys J(p,q) = KL(p||q) + KL(q||p) for full softmax distributions.
-    ``p = softmax(teacher_logits / T)``, ``q = softmax(student_logits / T)``. Returns shape [B].
-    """
-    loss_dtype = torch.promote_types(teacher_logits.dtype, student_logits.dtype)
-    if loss_dtype in (torch.float16, torch.bfloat16):
-        loss_dtype = torch.float32
-    t = teacher_logits.to(dtype=loss_dtype) / temperature
-    s = student_logits.to(dtype=loss_dtype) / temperature
-    p = F.softmax(t, dim=-1)
-    q = F.softmax(s, dim=-1)
-    return _kl_safe(p, q) + _kl_safe(q, p)
+class PTQInputQuantizer(nn.Module):
+    def __init__(self, activation_bits: int, input_scale: torch.Tensor) -> None:
+        super().__init__()
+        self.activation_bits = int(activation_bits)
+        self._qmin, self._qmax = ptq_signed_qrange(self.activation_bits)
+        self.register_buffer("input_scale", input_scale.to(dtype=torch.float32))
+        self.register_buffer("input_inv_scale", input_scale.reciprocal().to(dtype=torch.float32))
 
-
-def jeffreys_distance_sparse_teacher(
-    teacher_logits: torch.Tensor,
-    vals: torch.Tensor,
-    idx: torch.Tensor,
-    nk: int,
-    k: int,
-    *,
-    gibbs_tail_prob_eps: float,
-) -> torch.Tensor:
-    """
-    teacher_logits: [R, nk]
-    vals: top-k stabilized logits (row-wise max subtracted) [R, k]
-    idx: [R, k]
-    Dense student q uses a fixed omitted-tail probability mass.
-    """
-    tail_prob = float(gibbs_tail_prob_eps)
-    if not 0.0 <= tail_prob < 1.0:
-        raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
-    t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
-    p = F.softmax(t, dim=-1)
-    _, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
-
-    exp_vals = torch.exp(vals)
-    q_dense = torch.zeros_like(p)
-    tail_mass = tail_prob if nk > k else 0.0
-    z_top = exp_vals.sum(dim=-1, keepdim=True)
-    q_on_I = (1.0 - tail_mass) * exp_vals / (z_top + denom_eps)
-    if nk > k:
-        q_dense = torch.full_like(p, tail_mass / float(nk - k))
-    q_dense.scatter_(1, idx, q_on_I)
-
-    j = _kl_safe(p, q_dense) + _kl_safe(q_dense, p)
-    return j
-
-
-def jeffreys_naive_topk(
-    teacher_logits: torch.Tensor,
-    vals: torch.Tensor,
-    idx: torch.Tensor,
-    nk: int,
-    k: int,
-) -> torch.Tensor:
-    """Naive: softmax renormalized only over the top-k logits; zeros elsewhere."""
-    t = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
-    p = F.softmax(t, dim=-1)
-    kl_eps, denom_eps = _jeffreys_metric_eps(teacher_logits.dtype)
-    exp_vals = torch.exp(vals)
-    z_sub = exp_vals.sum(dim=-1, keepdim=True)
-    q_sub = exp_vals / (z_sub + denom_eps)
-    q_dense = torch.zeros_like(p)
-    q_dense.scatter_(1, idx, q_sub)
-    j = _kl_safe(p, q_dense.clamp_min(kl_eps)) + _kl_safe(q_dense.clamp_min(kl_eps), p)
-    return j
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint + metadata
-# ---------------------------------------------------------------------------
-
-CALIBRATION_LEGEND_TEXT = (
-    "ref_val_acc / ref_val_loss: frozen timm teacher on val (mean CE). "
-    "student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val "
-    "after transform, before distill. "
-    "student_post_distill_*: after Jeffreys distillation (acc and mean CE / Jeffreys). "
-    "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
-    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
-)
-
-
-def _forward_output_shape_str(out: Any) -> str:
-    if torch.is_tensor(out):
-        return str(tuple(out.shape))
-    if isinstance(out, (tuple, list)):
-        return "(" + ", ".join(_forward_output_shape_str(x) for x in out) + ")"
-    return type(out).__name__
-
-
-def write_model_structure_txt(
-    path: str,
-    model: nn.Module,
-    title: str,
-    *,
-    example_input: Optional[torch.Tensor] = None,
-    default_input_shape: Tuple[int, ...] = (1, 3, 224, 224),
-    include_forward_shapes: bool = True,
-) -> None:
-    """
-    Write model repr, parameter counts, ``named_modules`` listing, and (by default) per-module
-    forward **output** tensor shapes from one ``eval`` pass with a dummy batch (for ``artifacts/logs`` dumps).
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    n_all = sum(p.numel() for p in model.parameters())
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    lines: List[str] = [
-        title,
-        "=" * min(80, max(len(title), 40)),
-        f"class: {type(model).__name__}",
-        f"parameters: total={n_all:,} trainable={n_train:,}",
-        "",
-        str(model),
-        "",
-        "--- named_modules (name: class) ---",
-        "",
-    ]
-    for name, mod in model.named_modules():
-        lines.append(f"{name if name else '<root>'}: {type(mod).__name__}")
-
-    if include_forward_shapes:
-        out_shapes: Dict[str, str] = {}
-        shape_err: Optional[str] = None
-        x_log: Optional[torch.Tensor] = None
-        try:
-            try:
-                device = next(model.parameters()).device
-                dtype = next(model.parameters()).dtype
-            except StopIteration:
-                device = torch.device("cpu")
-                dtype = get_surgery_dtype()
-            x = example_input
-            if x is None:
-                x = torch.zeros(default_input_shape, device=device, dtype=dtype)
-            else:
-                x = x.to(device=device, dtype=dtype)
-            x_log = x
-
-            hooks: List[Any] = []
-
-            def _make_hook(key: str):
-                def _hook(_mod: nn.Module, _inp: Any, out: Any) -> None:
-                    out_shapes[key] = _forward_output_shape_str(out)
-
-                return _hook
-
-            for name, mod in model.named_modules():
-                key = name if name else "<root>"
-                hooks.append(mod.register_forward_hook(_make_hook(key)))
-
-            was_training = model.training
-            model.eval()
-            with torch.no_grad():
-                model(x)
-            if was_training:
-                model.train()
-            for h in hooks:
-                h.remove()
-        except Exception as ex:
-            shape_err = repr(ex)
-
-        lines.extend(
-            [
-                "",
-                "--- forward output shapes (one eval batch; dummy input unless example_input set) ---",
-            ]
+    def forward(self, *inputs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return tuple(
+            torch.clamp(torch.round(x.float() * self.input_inv_scale[i]), self._qmin, self._qmax)
+            for i, x in enumerate(inputs)
         )
-        if shape_err is not None:
-            lines.append(f"(forward shape trace failed: {shape_err})")
-        elif x_log is not None:
-            lines.append(
-                f"example_input: {tuple(x_log.shape)}  dtype={x_log.dtype}  device={x_log.device}"
-            )
-            lines.append("")
-            for name, _mod in model.named_modules():
-                key = name if name else "<root>"
-                label = name if name else "<root>"
-                lines.append(f"{label}: {out_shapes.get(key, '—')}")
+
+
+class CalibratedAffinePTQWrapper(nn.Module):
+    """Forward-only PTQ proxy: quantize, accumulate, dequantize."""
+
+    def __init__(
+        self,
+        *,
+        activation_bits: int,
+        input_scale: torch.Tensor,
+        accumulator: nn.Module,
+        out_scale: torch.Tensor,
+        out_bias: torch.Tensor,
+        skip_out_scale: bool = False,
+        out_bcast_shape: Optional[Tuple[int, ...]] = None,
+        module_device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.activation_bits = int(activation_bits)
+        self.skip_out_scale = bool(skip_out_scale)
+        self.quantizer = PTQInputQuantizer(activation_bits, input_scale)
+        self.accumulator = accumulator
+        self.register_buffer("out_scale", out_scale.to(dtype=torch.float32))
+        self.register_buffer("out_bias", out_bias.to(dtype=torch.float32))
+        self.out_bcast_shape = out_bcast_shape
+
+        if module_device is not None:
+            self.to(device=module_device)
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        acc = self.accumulator(*self.quantizer(*inputs))
+        if self.out_bcast_shape is not None:
+            bias = self.out_bias.view(self.out_bcast_shape)
+            out = acc + bias if self.skip_out_scale else self.out_scale.view(self.out_bcast_shape) * acc + bias
         else:
-            lines.append("(no example batch; shapes skipped)")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
+            out = acc + self.out_bias if self.skip_out_scale else self.out_scale * acc + self.out_bias
+        return out.to(dtype=inputs[0].dtype)

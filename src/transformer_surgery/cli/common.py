@@ -10,8 +10,8 @@ from typing import Any, Dict, Optional, Sequence, Type, TypeVar, Union, get_args
 
 import torch
 
-from transformer_surgery.ops import set_surgery_dtype
-from transformer_surgery.util import set_default_device, torch_dtype_from_name
+from transformer_surgery.internal.runtime import set_surgery_dtype
+from transformer_surgery.internal.util import set_default_device, torch_dtype_from_name
 
 
 TConfig = TypeVar("TConfig")

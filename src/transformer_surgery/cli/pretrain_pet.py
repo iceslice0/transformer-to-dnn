@@ -22,7 +22,7 @@ from transformer_surgery.models.pet import (
     train_timm_deit_on_pet,
 )
 from transformer_surgery.cli.common import apply_device_from_config
-from transformer_surgery.util import (
+from transformer_surgery.internal.util import (
     accuracy_and_loss,
     describe_device,
     set_seed,
