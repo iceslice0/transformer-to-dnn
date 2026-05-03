@@ -21,7 +21,7 @@ class PTQSurgeryConfig:
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
     device: str = "cuda"
-    calibration_batches: int = 4
+    calibration_batches: Optional[int] = 4
     wrap_linear_conv: bool = True
     wrap_affine: bool = False
     wrap_matmul: bool = False
@@ -57,8 +57,8 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "fp_checkpoint": "Float checkpoint to wrap with PTQ modules.",
     "output": "PTQ checkpoint output path.",
     "calibration_batches": (
-        "Number of validation minibatches sampled at random for PTQ; each minibatch contributes all its examples "
-        "per wrapped node."
+        "Validation minibatches for PTQ (random subset when set); JSON null uses every val minibatch in order. "
+        "Each minibatch contributes all its examples per wrapped node."
     ),
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",

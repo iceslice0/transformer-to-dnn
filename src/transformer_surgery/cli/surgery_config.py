@@ -20,7 +20,7 @@ class SurgeryConfig:
     top_k: int = 32
     eps: float = 1e-5
     gibbs_tail_prob_eps: float = 1e-5
-    gibbs_tail_calibration_batches: int = 10
+    gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
     reference_checkpoint: Optional[str] = None
     device: str = "cuda"
@@ -45,7 +45,7 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "reference_checkpoint": "Reference/teacher checkpoint path.",
     "gibbs_tail_prob_eps": "Initial omitted-tail probability mass; calibration overwrites per-block values.",
-    "gibbs_tail_calibration_batches": "Validation batches used to estimate per-block Gibbs omitted-tail mass.",
+    "gibbs_tail_calibration_batches": "Validation batches for Gibbs tail mass; JSON null uses the full val loader.",
     "disable_calib_gibbs_tail_prob": "Disable calibration/application of per-block Gibbs omitted-tail probability.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",

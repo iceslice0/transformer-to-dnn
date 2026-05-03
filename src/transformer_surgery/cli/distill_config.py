@@ -37,7 +37,6 @@ class JeffreysDistillConfig:
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
     device: str = "cuda"
-    surgery_dtype: str = "bfloat16"
     train_progress_interval: int = 10
     top_k: Optional[int] = None
     eps: Optional[float] = None
@@ -54,7 +53,6 @@ FIELD_HELP_JEFFREYS: Dict[str, str] = {
     "distill_weight": "Mixing weight for teacher matching vs hard-label CE.",
     "base_seed": "Base random seed; run i uses base_seed + i.",
     "num_trainings": "Number of independent distillation trainings to run; only the best checkpoint is saved.",
-    "surgery_dtype": FIELD_HELP_SURGERY["surgery_dtype"],
 }
 
 CLI_JEFFREYS_DESCRIPTION = "Model-adapter CE + Jeffreys teacher matching"

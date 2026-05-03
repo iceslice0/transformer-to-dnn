@@ -62,13 +62,16 @@ class PackageSmokeTests(unittest.TestCase):
             PretrainPetConfig.load(path)
         for path in glob.glob(str(ROOT / "configs/surgery/*.json")):
             cfg = SurgeryConfig.load(path)
-            self.assertGreaterEqual(cfg.gibbs_tail_calibration_batches, 1)
+            lim = cfg.gibbs_tail_calibration_batches
+            self.assertTrue(lim is None or lim >= 1)
         for path in glob.glob(str(ROOT / "configs/distill/*.json")):
             cfg = JeffreysDistillConfig.load(path)
             self.assertEqual(cfg.base_seed, 42)
             self.assertGreaterEqual(cfg.num_trainings, 1)
         for path in glob.glob(str(ROOT / "configs/ptq/*.json")):
-            PTQSurgeryConfig.load(path)
+            cfg = PTQSurgeryConfig.load(path)
+            cb = cfg.calibration_batches
+            self.assertTrue(cb is None or cb >= 1)
         self.assertFalse(SurgeryConfig.load(str(ROOT / CLI_SURGERY_CONFIG_DEFAULT)).disable_calib_gibbs_tail_prob)
         forbidden_metadata_field = "_".join(("meta", "json"))
         for path in glob.glob(str(ROOT / "configs/**/*.json"), recursive=True):
@@ -129,6 +132,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(indices, expected)
         self.assertEqual(len(indices), 4)
         self.assertEqual(len(set(indices)), 4)
+        self.assertEqual(_sample_calibration_batch_indices(10, None), list(range(10)))
+        self.assertEqual(_sample_calibration_batch_indices(0, None), [])
 
         model = nn.Sequential(nn.Linear(3, 2, bias=False))
         selected = {"0": "linear"}

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -27,6 +28,13 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
     """Set global surgery dtype (mirrors the process device pattern in ``transformer_surgery.util``)."""
     global _SURGERY_DTYPE
     _SURGERY_DTYPE = dt
+
+
+def maybe_surgery_cuda_autocast(device: torch.device, dt: torch.dtype):
+    """CUDA autocast for fp16/bf16 forwards — matches distill eval and mixed-precision training."""
+    if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dt)
+    return nullcontext()
 
 
 # ---------------------------------------------------------------------------

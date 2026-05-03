@@ -44,6 +44,7 @@ from transformer_surgery.ops import (
     AffineScale,
     AffineScaleBias,
     get_surgery_dtype,
+    maybe_surgery_cuda_autocast,
     set_surgery_dtype,
     write_model_structure_txt,
 )
@@ -139,14 +140,16 @@ def _select_examples_by_index(t: torch.Tensor, idx: torch.Tensor) -> torch.Tenso
 
 def _sample_calibration_batch_indices(
     total_batches: int,
-    requested_batches: int,
+    requested_batches: Optional[int],
     *,
     generator: Optional[torch.Generator] = None,
 ) -> List[int]:
     total = int(total_batches)
-    requested = int(requested_batches)
     if total < 1:
         return []
+    if requested_batches is None:
+        return list(range(total))
+    requested = int(requested_batches)
     keep = min(total, requested)
     return sorted(torch.randperm(total, generator=generator)[:keep].tolist())
 
@@ -473,6 +476,7 @@ def _forward_ptq_calibration_batches(
     device = get_device()
     use_cuda = device.type == "cuda"
     input_dtype = _input_dtype(model)
+    dt_eval = get_surgery_dtype()
     last = max(batch_index_set)
     for bi, (x, _y) in enumerate(loader):
         if bi > last:
@@ -481,7 +485,8 @@ def _forward_ptq_calibration_batches(
             continue
         batch_ctx.idx = bi
         x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
-        model(x)
+        with maybe_surgery_cuda_autocast(device, dt_eval):
+            model(x)
 
 
 def gather_ptq_range_moments(
@@ -929,11 +934,13 @@ def validate_model(
     correct_t = torch.zeros((), device=device, dtype=torch.long)
     n = 0
     input_dtype = _input_dtype(model)
+    dt_eval = get_surgery_dtype()
 
     for _, (x, y) in enumerate(loader):
         x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
-        logits = model(x)
+        with maybe_surgery_cuda_autocast(device, dt_eval):
+            logits = model(x)
         loss_sum_t += criterion(logits.float(), y).double() * y.size(0)
         correct_t += (logits.argmax(dim=-1) == y).sum()
         n += y.size(0)
@@ -1021,7 +1028,7 @@ def _ptq_summary(
             "per_output_channel": bool(cfg.per_output_channel),
         },
         "calibration": {
-            "batches_requested": int(cfg.calibration_batches),
+            "batches_requested": cfg.calibration_batches,
             "batches_sampled": len(calibration_batch_indices),
             "batch_indices": [int(i) for i in calibration_batch_indices],
         },
@@ -1056,12 +1063,13 @@ def run_ptq(
     print(f"Using model adapter: {adapter.key}", flush=True)
     calibration_batch_indices = _sample_calibration_batch_indices(
         len(val_loader),
-        int(cfg.calibration_batches),
+        cfg.calibration_batches,
     )
     if not calibration_batch_indices:
         raise SystemExit("No validation batches available for PTQ calibration.")
+    req_disp = "all" if cfg.calibration_batches is None else str(int(cfg.calibration_batches))
     print(
-        f"PTQ calibration batches: requested={int(cfg.calibration_batches)} "
+        f"PTQ calibration batches: requested={req_disp} "
         f"sampled={len(calibration_batch_indices)} indices={calibration_batch_indices}",
         flush=True,
     )

@@ -7,7 +7,6 @@ import json
 import math
 import os
 import time
-from contextlib import nullcontext
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -16,7 +15,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
-from transformer_surgery.ops import CALIBRATION_LEGEND_TEXT, get_surgery_dtype, jeffreys_divergence_dense
+from transformer_surgery.ops import (
+    CALIBRATION_LEGEND_TEXT,
+    get_surgery_dtype,
+    jeffreys_divergence_dense,
+    maybe_surgery_cuda_autocast,
+)
 from transformer_surgery.util import (
     DEFAULT_MODEL_KEY,
     describe_device,
@@ -31,12 +35,6 @@ from transformer_surgery.util import (
 
 if TYPE_CHECKING:
     from transformer_surgery.cli.distill_config import JeffreysDistillConfig
-
-
-def _maybe_cuda_autocast(device: torch.device, dt: torch.dtype):
-    if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
-        return torch.autocast(device_type="cuda", dtype=dt)
-    return nullcontext()
 
 
 def _copy_state_into(src: nn.Module, dst: nn.Module) -> None:
@@ -93,7 +91,7 @@ def eval_distillation_metrics(
     for x, y in val_loader:
         x = x.to(device, dtype=dt, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
-        with _maybe_cuda_autocast(device, dt):
+        with maybe_surgery_cuda_autocast(device, dt):
             t_log = teacher(x)
             s_log = student(x)
         ce_sum_t += torch.nn.functional.cross_entropy(s_log.float(), y, reduction="sum").double()
@@ -184,12 +182,12 @@ def distill_student_from_teacher(
             y = y.to(device, non_blocking=use_cuda)
             train_opt.zero_grad(set_to_none=True)
             with torch.no_grad():
-                with _maybe_cuda_autocast(device, dt):
+                with maybe_surgery_cuda_autocast(device, dt):
                     t_log = baseline_teacher(x)
             if use_master_fp32:
                 s_log = train_student(x.float())
             else:
-                with _maybe_cuda_autocast(device, dt):
+                with maybe_surgery_cuda_autocast(device, dt):
                     s_log = train_student(x)
             ce_loss = torch.nn.functional.cross_entropy(s_log.float(), y, reduction="mean")
             j_loss = jeffreys_divergence_dense(t_log, s_log, temperature=cfg.temperature).mean()
@@ -360,9 +358,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     num_trainings = int(cfg.num_trainings)
     base_seed = int(cfg.base_seed)
 
-    probe_student, student_extra = load_surgery_student_checkpoint(
-        pre_path, cfg, surgery_dtype=get_surgery_dtype()
-    )
+    probe_student, student_extra = load_surgery_student_checkpoint(pre_path, cfg)
     adapter = get_model_adapter(student_extra["model_key"])
     teacher_path = adapter.reference_checkpoint_path(cfg)
     _log_distill_device_and_config_json(cfg)
@@ -393,9 +389,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         run_number = run_index + 1
         print(f"starting distill run {run_number}/{num_trainings} seed={seed}", flush=True)
         set_seed(seed)
-        student, _ = load_surgery_student_checkpoint(
-            pre_path, cfg, adapter=adapter, surgery_dtype=get_surgery_dtype()
-        )
+        student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
         train_loader, val_loader = adapter.build_loaders(cfg)
         result = distill_student_from_teacher(
             student,
@@ -423,9 +417,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     accuracy_summary = _validation_accuracy_summary(run_results)
     _log_distill_summary(accuracy_summary, best_run)
 
-    best_student, _ = load_surgery_student_checkpoint(
-        pre_path, cfg, adapter=adapter, surgery_dtype=get_surgery_dtype()
-    )
+    best_student, _ = load_surgery_student_checkpoint(pre_path, cfg, adapter=adapter)
     best_student.load_state_dict(best_state, strict=True)
 
     os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)

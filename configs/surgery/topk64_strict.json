@@ -10,7 +10,7 @@
   "disable_calib_gibbs_tail_prob": false,
   "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "device": "cuda",
-  "surgery_dtype": "float16",
+  "surgery_dtype": "bfloat16",
   "disable_layernorm_replacement": false,
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,

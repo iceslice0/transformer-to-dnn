@@ -26,6 +26,7 @@ from transformer_surgery.ops import (
     SurgeryAttention,
     copy_ln_params_to_rewritten,
     get_surgery_dtype,
+    maybe_surgery_cuda_autocast,
 )
 from transformer_surgery.util import ensure_mapping, get_device
 
@@ -307,7 +308,8 @@ def calibrate_timm_deit_reference(
     eps = float(cfg.eps)
     gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
     disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
-    calibration_batches = max(1, int(cfg.gibbs_tail_calibration_batches))
+    cal_batches_cfg = cfg.gibbs_tail_calibration_batches
+    calibration_batches_limit = None if cal_batches_cfg is None else max(1, int(cal_batches_cfg))
     top_k = int(cfg.top_k)
     use_cuda = device.type == "cuda"
     mse_acc = 0.0
@@ -324,78 +326,83 @@ def calibrate_timm_deit_reference(
     processed_batches = 0
 
     for batch_idx, (batch, _) in enumerate(loader):
-        if batch_idx >= calibration_batches:
+        if calibration_batches_limit is not None and batch_idx >= calibration_batches_limit:
             break
         processed_batches += 1
         batch = batch.to(device, dtype=dt, non_blocking=use_cuda)
 
-        b = batch.shape[0]
-        x = reference.patch_embed(batch)
-        x = torch.cat((reference.cls_token.expand(b, -1, -1), x), dim=1) + reference.pos_embed
-        x = reference.pos_drop(x)
-        if batch_idx == 0:
-            y_ref0 = reference.blocks[0].norm1(x)
-            rw0 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-                device=device, dtype=dt
-            )
-            copy_ln_params_to_rewritten(rw0, reference.blocks[0].norm1)
-            y_rw0 = rw0(x)
-            stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
+        with maybe_surgery_cuda_autocast(device, dt):
+            b = batch.shape[0]
+            x = reference.patch_embed(batch)
+            x = torch.cat((reference.cls_token.expand(b, -1, -1), x), dim=1) + reference.pos_embed
+            x = reference.pos_drop(x)
+            if batch_idx == 0:
+                y_ref0 = reference.blocks[0].norm1(x)
+                rw0 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                    device=device, dtype=dt
+                )
+                copy_ln_params_to_rewritten(rw0, reference.blocks[0].norm1)
+                y_rw0 = rw0(x)
+                stats["ln_rewrite_mse_layer0_minibatch"] = float(torch.mean((y_ref0 - y_rw0).pow(2)).cpu())
 
-        h = x
-        for block_idx, blk in enumerate(reference.blocks):
-            n1 = blk.norm1(h)
-            rw = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+            h = x
+            for block_idx, blk in enumerate(reference.blocks):
+                n1 = blk.norm1(h)
+                rw = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                    device=device, dtype=dt
+                )
+                copy_ln_params_to_rewritten(rw, blk.norm1)
+                mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
+                n_ln += 1
+                if block_idx == 0 or not disable_tail_calib:
+                    scores = timm_attention_scores(blk.attn, n1)
+                    teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k)
+                    if not disable_tail_calib:
+                        tail_stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
+                        count = int(tail_stats["count"])
+                        while len(tail_eps_sum_by_block) <= block_idx:
+                            tail_eps_sum_by_block.append(0.0)
+                            tail_eps_count_by_block.append(0)
+                            tail_eps_min_by_block.append(float("inf"))
+                            tail_eps_max_by_block.append(float("-inf"))
+                        tail_eps_sum_by_block[block_idx] += float(tail_stats["mean"]) * count
+                        tail_eps_count_by_block[block_idx] += count
+                        tail_eps_min_by_block[block_idx] = min(
+                            tail_eps_min_by_block[block_idx], float(tail_stats["min"])
+                        )
+                        tail_eps_max_by_block[block_idx] = max(
+                            tail_eps_max_by_block[block_idx], float(tail_stats["max"])
+                        )
+                    if block_idx == 0:
+                        block0_teachers.append(teacher)
+                        block0_vals_list.append(vals)
+                        block0_idx_list.append(idx)
+                        block0_nk = nk
+                        block0_k_top = k_top
+                h = h + blk.attn(n1)
+                n2 = blk.norm2(h)
+                rw2 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
+                    device=device, dtype=dt
+                )
+                copy_ln_params_to_rewritten(rw2, blk.norm2)
+                mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
+                n_ln += 1
+                h = h + blk.mlp(n2)
+            h_pre = h
+            h_out = reference.norm(h_pre)
+            rwf = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
                 device=device, dtype=dt
             )
-            copy_ln_params_to_rewritten(rw, blk.norm1)
-            mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
+            copy_ln_params_to_rewritten(rwf, reference.norm)
+            mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
             n_ln += 1
-            if block_idx == 0 or not disable_tail_calib:
-                scores = timm_attention_scores(blk.attn, n1)
-                teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k)
-                if not disable_tail_calib:
-                    tail_stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
-                    count = int(tail_stats["count"])
-                    while len(tail_eps_sum_by_block) <= block_idx:
-                        tail_eps_sum_by_block.append(0.0)
-                        tail_eps_count_by_block.append(0)
-                        tail_eps_min_by_block.append(float("inf"))
-                        tail_eps_max_by_block.append(float("-inf"))
-                    tail_eps_sum_by_block[block_idx] += float(tail_stats["mean"]) * count
-                    tail_eps_count_by_block[block_idx] += count
-                    tail_eps_min_by_block[block_idx] = min(tail_eps_min_by_block[block_idx], float(tail_stats["min"]))
-                    tail_eps_max_by_block[block_idx] = max(tail_eps_max_by_block[block_idx], float(tail_stats["max"]))
-                if block_idx == 0:
-                    block0_teachers.append(teacher)
-                    block0_vals_list.append(vals)
-                    block0_idx_list.append(idx)
-                    block0_nk = nk
-                    block0_k_top = k_top
-            h = h + blk.attn(n1)
-            n2 = blk.norm2(h)
-            rw2 = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-                device=device, dtype=dt
-            )
-            copy_ln_params_to_rewritten(rw2, blk.norm2)
-            mse_acc += torch.mean((rw2(h) - n2).pow(2)).item()
-            n_ln += 1
-            h = h + blk.mlp(n2)
-        h_pre = h
-        h_out = reference.norm(h_pre)
-        rwf = RewrittenLayerNorm(reference.embed_dim, eps=eps, allow_matmul=cfg.allow_matmul).to(
-            device=device, dtype=dt
-        )
-        copy_ln_params_to_rewritten(rwf, reference.norm)
-        mse_acc += torch.mean((rwf(h_pre) - h_out).pow(2)).item()
-        n_ln += 1
 
     if processed_batches == 0:
         raise ValueError("gibbs tail calibration requires at least one validation batch")
     stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
 
     stats["disable_calib_gibbs_tail_prob"] = disable_tail_calib
-    stats["gibbs_tail_calibration_batches_requested"] = calibration_batches
+    stats["gibbs_tail_calibration_batches_requested"] = cal_batches_cfg
     stats["gibbs_tail_calibration_batches"] = processed_batches
     stats["gibbs_tail_prob_eps_configured"] = gibbs_tail_prob_eps
     if disable_tail_calib:

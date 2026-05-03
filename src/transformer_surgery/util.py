@@ -15,6 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, S
 from torch.utils.data import DataLoader
 from torchmetrics.classification import MulticlassAccuracy
 
+from transformer_surgery.ops import get_surgery_dtype, maybe_surgery_cuda_autocast
 
 DEFAULT_MODEL_KEY = "deit_tiny_pet"
 
@@ -168,10 +169,12 @@ def accuracy_and_loss(
         input_dtype = next(model.parameters()).dtype
     except StopIteration:
         input_dtype = torch.float32
+    dt_eval = get_surgery_dtype()
     for x, y in loader:
         x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
-        logits = model(x)
+        with maybe_surgery_cuda_autocast(device, dt_eval):
+            logits = model(x)
         bs = y.size(0)
         loss_sum_t += criterion(logits, y).double() * bs
         n_samples += bs
