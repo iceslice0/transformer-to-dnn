@@ -73,7 +73,8 @@ Strictly nonlinear scalar maps:
 parameter block.
 
 `NLLogPlusEps`, `NLRsqrtPlusEps`, and `NLReciprocalPlusEps` carry a fixed `eps` buffer
-set from the run config and frozen at training time by `freeze_eps_parameters`.
+set from the run config. As a buffer it never appears in `model.parameters()` and is therefore
+not trainable.
 
 ### Routing
 
@@ -120,7 +121,8 @@ Fast path (`allow_matmul=True`):
 
 Final affine: `AffineScaleBias(normalized_shape)` carries `gamma`/`beta`. Weights are copied
 from the timm `nn.LayerNorm` by `copy_ln_params_to_rewritten`. `eps` is fixed at construction
-from `cfg.eps` and frozen by `freeze_eps_parameters` (it is not copied from `src.eps`).
+from `cfg.eps` and stored as a buffer (not a parameter), so it is never trained; it is not
+copied from `src.eps`.
 
 ## Transform 2: Variable Matrix-Multiplication Replacement in Attention
 
@@ -281,10 +283,9 @@ The CLI writes:
 - `artifacts/checkpoints/ts_surgery_<config>.pt` - pre-finetune surgery checkpoint
   (`save_model_checkpoint` with adapter-supplied `extra`).
 - `artifacts/metadata/ts_surgery_<config>.json` - JSON metadata: full surgery config fields plus
-  `calibration`, `module_mapping`, `reference_checkpoint`, and `calibration_legend`,
-  `patient`, `dataset`, `eps`, `top_k`, `surgery_dtype`, `calibration`, `module_mapping`,
-  `reference_checkpoint`, `allow_matmul`, `gibbs_tail_prob_eps`, and
-  `disable_calib_gibbs_tail_prob`.
+  `model_key`, `patient`, `dataset`, `calibration`, `module_mapping`, `reference_checkpoint`,
+  and `calibration_legend`. The configured `gibbs_tail_prob_eps` is overwritten with the applied
+  per-block mean when calibration runs.
 - `artifacts/logs/ts_surgery_<config>_model_before_surgery.txt` and `_model_after_surgery.txt`
   - `write_model_structure_txt` dumps with `repr(model)`, parameter counts, the
   `named_modules` listing, and per-module forward output tensor shapes from one `eval` pass on

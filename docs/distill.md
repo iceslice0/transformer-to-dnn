@@ -36,21 +36,27 @@ mean Jeffreys divergence against the teacher.
 
 ## Training Rule
 
+The optimizer is built over all student parameters (``train_student.parameters()``); it is not
+filtered by ``requires_grad``. Effective trainability is governed by ``requires_grad`` flags and
+buffer-vs-parameter status:
+
 Trainable:
 
-- affine weights and biases where ``requires_grad`` is set.
-- ``gamma``/``beta`` in ``AffineScaleBias``.
-- ``GibbsTopKSoftmax.gibbs_tail_prob_eps``.
+- ``nn.Linear`` and ``nn.Conv2d`` weights and biases.
+- ``AffineScaleBias.weight``/``bias`` (LayerNorm ``gamma``/``beta``).
+- ``GibbsTopKSoftmax.gibbs_tail_prob_eps`` (an ``nn.Parameter``, not frozen).
 
 Not trainable:
 
-- fixed ``eps`` buffers/parameters frozen by ``freeze_eps_parameters``.
-- fixed coefficients and scalar constants registered by the surgery graph.
-- teacher parameters.
+- ``AffineContract`` and ``AffineFixedMix`` coefficients — registered as buffers (``coeff``,
+  ``weight``), so they never enter ``parameters()``.
+- fixed ``eps`` floors in ``NLLogPlusEps``/``NLRsqrtPlusEps``/``NLReciprocalPlusEps`` — registered
+  as buffers.
+- teacher parameters (``requires_grad`` is set to ``False`` before training).
 
 When the runtime device is CUDA and the surgery dtype is ``float16``, distillation uses a float32
-training copy and copies trainable state back into the surgery student. Other dtypes train the
-student directly.
+training copy and copies its full state dict back into the surgery student after each epoch. Other
+dtypes train the student directly.
 
 When ``num_trainings`` is greater than one, each run reloads the same ``pre_checkpoint`` and trains
 independently. All run metrics are kept in metadata, validation accuracy mean/std are computed
@@ -69,9 +75,9 @@ accuracy mean/std, best run, config JSON path, and surgery dtype. The saved mode
 best run only. The metadata JSON adds post-distillation metrics under the ``calibration`` block so
 the full surgery -> distill result remains traceable by checkpoint basename.
 
-## Acceptance Criteria
+## Validation expectations
 
-The distillation stage is acceptable only if:
+The distillation stage is is expected to satisfy:
 
 1. It loads the student through the adapter checkpoint path and does not depend on a concrete model module.
 2. It keeps the teacher frozen.
@@ -79,4 +85,5 @@ The distillation stage is acceptable only if:
 4. It keeps per-run metrics, reports validation accuracy mean/std, and saves only the best run's
    checkpoint.
 5. It saves a real PyTorch checkpoint and matching metadata derived from the output checkpoint name.
-6. It preserves fixed surgery constants and only trains intended parameters.
+6. It preserves fixed surgery constants (eps buffers, registered coefficient buffers) and only
+   trains parameters that have ``requires_grad=True``.
