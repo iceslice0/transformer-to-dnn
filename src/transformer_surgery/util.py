@@ -123,7 +123,8 @@ def accuracy_and_loss(
     device = get_device()
     use_cuda = device.type == "cuda"
     acc_metric: Optional[MulticlassAccuracy] = None
-    loss_sum, n_samples = 0.0, 0
+    loss_sum_t = torch.zeros((), device=device, dtype=torch.float64)
+    n_samples = 0
     try:
         input_dtype = next(model.parameters()).dtype
     except StopIteration:
@@ -132,9 +133,8 @@ def accuracy_and_loss(
         x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
         y = y.to(device, non_blocking=use_cuda)
         logits = model(x)
-        loss = criterion(logits, y)
         bs = y.size(0)
-        loss_sum += loss.item() * bs
+        loss_sum_t += criterion(logits, y).double() * bs
         n_samples += bs
         if acc_metric is None:
             nc = int(num_classes) if num_classes is not None else int(logits.shape[-1])
@@ -142,7 +142,7 @@ def accuracy_and_loss(
         acc_metric.update(logits, y)
     if acc_metric is None or n_samples == 0:
         return 0.0, 0.0
-    return float(acc_metric.compute().item()), loss_sum / n_samples
+    return float(acc_metric.compute().item()), loss_sum_t.item() / n_samples
 
 
 def save_model_checkpoint(path: str, model: nn.Module, extra: Optional[Dict[str, Any]] = None) -> None:

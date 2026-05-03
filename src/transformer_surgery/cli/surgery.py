@@ -10,9 +10,9 @@ from transformer_surgery.surgery import surgery
 
 def main() -> None:
     cfg = parse_surgery_config()
-    device = apply_device_from_config(cfg)
-    dtype = apply_dtype_from_config(cfg)
-    surgery(cfg, device=device, dtype=dtype)
+    apply_device_from_config(cfg)
+    apply_dtype_from_config(cfg)
+    surgery(cfg)
 
 
 if __name__ == "__main__":
