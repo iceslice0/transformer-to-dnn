@@ -250,15 +250,9 @@ For `deit_tiny_pet`, the model-local helper walks the timm DeiT blocks and calls
 helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reported diagnostics are:
 
 - `ln_rewrite_mse_layer0_minibatch` - MSE of `RewrittenLayerNorm` against the reference LN at
-  block 0 on the cached batch.
+  block 0 on the first calibration minibatch.
 - `ln_rewrite_mse_all_norms_mean` - mean MSE across all `norm1`/`norm2` and the final `norm`
   while replaying the residual stream of the reference model.
-- `jeffreys_gibbs_mean_cached` and `jeffreys_naive_mean_cached` - mean Jeffreys divergence of
-  the Gibbs Top-K and naive Top-K approximations against the dense softmax on cached attention
-  scores from block 0. Gibbs uses the block-0 calibrated `gibbs_tail_prob_eps` value for this
-  metric.
-- `jeffreys_improvement_naive_minus_gibbs_cached` - signed gap between naive and Gibbs Top-K under
-  the active tail behavior.
 - `gibbs_tail_calibration_batches` - actual number of validation minibatches used.
 - `gibbs_tail_prob_eps_calibrated_by_block` - per-block estimates of the true omitted dense-softmax
   probability mass outside the top-k set over the calibration batches.
@@ -269,8 +263,8 @@ helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reporte
   parameter.
 - `disable_calib_gibbs_tail_prob` - when true, the by-block tail estimate and parameter copy are
   skipped; metrics use the configured `gibbs_tail_prob_eps`.
-- Synthetic `*_synthetic` variants on a Gaussian score tensor of the same shape, for
-  cross-checking.
+- Synthetic `*_synthetic` Jeffreys variants on a Gaussian score tensor matching block-0
+  vocabulary size and top-k, using the calibrated tail metric, for cross-checking.
 
 The surgery driver then runs full-validation passes on both the reference (`ref_val_acc`,
 `ref_val_loss`) and the freshly built surgery student (`student_pre_ft_val_acc`,

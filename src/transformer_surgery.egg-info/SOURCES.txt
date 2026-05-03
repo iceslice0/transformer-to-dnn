@@ -7,7 +7,7 @@ src/transformer_surgery/ptq.py
 src/transformer_surgery/surgery.py
 src/transformer_surgery/internal/__init__.py
 src/transformer_surgery/internal/metrics.py
-src/transformer_surgery/internal/ptq_calibration.py
+src/transformer_surgery/internal/calibration.py
 src/transformer_surgery/internal/reporting.py
 src/transformer_surgery/internal/runtime.py
 src/transformer_surgery/internal/util.py

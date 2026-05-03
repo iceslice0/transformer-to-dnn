@@ -16,7 +16,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from transformer_surgery.internal.metrics import jeffreys_distance_sparse_teacher, jeffreys_naive_topk
+from transformer_surgery.internal.calibration import (
+    add_sparse_topk_jeffreys_stats,
+    apply_gibbs_tail_calibration,
+    sample_topk_scores,
+    topk_tail_mass_stats,
+)
 from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
 from transformer_surgery.internal.runtime import get_surgery_dtype, set_surgery_dtype
 from transformer_surgery.internal.util import (
@@ -30,94 +35,6 @@ from transformer_surgery.internal.util import (
 
 def _is_set(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
-
-
-def sample_topk_scores(
-    scores: torch.Tensor,
-    top_k: int,
-    *,
-    max_rows: int = 4096,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    flat = scores.reshape(-1, scores.shape[-1])
-    rows = min(flat.shape[0], max_rows)
-    teacher = flat[torch.randperm(flat.shape[0], device=flat.device)[:rows]].float()
-    t = teacher - teacher.max(dim=-1, keepdim=True).values
-    nk = t.shape[-1]
-    k_top = min(int(top_k), nk)
-    vals, idx = torch.topk(t, k=k_top, dim=-1, largest=True, sorted=True)
-    return teacher, vals, idx, nk, k_top
-
-
-def topk_tail_mass_stats(
-    teacher: torch.Tensor,
-    idx: torch.Tensor,
-    nk: int,
-    k_top: int,
-) -> Dict[str, Any]:
-    t = teacher - teacher.max(dim=-1, keepdim=True).values
-    if nk > k_top:
-        dense = torch.softmax(t, dim=-1)
-        top_mass = dense.gather(1, idx).sum(dim=-1)
-        tail_mass = (1.0 - top_mass).clamp(0.0, 1.0)
-    else:
-        tail_mass = torch.zeros(teacher.shape[0], device=teacher.device, dtype=torch.float32)
-    return {
-        "mean": float(tail_mass.mean().cpu()),
-        "min": float(tail_mass.min().cpu()),
-        "max": float(tail_mass.max().cpu()),
-        "count": int(tail_mass.numel()),
-    }
-
-
-def add_sparse_topk_jeffreys_stats(
-    stats: Dict[str, Any],
-    teacher: torch.Tensor,
-    vals: torch.Tensor,
-    idx: torch.Tensor,
-    nk: int,
-    k_top: int,
-    *,
-    gibbs_tail_prob_eps: float,
-    prefix: str,
-) -> None:
-    j_gibbs = jeffreys_distance_sparse_teacher(
-        teacher,
-        vals,
-        idx,
-        nk,
-        k_top,
-        gibbs_tail_prob_eps=gibbs_tail_prob_eps,
-    ).mean()
-    j_naive = jeffreys_naive_topk(teacher, vals, idx, nk, k_top).mean()
-    stats[f"jeffreys_gibbs_mean_{prefix}"] = float(j_gibbs.cpu())
-    stats[f"jeffreys_naive_mean_{prefix}"] = float(j_naive.cpu())
-    stats[f"jeffreys_improvement_naive_minus_gibbs_{prefix}"] = float((j_naive - j_gibbs).cpu())
-
-
-def apply_gibbs_tail_calibration(model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-    if bool(calibration.get("disable_calib_gibbs_tail_prob", False)):
-        return {}
-    values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
-    if not isinstance(values, list) or not values:
-        return {}
-    applied = []
-    with torch.no_grad():
-        for block_idx, blk in enumerate(model.blocks):
-            gibbs = blk.attn.gibbs
-            param = gibbs.gibbs_tail_prob_eps
-            if not isinstance(param, nn.Parameter):
-                continue
-            raw_value = float(values[min(block_idx, len(values) - 1)])
-            value = max(0.0, min(raw_value, 1.0 - 1e-7))
-            param.copy_(torch.tensor(value, device=param.device, dtype=param.dtype))
-            applied.append(value)
-    if not applied:
-        return {}
-    model.gibbs_tail_prob_eps = float(sum(applied) / len(applied))
-    return {
-        "gibbs_tail_prob_eps_applied_by_block": applied,
-        "gibbs_tail_prob_eps_applied_mean": model.gibbs_tail_prob_eps,
-    }
 
 
 class SurgeryModelAdapter:
@@ -229,9 +146,9 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         freeze_eps_parameters(model)
 
     def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
-        from transformer_surgery.models.deit_tiny import calibrate_timm_deit_reference
+        from transformer_surgery.internal.calibration import calibrate_vit_reference
 
-        return calibrate_timm_deit_reference(reference, loader, cfg)
+        return calibrate_vit_reference(reference, loader, cfg)
 
     def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
         return super().apply_calibration(model, calibration)

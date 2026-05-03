@@ -119,27 +119,25 @@ class PackageSmokeTests(unittest.TestCase):
         import torch.nn as nn
         from types import SimpleNamespace
 
-        from transformer_surgery.internal.ptq_calibration import (
-            build_ptq_wrapper,
+        from transformer_surgery.internal.calibration import (
             build_ptq_node_setup,
-            make_ptq_wrapper,
-            ptq_wrapper_from_reload_config,
-        )
-        from transformer_surgery.ptq import (
-            _sample_calibration_batch_indices,
+            build_ptq_wrapper,
             gather_ptq_dequant_moments,
             gather_ptq_range_moments,
+            make_ptq_wrapper,
+            ptq_wrapper_from_reload_config,
+            sample_calibration_batch_indices,
         )
 
         gen = torch.Generator().manual_seed(123)
         expected_gen = torch.Generator().manual_seed(123)
-        indices = _sample_calibration_batch_indices(10, 4, generator=gen)
+        indices = sample_calibration_batch_indices(10, 4, generator=gen)
         expected = sorted(torch.randperm(10, generator=expected_gen)[:4].tolist())
         self.assertEqual(indices, expected)
         self.assertEqual(len(indices), 4)
         self.assertEqual(len(set(indices)), 4)
-        self.assertEqual(_sample_calibration_batch_indices(10, None), list(range(10)))
-        self.assertEqual(_sample_calibration_batch_indices(0, None), [])
+        self.assertEqual(sample_calibration_batch_indices(10, None), list(range(10)))
+        self.assertEqual(sample_calibration_batch_indices(0, None), [])
 
         model = nn.Sequential(nn.Linear(3, 2, bias=False))
         selected = {"0": "linear"}
@@ -303,7 +301,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         from transformer_surgery.models import DeiTTinySurgeryModel
         from transformer_surgery.models import adapters
-        from transformer_surgery.models import deit_tiny
+        from transformer_surgery.internal import calibration as calibration_mod
         from transformer_surgery.models.adapters import get_model_adapter
         from transformer_surgery.ops import SurgeryAttention
 
@@ -325,8 +323,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(adapters, "sample_topk_scores"))
         self.assertTrue(hasattr(adapters, "topk_tail_mass_stats"))
         self.assertTrue(hasattr(adapters, "apply_gibbs_tail_calibration"))
-        self.assertTrue(hasattr(deit_tiny, "calibrate_timm_deit_reference"))
-        self.assertTrue(hasattr(deit_tiny, "timm_attention_scores"))
+        self.assertTrue(hasattr(calibration_mod, "calibrate_vit_reference"))
+        self.assertTrue(hasattr(calibration_mod, "fused_qkv_attention_qk_scores"))
 
         disabled_calibration = DeiTTinySurgeryModel(
             num_classes=37,

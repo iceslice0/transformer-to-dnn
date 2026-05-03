@@ -21,7 +21,7 @@ The explicit forward wrapper lives in [src/transformer_surgery/ops.py](../src/tr
 as `CalibratedAffinePTQWrapper`. It owns a `PTQInputQuantizer` and reuses the module being wrapped
 as its `accumulator` submodule (`nn.Linear`, `nn.Conv2d`, `AffineMatMul`, `AffineHadamard`, and so
 on), so the PTQ checkpoint structure stays human-readable. Calibration stats, wrapper construction, and reload metadata live
-in [src/transformer_surgery/internal/ptq_calibration.py](../src/transformer_surgery/internal/ptq_calibration.py). The
+in [src/transformer_surgery/internal/calibration.py](../src/transformer_surgery/internal/calibration.py). The
 CLI wrapper is `python -m transformer_surgery.cli.ptq` or `ts-ptq`.
 
 ## Inputs

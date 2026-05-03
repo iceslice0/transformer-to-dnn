@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,16 +29,18 @@ from transformer_surgery.ops import (
     AffineScale,
     AffineScaleBias,
 )
-from transformer_surgery.internal.ptq_calibration import (
+from transformer_surgery.internal.calibration import (
     PTQNodeSetup,
     PTQNodeStats,
     build_ptq_node_setup,
     build_ptq_wrapper,
-    observe_ptq_dequant,
-    observe_ptq_range,
+    calibration_input_dtype,
+    gather_ptq_dequant_moments,
+    gather_ptq_range_moments,
     ptq_activation_bits_for_kind,
     ptq_module_kind,
     ptq_wrapper_from_reload_config,
+    sample_calibration_batch_indices,
 )
 from transformer_surgery.internal.reporting import (
     describe_device,
@@ -85,168 +86,6 @@ def _set_module(root: nn.Module, name: str, new_module: nn.Module) -> None:
     setattr(parent, leaf, new_module)
 
 
-def _sample_calibration_batch_indices(
-    total_batches: int,
-    requested_batches: Optional[int],
-    *,
-    generator: Optional[torch.Generator] = None,
-) -> List[int]:
-    total = int(total_batches)
-    if total < 1:
-        return []
-    if requested_batches is None:
-        return list(range(total))
-    keep = min(total, int(requested_batches))
-    return sorted(torch.randperm(total, generator=generator)[:keep].tolist())
-
-
-@dataclass
-class _CurrentBatch:
-    idx: int = -1
-
-
-def _hook_payload(inputs: Tuple[Any, ...], output: Any) -> Optional[Tuple[Tuple[torch.Tensor, ...], torch.Tensor]]:
-    if not torch.is_tensor(output):
-        return None
-    tensor_inputs = tuple(x for x in inputs if torch.is_tensor(x))
-    if not tensor_inputs:
-        return None
-    return tensor_inputs, output
-
-
-def _register_hooks(
-    model: nn.Module,
-    selected: Dict[str, str],
-    hook_for: Callable[[str], Callable[..., None]],
-) -> List[Any]:
-    return [model.get_submodule(name).register_forward_hook(hook_for(name)) for name in selected]
-
-
-def _remove_hooks(handles: List[Any]) -> None:
-    for handle in handles:
-        handle.remove()
-    handles.clear()
-
-
-def _range_hook(
-    name: str,
-    stats: Dict[str, PTQNodeStats],
-    batch_ctx: _CurrentBatch,
-    batch_set: set[int],
-) -> Callable[..., None]:
-    def fn(_module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
-        bi = batch_ctx.idx
-        if bi not in batch_set or stats[name].examples_by_batch.get(bi, 0) > 0:
-            return
-        payload = _hook_payload(inputs, output)
-        if payload is None:
-            return
-        observe_ptq_range(stats[name], payload[0], payload[1], bi)
-
-    return fn
-
-
-def _dequant_hook(
-    name: str,
-    stats: Dict[str, PTQNodeStats],
-    setups: Dict[str, PTQNodeSetup],
-    batch_ctx: _CurrentBatch,
-    batch_set: set[int],
-) -> Callable[..., None]:
-    def fn(_module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
-        if getattr(_module, "_ptq_accumulator_call", False):
-            return
-        bi = batch_ctx.idx
-        if bi not in batch_set or stats[name].dequant_examples_by_batch.get(bi, 0) > 0:
-            return
-        payload = _hook_payload(inputs, output)
-        if payload is None:
-            return
-        observe_ptq_dequant(_module, stats[name], setups[name], payload[0], payload[1], bi)
-
-    return fn
-
-
-def _input_dtype(model: nn.Module) -> torch.dtype:
-    try:
-        return next(model.parameters()).dtype
-    except StopIteration:
-        return get_surgery_dtype()
-
-
-@torch.no_grad()
-def _forward_calibration_batches(
-    model: nn.Module,
-    loader,
-    batch_indices: Sequence[int],
-    batch_ctx: _CurrentBatch,
-) -> None:
-    batch_set = {int(i) for i in batch_indices}
-    if not batch_set:
-        return
-    model.eval()
-    device = get_device()
-    use_cuda = device.type == "cuda"
-    input_dtype = _input_dtype(model)
-    dt_eval = get_surgery_dtype()
-    last = max(batch_set)
-    for bi, (x, _y) in enumerate(loader):
-        if bi > last:
-            break
-        if bi not in batch_set:
-            continue
-        batch_ctx.idx = bi
-        x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
-        with maybe_surgery_cuda_autocast(device, dt_eval):
-            model(x)
-
-
-def _run_hook_phase(
-    model: nn.Module,
-    loader,
-    selected_batches: Sequence[int],
-    install_hooks: Callable[[_CurrentBatch, set[int]], List[Any]],
-) -> None:
-    batch_ctx = _CurrentBatch()
-    batch_set = {int(i) for i in selected_batches}
-    hooks = install_hooks(batch_ctx, batch_set)
-    try:
-        _forward_calibration_batches(model, loader, selected_batches, batch_ctx)
-    finally:
-        _remove_hooks(hooks)
-
-
-def gather_ptq_range_moments(
-    model: nn.Module,
-    loader,
-    selected: Dict[str, str],
-    batch_indices: Sequence[int],
-    *,
-    stats: Optional[Dict[str, PTQNodeStats]] = None,
-) -> Dict[str, PTQNodeStats]:
-    out = stats or {name: PTQNodeStats(name=name, kind=kind) for name, kind in selected.items()}
-
-    def install(batch_ctx: _CurrentBatch, batch_set: set[int]) -> List[Any]:
-        return _register_hooks(model, selected, lambda name: _range_hook(name, out, batch_ctx, batch_set))
-
-    _run_hook_phase(model, loader, batch_indices, install)
-    return out
-
-
-def gather_ptq_dequant_moments(
-    model: nn.Module,
-    loader,
-    selected: Dict[str, str],
-    stats: Dict[str, PTQNodeStats],
-    setups: Dict[str, PTQNodeSetup],
-    batch_indices: Sequence[int],
-) -> None:
-    def install(batch_ctx: _CurrentBatch, batch_set: set[int]) -> List[Any]:
-        return _register_hooks(model, selected, lambda name: _dequant_hook(name, stats, setups, batch_ctx, batch_set))
-
-    _run_hook_phase(model, loader, batch_indices, install)
-
-
 def _build_node_selection(model: nn.Module, cfg: Any) -> Dict[str, str]:
     selected: Dict[str, str] = {}
     for name, module in model.named_modules():
@@ -290,7 +129,7 @@ def validate_model(model: nn.Module, loader, criterion: nn.Module) -> Tuple[floa
     loss_sum_t = torch.zeros((), device=device, dtype=torch.float64)
     correct_t = torch.zeros((), device=device, dtype=torch.long)
     n = 0
-    input_dtype = _input_dtype(model)
+    input_dtype = calibration_input_dtype(model)
     dt_eval = get_surgery_dtype()
 
     for x, y in loader:
@@ -440,7 +279,7 @@ def run_ptq(
     _train_loader, val_loader = adapter.build_loaders(cfg)
     log_line(f"Using model adapter: {adapter.key}")
 
-    calibration_batches = _sample_calibration_batch_indices(len(val_loader), cfg.calibration_batches)
+    calibration_batches = sample_calibration_batch_indices(len(val_loader), cfg.calibration_batches)
     if not calibration_batches:
         raise SystemExit("No validation batches available for PTQ calibration.")
     requested = "all" if cfg.calibration_batches is None else str(int(cfg.calibration_batches))
