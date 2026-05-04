@@ -45,7 +45,7 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "reference_checkpoint": "Reference/teacher checkpoint path.",
     "gibbs_tail_prob_eps": "Initial omitted-tail probability mass; calibration overwrites per-block values.",
-    "gibbs_tail_calibration_batches": "Validation batches for Gibbs tail mass; JSON null uses the full val loader.",
+    "gibbs_tail_calibration_batches": "Training batches for Gibbs tail mass; JSON null uses the full train loader.",
     "disable_calib_gibbs_tail_prob": "Disable calibration/application of per-block Gibbs omitted-tail probability.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",

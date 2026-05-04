@@ -242,6 +242,7 @@ def _ptq_summary(
             "dequant_var_eps": float(cfg.dequant_var_eps),
         },
         "calibration": {
+            "loader_split": "train",
             "batches_requested": cfg.calibration_batches,
             "batches_sampled": len(calibration_batch_indices),
             "batch_indices": [int(i) for i in calibration_batch_indices],
@@ -278,12 +279,12 @@ def run_ptq(
     fp_model, fp_extra = load_surgery_student_checkpoint(os.path.abspath(cfg.fp_checkpoint), cfg, surgery_dtype=dtype)
     log_line(f"Surgery dtype (from checkpoint): {describe_dtype(get_surgery_dtype())}")
     adapter = get_model_adapter(fp_extra["model_key"])
-    _train_loader, val_loader = adapter.build_loaders(cfg)
+    train_loader, val_loader = adapter.build_loaders(cfg)
     log_line(f"Using model adapter: {adapter.key}")
 
-    calibration_batches = sample_calibration_batch_indices(len(val_loader), cfg.calibration_batches)
+    calibration_batches = sample_calibration_batch_indices(len(train_loader), cfg.calibration_batches)
     if not calibration_batches:
-        raise SystemExit("No validation batches available for PTQ calibration.")
+        raise SystemExit("No training batches available for PTQ calibration.")
     requested = "all" if cfg.calibration_batches is None else str(int(cfg.calibration_batches))
     log_line(
         f"PTQ calibration batches: requested={requested} "
@@ -300,13 +301,13 @@ def run_ptq(
     fp_acc, fp_loss = validate_model(fp_model, val_loader, criterion)
     log_line(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}")
 
-    stats = gather_ptq_range_moments(fp_model, val_loader, selected, calibration_batches)
+    stats = gather_ptq_range_moments(fp_model, train_loader, selected, calibration_batches)
     missing = [name for name in selected if not stats[name].examples_by_batch]
     if missing:
         raise SystemExit(f"Calibration range statistics missing for selected node(s): {missing}")
 
     setups = {name: _build_ptq_setup(name, fp_model.get_submodule(name), stats[name], cfg) for name in selected}
-    gather_ptq_dequant_moments(fp_model, val_loader, selected, stats, setups, calibration_batches)
+    gather_ptq_dequant_moments(fp_model, train_loader, selected, stats, setups, calibration_batches)
     missing_dequant = [
         name for name in selected if stats[name].bias_fit.count <= 0 and stats[name].affine_fit.count <= 0
     ]

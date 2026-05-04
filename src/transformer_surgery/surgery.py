@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+
+import time
 from typing import TYPE_CHECKING, Any, Dict
 
+import torch
 import torch.nn as nn
 
 from transformer_surgery.models.adapters import get_model_adapter
@@ -47,6 +50,24 @@ def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
         log_line(f"gibbs_tail_prob_eps calibration disabled; using configured value {configured:.6g}")
 
 
+def _timed_accuracy_and_loss(
+    model: nn.Module, val_loader: Any, criterion: nn.Module, device: Any
+) -> tuple[float, float, float, int | None]:
+    peak_memory_bytes: int | None = None
+    if getattr(device, "type", None) == "cuda":
+        torch_device = device
+        torch.cuda.synchronize(torch_device)
+        torch.cuda.reset_peak_memory_stats(torch_device)
+    t0 = time.perf_counter()
+    acc, loss = accuracy_and_loss(model, val_loader, criterion)
+    if getattr(device, "type", None) == "cuda":
+        torch_device = device
+        torch.cuda.synchronize(torch_device)
+        peak_memory_bytes = int(torch.cuda.max_memory_allocated(torch_device))
+    elapsed_s = time.perf_counter() - t0
+    return float(acc), float(loss), float(elapsed_s), peak_memory_bytes
+
+
 def surgery(cfg: "SurgeryConfig") -> None:
     """Load reference, build the surgery student, calibrate, and save traceable artifacts."""
     adapter = get_model_adapter(cfg.model_key)
@@ -59,7 +80,7 @@ def surgery(cfg: "SurgeryConfig") -> None:
     if cfg.config_json_path:
         log_line(f"config_json={cfg.config_json_path}")
 
-    _, val_loader = adapter.build_loaders(cfg)
+    train_loader, val_loader = adapter.build_loaders(cfg)
 
     reference_path = adapter.reference_checkpoint_path(cfg)
     log_line(f"Loading reference from {reference_path} ...")
@@ -70,10 +91,15 @@ def surgery(cfg: "SurgeryConfig") -> None:
     log_wrote(before_log_path)
 
     criterion = nn.CrossEntropyLoss()
-    ref_acc, ref_loss = accuracy_and_loss(ref, val_loader, criterion)
-    log_line(f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f}")
+    ref_acc, ref_loss, ref_val_time_s, ref_peak_memory = _timed_accuracy_and_loss(
+        ref, val_loader, criterion, device
+    )
+    log_line(
+        f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f} "
+        f"time={ref_val_time_s:.3f}s"
+    )
 
-    cal = adapter.calibrate_reference(ref, val_loader, cfg)
+    cal = adapter.calibrate_reference(ref, train_loader, cfg)
     log_json_block("Calibration:", cal)
     _log_tail_prob_calibration(cal, float(cfg.gibbs_tail_prob_eps))
 
@@ -100,8 +126,14 @@ def surgery(cfg: "SurgeryConfig") -> None:
     write_model_structure_txt(after_log_path, model, "Surgery Model (after transform, pre-finetune checkpoint)")
     log_wrote(after_log_path)
 
-    pre_acc, pre_loss = accuracy_and_loss(model, val_loader, criterion)
-    log_line(f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f}")
+    pre_acc, pre_loss, pre_val_time_s, pre_peak_memory = _timed_accuracy_and_loss(
+        model, val_loader, criterion, device
+    )
+    rel_slowdown = pre_val_time_s / ref_val_time_s if ref_val_time_s > 0 else 0.0
+    log_line(
+        f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f} "
+        f"time={pre_val_time_s:.3f}s slowdown_vs_ref={rel_slowdown:.3f}x"
+    )
 
     pre_path = traceable_artifact_path(cfg.pre_ft_checkpoint, cfg, "ts-surgery", extension=".pt")
     cfg.pre_ft_checkpoint = pre_path
@@ -119,8 +151,15 @@ def surgery(cfg: "SurgeryConfig") -> None:
         meta.gibbs_tail_prob_eps = float(applied_mean)
     meta.calibration.ref_val_acc = float(ref_acc)
     meta.calibration.ref_val_loss = float(ref_loss)
+    meta.calibration.ref_val_wall_time_sec = float(ref_val_time_s)
     meta.calibration.student_pre_ft_val_acc = float(pre_acc)
     meta.calibration.student_pre_ft_mean_ce = float(pre_loss)
+    meta.calibration.student_pre_ft_val_wall_time_sec = float(pre_val_time_s)
+    meta.calibration.student_pre_ft_val_relative_slowdown_vs_ref = float(rel_slowdown)
+    if ref_peak_memory is not None:
+        meta.calibration.ref_val_peak_gpu_mem_bytes = int(ref_peak_memory)
+    if pre_peak_memory is not None:
+        meta.calibration.student_pre_ft_val_peak_gpu_mem_bytes = int(pre_peak_memory)
 
     write_json(meta_path, namespace_to_mapping(meta))
     os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)

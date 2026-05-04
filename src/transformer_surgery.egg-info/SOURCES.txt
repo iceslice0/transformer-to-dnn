@@ -5,11 +5,6 @@ src/transformer_surgery/distill.py
 src/transformer_surgery/ops.py
 src/transformer_surgery/ptq.py
 src/transformer_surgery/surgery.py
-src/transformer_surgery/internal/__init__.py
-src/transformer_surgery/internal/metrics.py
-src/transformer_surgery/internal/calibration.py
-src/transformer_surgery/internal/reporting.py
-src/transformer_surgery/internal/util.py
 src/transformer_surgery.egg-info/PKG-INFO
 src/transformer_surgery.egg-info/SOURCES.txt
 src/transformer_surgery.egg-info/dependency_links.txt
@@ -26,6 +21,11 @@ src/transformer_surgery/cli/ptq.py
 src/transformer_surgery/cli/ptq_config.py
 src/transformer_surgery/cli/surgery.py
 src/transformer_surgery/cli/surgery_config.py
+src/transformer_surgery/internal/__init__.py
+src/transformer_surgery/internal/calibration.py
+src/transformer_surgery/internal/metrics.py
+src/transformer_surgery/internal/reporting.py
+src/transformer_surgery/internal/util.py
 src/transformer_surgery/models/__init__.py
 src/transformer_surgery/models/adapters.py
 src/transformer_surgery/models/deit_tiny.py

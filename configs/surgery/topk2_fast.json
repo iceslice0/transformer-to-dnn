@@ -3,7 +3,7 @@
   "data_dir": "./data",
   "batch_size": 32,
   "workers": 2,
-  "top_k": 64,
+  "top_k": 2,
   "eps": 1e-3,
   "gibbs_tail_prob_eps": 1e-3,
   "gibbs_tail_calibration_batches": null,
@@ -14,7 +14,7 @@
   "disable_layernorm_replacement": false,
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
-  "allow_matmul": false,
-  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk64_strict.pt",
+  "allow_matmul": true,
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk2_fast.pt",
   "log_dir": "artifacts/logs"
 }

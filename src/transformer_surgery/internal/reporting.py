@@ -17,7 +17,8 @@ CALIBRATION_LEGEND_TEXT = (
     "student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val "
     "after transform, before distill. "
     "student_post_distill_*: after Jeffreys distillation (acc and mean CE / Jeffreys). "
-    "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores; "
+    "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores "
+    "(fit on train batches, not val); "
     "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
 )
 

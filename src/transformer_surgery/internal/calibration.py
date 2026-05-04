@@ -312,9 +312,9 @@ def calibrate_vit_reference(
     block0_nk = 0
     block0_k_top = 0
 
-    batch_indices = _gibbs_cal_val_batch_indices(len(loader), cal_batches_cfg, random_when_limited=False)
+    batch_indices = _gibbs_cal_batch_indices(len(loader), cal_batches_cfg, random_when_limited=False)
     if not batch_indices:
-        raise ValueError("gibbs tail calibration requires at least one validation batch")
+        raise ValueError("gibbs tail calibration requires at least one training batch")
     batch_set = set(batch_indices)
     last_batch = max(batch_set)
     processed_batches = 0
@@ -388,7 +388,7 @@ def calibrate_vit_reference(
             n_ln += 1
 
     if processed_batches == 0:
-        raise ValueError("gibbs tail calibration requires at least one validation batch")
+        raise ValueError("gibbs tail calibration requires at least one training batch")
     _write_gibbs_tail_reporting(
         stats,
         mse_acc=mse_acc,
@@ -407,6 +407,7 @@ def calibrate_vit_reference(
         block0_nk=block0_nk,
         block0_k_top=block0_k_top,
     )
+    stats["calibration_loader_split"] = "train"
     return stats
 
 
@@ -577,9 +578,9 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
         for g in gibbs_modules:
             g.top_k = seq_len
 
-        batch_indices = _gibbs_cal_val_batch_indices(len(loader), cal_batches_cfg, random_when_limited=True)
+        batch_indices = _gibbs_cal_batch_indices(len(loader), cal_batches_cfg, random_when_limited=True)
         if not batch_indices:
-            raise ValueError("gibbs tail calibration requires at least one validation batch")
+            raise ValueError("gibbs tail calibration requires at least one training batch")
 
         mse_acc = 0.0
         n_ln = 0
@@ -667,7 +668,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
         processed_batches = run_hook_phase(model, loader, batch_indices, install)
 
         if processed_batches == 0:
-            raise ValueError("gibbs tail calibration requires at least one validation batch")
+            raise ValueError("gibbs tail calibration requires at least one training batch")
         _write_gibbs_tail_reporting(
             stats,
             mse_acc=mse_acc,
@@ -686,6 +687,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
             block0_nk=block0_nk,
             block0_k_top=block0_k_top,
         )
+        stats["calibration_loader_split"] = "train"
         return stats
     finally:
         for g, tk in zip(gibbs_modules, saved_top_k):
@@ -698,7 +700,7 @@ def sample_calibration_batch_indices(
     *,
     generator: Optional[torch.Generator] = None,
 ) -> List[int]:
-    'Pick validation minibatch indices for PTQ hooks (random subset, or all when requested_batches is None).'
+    "Pick minibatch indices for PTQ calibration hooks (random subset, or all when requested_batches is None)."
     total = int(total_batches)
     if total < 1:
         return []
@@ -708,14 +710,14 @@ def sample_calibration_batch_indices(
     return sorted(torch.randperm(total, generator=generator)[:keep].tolist())
 
 
-def _gibbs_cal_val_batch_indices(
+def _gibbs_cal_batch_indices(
     total_batches: int,
     cal_batches_cfg: Any,
     *,
     random_when_limited: bool,
     generator: Optional[torch.Generator] = None,
 ) -> List[int]:
-    """Validation minibatch indices for Gibbs-tail calibration (all, first N, or random N)."""
+    """Minibatch indices for Gibbs-tail calibration (all, first N, or random N)."""
     total = int(total_batches)
     if total < 1:
         return []
@@ -1049,7 +1051,7 @@ def gather_ptq_range_moments(
     *,
     stats: Optional[Dict[str, PTQNodeStats]] = None,
 ) -> Dict[str, PTQNodeStats]:
-    """Register range hooks, run selected val batches, return per-node :class:`PTQNodeStats`."""
+    """Register range hooks, run selected calibration batches, return per-node :class:`PTQNodeStats`."""
     out = stats or {name: PTQNodeStats(name=name, kind=kind) for name, kind in selected.items()}
 
     def install(batch_ctx: CurrentBatch, batch_set: set[int]) -> List[Any]:
@@ -1068,7 +1070,7 @@ def gather_ptq_dequant_moments(
     setups: Dict[str, PTQNodeSetup],
     batch_indices: Sequence[int],
 ) -> None:
-    """Register dequant hooks and run selected val batches (mutates ``stats``)."""
+    """Register dequant hooks and run selected calibration batches (mutates ``stats``)."""
 
     def install(batch_ctx: CurrentBatch, batch_set: set[int]) -> List[Any]:
         return _install_ptq_calibration_hooks(model, selected, batch_ctx, batch_set, stats, setups)

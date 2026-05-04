@@ -6,7 +6,7 @@
   "top_k": 8,
   "eps": 1e-3,
   "gibbs_tail_prob_eps": 1e-3,
-  "gibbs_tail_calibration_batches": 10,
+  "gibbs_tail_calibration_batches": null,
   "disable_calib_gibbs_tail_prob": false,
   "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "device": "cuda",

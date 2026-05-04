@@ -57,7 +57,7 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "fp_checkpoint": "Float checkpoint to wrap with PTQ modules.",
     "output": "PTQ checkpoint output path.",
     "calibration_batches": (
-        "Validation minibatches for PTQ (random subset when set); JSON null uses every val minibatch in order. "
+        "Training minibatches for PTQ (random subset when set); JSON null uses every train minibatch in order. "
         "Each minibatch contributes all its examples per wrapped node."
     ),
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
