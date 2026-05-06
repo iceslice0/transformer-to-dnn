@@ -1,6 +1,7 @@
 """Model implementations and model adapters for transformer surgery."""
 
 from transformer_surgery.models.adapters import (
+    DeiTTinyImageNetAdapter,
     DeiTTinyPetAdapter,
     SurgeryModelAdapter,
     get_model_adapter,
@@ -11,6 +12,7 @@ from transformer_surgery.models.adapters import (
 from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel, freeze_eps_parameters
 
 __all__ = [
+    "DeiTTinyImageNetAdapter",
     "DeiTTinyPetAdapter",
     "DeiTTinySurgeryModel",
     "SurgeryModelAdapter",

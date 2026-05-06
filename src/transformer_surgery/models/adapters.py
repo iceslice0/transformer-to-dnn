@@ -184,6 +184,53 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
         return mapping
 
 
+class DeiTTinyImageNetAdapter(SurgeryModelAdapter):
+    key = "deit_tiny_imagenet"
+    patient_name = "DeiT-Tiny"
+    dataset_name = "ImageNet-1k"
+
+    def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
+        from transformer_surgery.models.imagenet import build_imagenet_loaders
+
+        return build_imagenet_loaders(cfg)
+
+    def load_reference_checkpoint(self, path: str) -> nn.Module:
+        from transformer_surgery.models.imagenet import load_timm_deit_imagenet_checkpoint
+
+        return load_timm_deit_imagenet_checkpoint(path)
+
+    def build_surgery_model(self, cfg: Any) -> nn.Module:
+        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
+        from transformer_surgery.models.imagenet import IMAGENET_NUM_CLASSES
+
+        return DeiTTinySurgeryModel.from_surgery_config(cfg, num_classes=IMAGENET_NUM_CLASSES)
+
+    def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
+        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
+        from transformer_surgery.models.imagenet import IMAGENET_NUM_CLASSES
+
+        return DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=IMAGENET_NUM_CLASSES)
+
+    def copy_reference_weights(self, student: nn.Module, reference: nn.Module) -> Dict[str, str]:
+        return student.load_from_timm(reference)
+
+    def freeze_surgery_parameters(self, model: nn.Module) -> None:
+        from transformer_surgery.models.deit_tiny import freeze_eps_parameters
+
+        freeze_eps_parameters(model)
+
+    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+        from transformer_surgery.internal.calibration import calibrate_vit_reference
+
+        return calibrate_vit_reference(reference, loader, cfg)
+
+    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
+        return super().apply_calibration(model, calibration)
+
+    def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
+        return DeiTTinyPetAdapter.build_module_mapping(self, cfg, model)
+
+
 _ADAPTERS: Dict[str, SurgeryModelAdapter] = {}
 
 
@@ -235,3 +282,4 @@ def load_surgery_student_checkpoint(
 
 
 register_model_adapter(DeiTTinyPetAdapter())
+register_model_adapter(DeiTTinyImageNetAdapter())

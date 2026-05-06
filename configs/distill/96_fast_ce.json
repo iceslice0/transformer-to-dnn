@@ -14,7 +14,7 @@
   "max_train_batches": null,
   "keep_best": true,
   "base_seed": 42,
-  "num_trainings": 1,
+  "num_trainings": 5,
   "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "pre_checkpoint": "artifacts/checkpoints/ts_surgery_topk96_fast.pt",
   "output": "artifacts/checkpoints/ts_distill_96_fast_ce.pt",

@@ -1,0 +1,20 @@
+{
+  "model_key": "deit_tiny_imagenet",
+  "data_dir": "/home/iceslice/nn/data/imagenet",
+  "batch_size": 32,
+  "workers": 2,
+  "top_k": 192,
+  "eps": 0.001,
+  "gibbs_tail_prob_eps": 0.001,
+  "gibbs_tail_calibration_batches": 10,
+  "disable_calib_gibbs_tail_prob": false,
+  "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_imagenet_deit_tiny.pt",
+  "device": "cuda",
+  "surgery_dtype": "bfloat16",
+  "disable_layernorm_replacement": false,
+  "disable_attention_surgery": false,
+  "disable_softmax_replacement": false,
+  "allow_matmul": true,
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk192_fast_imagenet.pt",
+  "log_dir": "artifacts/logs"
+}

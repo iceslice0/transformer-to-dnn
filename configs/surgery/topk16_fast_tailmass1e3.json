@@ -3,11 +3,11 @@
   "data_dir": "./data",
   "batch_size": 32,
   "workers": 2,
-  "top_k": 256,
-  "eps": 1e-5,
-  "gibbs_tail_prob_eps": 1e-5,
+  "top_k": 16,
+  "eps": 0.001,
+  "gibbs_tail_prob_eps": 0.001,
   "gibbs_tail_calibration_batches": null,
-  "disable_calib_gibbs_tail_prob": false,
+  "disable_calib_gibbs_tail_prob": true,
   "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
   "device": "cuda",
   "surgery_dtype": "bfloat16",
@@ -15,6 +15,6 @@
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": true,
-  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk96_fast.pt",
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk16_fast_tailmass1e3.pt",
   "log_dir": "artifacts/logs"
 }
