@@ -21,7 +21,6 @@ class PTQSurgeryConfig:
     ra_magnitude: int = 9
     random_erasing_prob: float = 0.0
     device: str = "cuda"
-    calibration_batches: Optional[int] = 4
     wrap_linear_conv: bool = True
     wrap_affine: bool = False
     wrap_matmul: bool = False
@@ -56,10 +55,6 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "fp_checkpoint": "Float checkpoint to wrap with PTQ modules.",
     "output": "PTQ checkpoint output path.",
-    "calibration_batches": (
-        "Training minibatches for PTQ (random subset when set); JSON null uses every train minibatch in order. "
-        "Each minibatch contributes all its examples per wrapped node."
-    ),
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",
     "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",

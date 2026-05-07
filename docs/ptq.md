@@ -36,7 +36,7 @@ fields are:
   `randaugment`, `ra_magnitude`, `random_erasing_prob`.
 - runtime fields: `device`, `log_dir`. Surgery compute dtype is taken from the float checkpoint
   (``extra["surgery_dtype"]`` on the checkpoint).
-- calibration fields: `calibration_batches` (each sampled minibatch contributes all examples per node).
+- calibration uses the full training loader (aggregated streaming statistics; no sampled-batch cache).
 - selection fields: `wrap_linear_conv`, `wrap_affine`, `wrap_matmul`, `include_names`,
   `exclude_names`.
 - quantization fields: `weight_bits`, `activation_bits`, `affine_activation_bits`,
@@ -46,8 +46,8 @@ fields are:
   config name.
 
 PTQ does not train the model and does not run QAT. It validates the float model, runs two
-forward-only calibration passes (ranges, then dequant moments) on the sampled batches, constructs
-wrappers, reloads the saved wrapped checkpoint, and evaluates that checkpoint.
+forward-only calibration passes (ranges, then dequant moments) on the full training loader,
+constructs wrappers, reloads the saved wrapped checkpoint, and evaluates that checkpoint.
 
 ## Node Selection
 
@@ -67,18 +67,18 @@ not PTQ-wrapped.
 ## Calibration
 
 Forward hooks on selected nodes accumulate statistics from full calibration minibatches. PTQ first
-runs full validation (no hooks), samples up to `calibration_batches` validation indices with
-`torch.randperm`, then runs hooks over those minibatches twice: ranges, then accumulator/output
-moments for the dequant fit. Each pass is streaming (no activation cache across batches).
+runs full validation (no hooks), then runs hooks over the entire training loader twice: ranges,
+then accumulator/output moments for the dequant fit. Each pass is streaming (no activation cache
+across batches).
 
 Per node:
 
 - tensor input ranges (every operand for matmul-like nodes);
 - running residual or OLS moments for dequantization;
-- batch indices and example counts (for metadata).
+- aggregated example counts.
 
 The float validation pass reports `fp_val_acc` and `fp_val_loss`. If any selected node receives no
-statistics on the sampled batches, PTQ stops before writing a wrapped checkpoint.
+statistics on the calibration passes, PTQ stops before writing a wrapped checkpoint.
 
 ## Quantization
 

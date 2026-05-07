@@ -40,7 +40,6 @@ from transformer_surgery.internal.calibration import (
     ptq_activation_bits_for_kind,
     ptq_module_kind,
     ptq_wrapper_from_reload_config,
-    sample_calibration_batch_indices,
 )
 from transformer_surgery.internal.reporting import (
     describe_device,
@@ -114,15 +113,6 @@ def _build_ptq_setup(name: str, module: nn.Module, stats: PTQNodeStats, cfg: Any
     )
 
 
-def _node_debug_metadata(stats: PTQNodeStats) -> Dict[str, Any]:
-    return {
-        "examples_by_batch": {str(k): int(v) for k, v in sorted(stats.examples_by_batch.items())},
-        "dequant_examples_by_batch": {
-            str(k): int(v) for k, v in sorted(stats.dequant_examples_by_batch.items())
-        },
-    }
-
-
 @torch.no_grad()
 def validate_model(model: nn.Module, loader, criterion: nn.Module) -> Tuple[float, float]:
     model.eval()
@@ -166,7 +156,6 @@ def _build_ptq_model(
         )
         _set_module(out, name, built.module)
         meta = built.metadata
-        meta["calibration_debug"] = _node_debug_metadata(calibration_stats[name])
         node_meta.append(meta)
         reload_configs.append(built.reload_config)
     return out, node_meta, reload_configs
@@ -205,8 +194,6 @@ def _ptq_summary(
     ptq_acc: float,
     ptq_loss: float,
     node_meta: List[Dict[str, Any]],
-    *,
-    calibration_batch_indices: Sequence[int],
 ) -> Dict[str, Any]:
     return {
         "source_checkpoint": os.path.abspath(cfg.fp_checkpoint),
@@ -243,9 +230,7 @@ def _ptq_summary(
         },
         "calibration": {
             "loader_split": "train",
-            "batches_requested": cfg.calibration_batches,
-            "batches_sampled": len(calibration_batch_indices),
-            "batch_indices": [int(i) for i in calibration_batch_indices],
+            "mode": "full_train_loader_aggregated",
         },
         "metrics": {
             "fp_val_acc": float(fp_acc),
@@ -282,14 +267,10 @@ def run_ptq(
     train_loader, val_loader = adapter.build_loaders(cfg)
     log_line(f"Using model adapter: {adapter.key}")
 
-    calibration_batches = sample_calibration_batch_indices(len(train_loader), cfg.calibration_batches)
+    calibration_batches = list(range(len(train_loader)))
     if not calibration_batches:
         raise SystemExit("No training batches available for PTQ calibration.")
-    requested = "all" if cfg.calibration_batches is None else str(int(cfg.calibration_batches))
-    log_line(
-        f"PTQ calibration batches: requested={requested} "
-        f"sampled={len(calibration_batches)} indices={calibration_batches}"
-    )
+    log_line(f"PTQ calibration batches: using full train loader ({len(calibration_batches)} batch(es), aggregated stats).")
 
     selected = _build_node_selection(fp_model, cfg)
     if not selected:
@@ -302,7 +283,7 @@ def run_ptq(
     log_line(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}")
 
     stats = gather_ptq_range_moments(fp_model, train_loader, selected, calibration_batches)
-    missing = [name for name in selected if not stats[name].examples_by_batch]
+    missing = [name for name in selected if stats[name].examples_total <= 0]
     if missing:
         raise SystemExit(f"Calibration range statistics missing for selected node(s): {missing}")
 
@@ -343,7 +324,6 @@ def run_ptq(
             ptq_acc,
             ptq_loss,
             node_meta,
-            calibration_batch_indices=calibration_batches,
         ),
     )
     log_wrote(meta_abs)

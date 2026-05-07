@@ -10,7 +10,6 @@
   "ra_magnitude": 9,
   "random_erasing_prob": 0.0,
   "device": "cuda",
-  "calibration_batches": null,
   "wrap_linear_conv": true,
   "wrap_affine": true,
   "wrap_matmul": true,

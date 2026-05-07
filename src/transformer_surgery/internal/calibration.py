@@ -877,8 +877,8 @@ class PTQNodeStats:
     input_max_abs: List[torch.Tensor] = field(default_factory=list)
     output_rank: int = 0
     output_channel_axis: Optional[int] = None
-    examples_by_batch: Dict[int, int] = field(default_factory=dict)
-    dequant_examples_by_batch: Dict[int, int] = field(default_factory=dict)
+    examples_total: int = 0
+    dequant_examples_total: int = 0
     affine_fit: PTQAffineFitStats = field(default_factory=PTQAffineFitStats)
     bias_fit: PTQBiasFitStats = field(default_factory=PTQBiasFitStats)
 
@@ -893,12 +893,12 @@ class PTQNodeStats:
             self.input_max_abs[idx] = torch.maximum(self.input_max_abs[idx], t.abs().max().to(device="cpu"))
         self.output_rank = output.ndim
         self.output_channel_axis = _default_output_channel_axis(self.kind, output)
-        self.examples_by_batch[batch_idx] = int(self.examples_by_batch.get(batch_idx, 0)) + _leading_examples(output)
+        _ = batch_idx
+        self.examples_total += _leading_examples(output)
 
     def mark_dequant_examples(self, batch_idx: int, output: torch.Tensor) -> None:
-        self.dequant_examples_by_batch[batch_idx] = int(
-            self.dequant_examples_by_batch.get(batch_idx, 0)
-        ) + _leading_examples(output)
+        _ = batch_idx
+        self.dequant_examples_total += _leading_examples(output)
 
 
 @dataclass
@@ -994,7 +994,7 @@ def _ptq_range_hook_fn(
 ) -> Callable[..., None]:
     def fn(_module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
         bi = batch_ctx.idx
-        if bi not in batch_set or stats[name].examples_by_batch.get(bi, 0) > 0:
+        if bi not in batch_set:
             return
         payload = _ptq_hook_tensor_payload(inputs, output)
         if payload is None:
@@ -1015,7 +1015,7 @@ def _ptq_dequant_hook_fn(
         if getattr(_module, "_ptq_accumulator_call", False):
             return
         bi = batch_ctx.idx
-        if bi not in batch_set or stats[name].dequant_examples_by_batch.get(bi, 0) > 0:
+        if bi not in batch_set:
             return
         payload = _ptq_hook_tensor_payload(inputs, output)
         if payload is None:

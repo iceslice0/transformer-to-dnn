@@ -71,9 +71,7 @@ class PackageSmokeTests(unittest.TestCase):
             self.assertEqual(cfg.base_seed, 42)
             self.assertGreaterEqual(cfg.num_trainings, 1)
         for path in glob.glob(str(ROOT / "configs/ptq/*.json")):
-            cfg = PTQSurgeryConfig.load(path)
-            cb = cfg.calibration_batches
-            self.assertTrue(cb is None or cb >= 1)
+            PTQSurgeryConfig.load(path)
         self.assertFalse(SurgeryConfig.load(str(ROOT / CLI_SURGERY_CONFIG_DEFAULT)).disable_calib_gibbs_tail_prob)
         forbidden_metadata_field = "_".join(("meta", "json"))
         for path in glob.glob(str(ROOT / "configs/**/*.json"), recursive=True):
@@ -145,7 +143,7 @@ class PackageSmokeTests(unittest.TestCase):
         loader = [(torch.full((4, 3), float(i)), torch.zeros(4, dtype=torch.long)) for i in range(5)]
         stats = gather_ptq_range_moments(model, loader, selected, batch_indices)
         data = stats["0"]
-        self.assertEqual(data.examples_by_batch, {1: 4, 3: 4})
+        self.assertEqual(data.examples_total, 8)
         self.assertGreaterEqual(data.input_max_abs[0].item(), 3.0)
 
         cfg = SimpleNamespace(
@@ -174,7 +172,7 @@ class PackageSmokeTests(unittest.TestCase):
             {"0": setup},
             batch_indices,
         )
-        self.assertEqual(data.dequant_examples_by_batch, {1: 4, 3: 4})
+        self.assertEqual(data.dequant_examples_total, 8)
         self.assertGreater(data.bias_fit.count, 0)
         wrapper = make_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
         self.assertEqual(wrapper.quantizer.input_scale.numel(), 1)
