@@ -14,7 +14,7 @@ The core code lives in ``src/transformer_surgery/distill.py``. The CLI wrapper i
 - ``model_key``: adapter key, default ``deit_tiny_pet``.
 - dataset/config fields shared with the adapter, such as ``data_dir``, ``batch_size``, and ``workers``.
 - optimization fields: ``epochs``, ``lr``, ``weight_decay``, ``warmup_epochs``, ``grad_clip``,
-  ``cosine_eta_min``, ``keep_best``, and progress intervals.
+  ``cosine_eta_min``, ``keep_best``, and ``train_progress_interval``.
 - repeat fields: ``base_seed`` and ``num_trainings``. Training run ``i`` uses seed
   ``base_seed + i``.
 

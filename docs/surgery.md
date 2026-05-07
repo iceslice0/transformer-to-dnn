@@ -263,8 +263,20 @@ helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reporte
   parameter.
 - `disable_calib_gibbs_tail_prob` - when true, the by-block tail estimate and parameter copy are
   skipped; metrics use the configured `gibbs_tail_prob_eps`.
-- Synthetic `*_synthetic` Jeffreys variants on a Gaussian score tensor matching block-0
-  vocabulary size and top-k, using the calibrated tail metric, for cross-checking.
+- Synthetic `*_synthetic` Jeffreys variants - a sanity check on the Gibbs top-k construction itself,
+  decoupled from real-data calibration. The reporter draws a 4096-row Gaussian score tensor with
+  the same `nk` (block-0 key length) and `k_top` (top-k) as the calibration sample, takes the dense
+  softmax `p` of the teacher logits, then forms two top-k approximations `q`:
+    - **Gibbs**: `(1 - tail) * softmax(top_vals)` on the kept indices and uniform `tail / (nk - k)`
+      on the dropped indices, where `tail` is the calibrated `gibbs_tail_prob_eps_metric` (or the
+      configured value when calibration is disabled). This matches what `GibbsTopKSoftmax` produces
+      at runtime including tail-mass redistribution.
+    - **Naive**: renormalize `softmax(top_vals)` over the kept indices only and put zero on dropped
+      indices (no tail correction).
+  Three keys are emitted: `jeffreys_gibbs_mean_synthetic`, `jeffreys_naive_mean_synthetic`, and
+  `jeffreys_improvement_naive_minus_gibbs_synthetic`. A positive improvement on synthetic Gaussian
+  scores is the construction-level guarantee that the calibrated tail term is doing the right
+  thing; the per-block real-data tail estimates above are what's actually copied into the model.
 
 The surgery driver then runs full-validation passes on both the reference (`ref_val_acc`,
 `ref_val_loss`) and the freshly built surgery student (`student_pre_ft_val_acc`,

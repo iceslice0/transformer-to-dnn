@@ -40,7 +40,9 @@ python -m transformer_surgery.cli.ptq            # 4. 8-bit PTQ on selected affi
 
 Equivalent console scripts after `pip install -e .`: `ts-pretrain-pet`, `ts-surgery`, `ts-distill`, `ts-ptq`.
 
-`pretrain_pet` is the only model-specific stage. `surgery`, `distill`, and `ptq` go through a model adapter (`model_key`, default `deit_tiny_pet`); adding a new transformer means registering an adapter, not branching the stage code.
+`pretrain_pet` is the only model-specific stage. `surgery`, `distill`, and `ptq` go through a model adapter (`model_key`, default `deit_tiny_pet`); adding a new transformer means registering an adapter, not branching the stage code. Two adapters ship in the repo: `deit_tiny_pet` (DeiT-Tiny on Oxford-IIIT Pet) and `imagenet` ([src/transformer_surgery/models/imagenet.py](src/transformer_surgery/models/imagenet.py)).
+
+A top-level `Makefile` orchestrates the full experiment grid (top-k sweeps, tail-mass ablations, strict vs fast, PTQ variants, ImageNet). Use `make help` to list targets, or `make a` / `make a_imagenet` / `make all` to run a sweep; targets call into the same CLIs and write to `artifacts/`.
 
 ## Install
 
