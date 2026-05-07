@@ -6,7 +6,7 @@ PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 MAIN_KS := 1 2 4 8 16 32 64 96 128 197
 TAIL_KS := 1 2 4 8 16 32 64
 STRICT_KS := 16 32 64
-PTQ_KS := 16 32 64
+PTQ_KS := 16 32 64 197
 IMAGENET_MAIN_KS := 1 4 32 64 197
 
 SURGERY_MAIN_TARGETS := $(foreach k,$(MAIN_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)

@@ -100,6 +100,32 @@ def _build_node_selection(model: nn.Module, cfg: Any) -> Dict[str, str]:
     return selected
 
 
+def _filter_unobserved_nodes(
+    selected: Dict[str, str],
+    stats: Dict[str, PTQNodeStats],
+) -> Dict[str, str]:
+    """
+    Drop selected nodes that never emitted calibration outputs.
+
+    Some modules are conditionally inactive on a given model/config path (for example,
+    Gibbs tail-scaling when ``top_k == seq_len``). Those modules should be skipped
+    rather than failing the full PTQ run.
+    """
+    active: Dict[str, str] = {}
+    skipped: List[str] = []
+    for name, kind in selected.items():
+        if stats[name].examples_total > 0:
+            active[name] = kind
+        else:
+            skipped.append(name)
+    if skipped:
+        log_line(
+            "Skipping PTQ node(s) with no calibration observations: "
+            + ", ".join(skipped)
+        )
+    return active
+
+
 def _build_ptq_setup(name: str, module: nn.Module, stats: PTQNodeStats, cfg: Any) -> PTQNodeSetup:
     return build_ptq_node_setup(
         name,
@@ -283,9 +309,9 @@ def run_ptq(
     log_line(f"Float model val acc={fp_acc:.4f} loss={fp_loss:.4f}")
 
     stats = gather_ptq_range_moments(fp_model, train_loader, selected, calibration_batches)
-    missing = [name for name in selected if stats[name].examples_total <= 0]
-    if missing:
-        raise SystemExit(f"Calibration range statistics missing for selected node(s): {missing}")
+    selected = _filter_unobserved_nodes(selected, stats)
+    if not selected:
+        raise SystemExit("No PTQ node received calibration statistics on the current run.")
 
     setups = {name: _build_ptq_setup(name, fp_model.get_submodule(name), stats[name], cfg) for name in selected}
     gather_ptq_dequant_moments(fp_model, train_loader, selected, stats, setups, calibration_batches)
