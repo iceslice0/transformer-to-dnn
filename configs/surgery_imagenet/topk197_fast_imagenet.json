@@ -3,7 +3,7 @@
   "data_dir": "/home/iceslice/nn/data/imagenet",
   "batch_size": 32,
   "workers": 2,
-  "top_k": 192,
+  "top_k": 197,
   "eps": 0.001,
   "gibbs_tail_prob_eps": 0.001,
   "gibbs_tail_calibration_batches": 10,
@@ -15,6 +15,6 @@
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": true,
-  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk192_fast_imagenet.pt",
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk197_fast_imagenet.pt",
   "log_dir": "artifacts/logs"
 }
