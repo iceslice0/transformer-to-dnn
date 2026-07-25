@@ -361,20 +361,25 @@ class PairwiseDotBySquare(nn.Module):
 
 class GibbsTopKSoftmax(nn.Module):
     """
-    Sparse Gibbs Top-K with a fixed omitted-tail probability parameter.
+    Sparse Gibbs Top-K with omitted-tail probability mass.
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
     :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; with
     ``allow_matmul=False`` use ``exp(vals - log(sum_exp + eps))`` (same math, no division).
 
-    ``gibbs_tail_prob_eps`` reserves probability mass for all omitted entries and scales the top-k
-    probabilities by ``1 - gibbs_tail_prob_eps``. The value is an ``nn.Parameter`` initialized from
-    config, then typically overwritten by surgery calibration. The scale is applied to top-k
-    probabilities through an explicit ``AffineHadamard`` module rather than a bare tensor multiply
-    in ``forward``.
+    By default ``gibbs_tail_prob_eps`` reserves probability mass for all omitted entries and scales
+    the top-k probabilities by ``1 - gibbs_tail_prob_eps``. The value is an ``nn.Parameter``
+    initialized from config, then typically overwritten by surgery calibration. The scale is applied
+    to top-k probabilities through an explicit ``AffineHadamard`` module rather than a bare tensor
+    multiply in ``forward``.
 
-    Only normalization subgraphs for the chosen ``allow_matmul`` mode are registered.
+    With ``use_exact_tail_mass=True``, ``q_tail`` is the exact dense-softmax omitted mass computed at
+    runtime via the centroid partition trick: ``Z_all = N * mean(exp(scores - row_max))``,
+    ``q_tail = 1 - Z_top / Z_all``. Omitted keys are never gathered; the mean over all keys is the
+    centroid. The calibrated ``gibbs_tail_prob_eps`` parameter is unused in that mode.
+
+    Only normalization subgraphs for the chosen ``allow_matmul`` / exact-tail mode are registered.
 
     ``eps`` is the same floor as LayerNorm / run config for log/reciprocal normalizers.
     """
@@ -387,10 +392,12 @@ class GibbsTopKSoftmax(nn.Module):
         eps: float,
         gibbs_tail_prob_eps: float,
         allow_matmul: bool = False,
+        use_exact_tail_mass: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
         self.top_k = top_k
+        self.use_exact_tail_mass = bool(use_exact_tail_mass)
         tail_prob = float(gibbs_tail_prob_eps)
         if not 0.0 <= tail_prob < 1.0:
             raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
@@ -415,6 +422,27 @@ class GibbsTopKSoftmax(nn.Module):
                 "i,...i->...",
                 torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
             )
+        if self.use_exact_tail_mass:
+            self.all_vals_stable_contract = AffineContract(
+                "i,...i->...",
+                torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
+            )
+            self.mean_exp_all = AffineMean(dim=-1, keepdim=True)
+            self.scale_z_all = AffineScale(float(self.seq_len))
+            self.one_minus_top_mass = AffineContract(
+                "i,...i->...",
+                torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
+            )
+            if allow_matmul:
+                self.inv_z_all = NLReciprocalPlusEps(e)
+                self.mul_ztop_inv_zall = AffineHadamard()
+            else:
+                self.log_z_all = NLLogPlusEps(e)
+                self.log_z_top = NLLogPlusEps(e)
+                self.top_mass_log_contract = AffineContract(
+                    "i,...i->...",
+                    torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+                )
 
     def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -442,9 +470,25 @@ class GibbsTopKSoftmax(nn.Module):
             top_probs = self.exp(logits_norm)
 
         if nk > k:
-            tail_prob = self.gibbs_tail_prob_eps.to(device=s_k.device, dtype=s_k.dtype).clamp(0.0, 1.0)
-            probs = self.scale_top_probs_by_tail(top_probs, 1.0 - tail_prob)
-            q_tail = RoutingExpandAs(tail_prob, s_k)
+            if self.use_exact_tail_mass:
+                _s, _rm = RoutingBroadcastTensors(scores, row_max)
+                scores_stable = self.all_vals_stable_contract(RoutingStack((_s, _rm), dim=-1))
+                exp_all = self.exp(scores_stable)
+                z_all = self.scale_z_all(self.mean_exp_all(exp_all))
+                if self.allow_matmul:
+                    top_mass = self.mul_ztop_inv_zall(normalizer, self.inv_z_all(z_all))
+                else:
+                    log_z_top = self.log_z_top(normalizer)
+                    neg_log_z_all = -self.log_z_all(z_all)
+                    _lt, _nlza = RoutingBroadcastTensors(log_z_top, neg_log_z_all)
+                    top_mass = self.exp(self.top_mass_log_contract(RoutingStack((_lt, _nlza), dim=-1)))
+                ones = RoutingFullLike(top_mass, 1.0)
+                q_tail = self.one_minus_top_mass(RoutingStack((ones, top_mass), dim=-1))
+                probs = self.scale_top_probs_by_tail(top_probs, top_mass)
+            else:
+                tail_prob = self.gibbs_tail_prob_eps.to(device=s_k.device, dtype=s_k.dtype).clamp(0.0, 1.0)
+                probs = self.scale_top_probs_by_tail(top_probs, 1.0 - tail_prob)
+                q_tail = RoutingExpandAs(tail_prob, s_k)
         else:
             probs = top_probs
             q_tail = RoutingFullLike(s_k, 0.0)
@@ -526,6 +570,7 @@ class SurgeryAttention(nn.Module):
         allow_matmul: bool = False,
         eps_ln: float = 1e-5,
         gibbs_tail_prob_eps: float = 1e-5,
+        use_exact_tail_mass: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -547,6 +592,7 @@ class SurgeryAttention(nn.Module):
                     eps=eps_ln,
                     gibbs_tail_prob_eps=gibbs_tail_prob_eps,
                     allow_matmul=allow_matmul,
+                    use_exact_tail_mass=use_exact_tail_mass,
                 )
                 self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
                 k_eff = min(int(top_k), int(seq_len))

@@ -16,7 +16,8 @@ wrapper is `python -m transformer_surgery.cli.surgery` or `ts-surgery`.
 - dataset/loader fields shared with the adapter, such as `data_dir`, `batch_size`, `workers`,
   `randaugment`, `ra_magnitude`, `random_erasing_prob`.
 - surgery shape/numerics fields: `top_k`, `eps`, `gibbs_tail_prob_eps`,
-  `gibbs_tail_calibration_batches`, `disable_calib_gibbs_tail_prob`, `surgery_dtype`.
+  `gibbs_tail_calibration_batches`, `disable_calib_gibbs_tail_prob`, `use_exact_tail_mass`,
+  `surgery_dtype`.
 - transform flags: `disable_layernorm_replacement`, `disable_attention_surgery`,
   `disable_softmax_replacement`, `allow_matmul`.
 - output paths: `pre_ft_checkpoint`, `log_dir`.
@@ -210,7 +211,13 @@ routing plus `AffineContract` submodules so the graph lists explicit affine node
 
 Tail term:
 
-- The total omitted-tail probability is the `gibbs_tail_prob_eps` parameter when `N > K`.
+- The total omitted-tail probability is the `gibbs_tail_prob_eps` parameter when `N > K`, unless
+  `use_exact_tail_mass=True`.
+- With `use_exact_tail_mass=True`, `q_tail` is the exact dense-softmax omitted mass computed at
+  runtime via the centroid partition trick: stabilize all scores by the top-k row max, then
+  `Z_all = N * mean(exp(scores_stable))`, `q_tail = 1 - Z_top / Z_all`. Omitted keys are never
+  gathered. Top-k probabilities are scaled by `1 - q_tail` (= `Z_top / Z_all`) so they match dense
+  softmax on the kept indices. The `gibbs_tail_prob_eps` parameter is unused and frozen.
 - When `N <= K`, `q_tail` is a routed zero tensor from `RoutingFullLike`.
 
 Normalization:
@@ -255,14 +262,20 @@ helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reporte
   while replaying the residual stream of the reference model.
 - `gibbs_tail_calibration_batches` - actual number of validation minibatches used.
 - `gibbs_tail_prob_eps_calibrated_by_block` - per-block estimates of the true omitted dense-softmax
-  probability mass outside the top-k set over the calibration batches.
+  probability mass outside the top-k set over the calibration batches (copied into parameters when
+  not using exact runtime tail mass).
 - `gibbs_tail_prob_eps_calibrated_mean` plus per-block min/max variants - summary statistics for
   those omitted-tail estimates. The surgery CLI prints the by-block values.
+- `gibbs_tail_prob_eps_exact_{mean,std,min,max}_by_block` - full exact omitted-mass diagnostics
+  (including std) gathered whenever calibration or `use_exact_tail_mass` is enabled.
+- `use_exact_tail_mass` - when true, runtime `q_tail` uses the centroid partition; calibrated
+  scalars are not applied.
 - `gibbs_tail_prob_eps_calibration_rows_by_block` - sampled row count used per block.
 - `gibbs_tail_prob_eps_applied_by_block` - values copied into each `GibbsTopKSoftmax` scalar
   parameter.
 - `disable_calib_gibbs_tail_prob` - when true, the by-block tail estimate and parameter copy are
-  skipped; metrics use the configured `gibbs_tail_prob_eps`.
+  skipped (exact stats may still be gathered when `use_exact_tail_mass`); metrics use the configured
+  `gibbs_tail_prob_eps` unless exact means are available.
 - Synthetic `*_synthetic` Jeffreys variants - a sanity check on the Gibbs top-k construction itself,
   decoupled from real-data calibration. The reporter draws a 4096-row Gaussian score tensor with
   the same `nk` (block-0 key length) and `k_top` (top-k) as the calibration sample, takes the dense

@@ -37,6 +37,27 @@ if TYPE_CHECKING:
 
 
 def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
+    exact_by_block = cal.get("gibbs_tail_prob_eps_exact_mean_by_block")
+    if isinstance(exact_by_block, list) and exact_by_block:
+        values = ", ".join(f"{float(v):.6g}" for v in exact_by_block)
+        batches = cal.get("gibbs_tail_calibration_batches")
+        rows = cal.get("gibbs_tail_prob_eps_exact_rows_by_block")
+        suffix = f" over {int(batches)} batch(es)" if batches is not None else ""
+        if isinstance(rows, list) and rows:
+            suffix += f"; rows/block min={min(int(r) for r in rows)} max={max(int(r) for r in rows)}"
+        stds = cal.get("gibbs_tail_prob_eps_exact_std_by_block")
+        std_suffix = ""
+        if isinstance(stds, list) and stds:
+            std_vals = ", ".join(f"{float(v):.6g}" for v in stds)
+            std_suffix = f" std=[{std_vals}]"
+        mode = "exact runtime" if cal.get("use_exact_tail_mass") else "calibrated"
+        log_line(f"Exact gibbs tail mass by block ({mode}){suffix}: mean=[{values}]{std_suffix}")
+        if cal.get("use_exact_tail_mass"):
+            log_line(
+                "use_exact_tail_mass=True: runtime q_tail from centroid partition; "
+                "calibrated gibbs_tail_prob_eps not applied"
+            )
+            return
     by_block = cal.get("gibbs_tail_prob_eps_calibrated_by_block")
     if isinstance(by_block, list) and by_block:
         values = ", ".join(f"{float(v):.6g}" for v in by_block)
@@ -108,7 +129,8 @@ def surgery(cfg: "SurgeryConfig") -> None:
         f"disable_layernorm_replacement={cfg.disable_layernorm_replacement} "
         f"disable_attention_surgery={cfg.disable_attention_surgery} "
         f"disable_softmax_replacement={cfg.disable_softmax_replacement} "
-        f"allow_matmul={cfg.allow_matmul}"
+        f"allow_matmul={cfg.allow_matmul} "
+        f"use_exact_tail_mass={cfg.use_exact_tail_mass}"
     )
     model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
     mapping = adapter.copy_reference_weights(model, ref)

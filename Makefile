@@ -1,4 +1,4 @@
-.PHONY: all a b c d a_imagenet help
+.PHONY: all a b c d e a_imagenet help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -18,6 +18,7 @@ TAIL_SURGERY_FIXED0_TARGETS := $(foreach k,$(TAIL_KS),artifacts/checkpoints/ts_s
 TAIL_SURGERY_FIXED1E3_TARGETS := $(foreach k,$(TAIL_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_tailmass1e3.pt)
 TAIL_SURGERY_CAL_TARGETS := $(foreach k,$(TAIL_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
 TAIL_DISTILL_TARGETS := $(foreach k,$(TAIL_KS),artifacts/checkpoints/ts_distill_$(k)_fast_jeffreys.pt)
+TAIL_SURGERY_EXACT_TARGETS := $(foreach k,$(MAIN_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_tailmass_exact.pt)
 
 STRICT_FAST_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
 STRICT_STRICT_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict.pt)
@@ -29,7 +30,7 @@ PTQ_STRICT_CHANNEL_TARGETS := $(foreach k,$(PTQ_KS),artifacts/checkpoints/ts_ptq
 PTQ_STRICT_TENSOR_TARGETS := $(foreach k,$(PTQ_KS),artifacts/checkpoints/ts_ptq_$(k)_strict_pertensor_8bit.pt)
 PTQ_TARGETS := $(PTQ_FAST_CHANNEL_TARGETS) $(PTQ_FAST_TENSOR_TARGETS) $(PTQ_STRICT_CHANNEL_TARGETS) $(PTQ_STRICT_TENSOR_TARGETS)
 
-all: a b c d a_imagenet
+all: a b c d e a_imagenet
 
 # A. Main Fast-Path Top-k Results
 a: $(SURGERY_MAIN_TARGETS) $(DISTILL_MAIN_CE_TARGETS) $(DISTILL_MAIN_J_TARGETS)
@@ -46,12 +47,16 @@ c: $(STRICT_FAST_TARGETS) $(STRICT_STRICT_TARGETS)
 # D. PTQ Experiments
 d: $(PTQ_TARGETS)
 
+# E. Exact Tail-Mass Fast-Path Top-k Sweep (Pet)
+e: $(TAIL_SURGERY_EXACT_TARGETS)
+
 help:
 	@echo "Targets:"
 	@echo "  make a      # Main fast-path top-k sweep"
 	@echo "  make b      # Tail-mass ablation"
 	@echo "  make c      # Strict vs fast surgery"
 	@echo "  make d      # PTQ granularity ablation"
+	@echo "  make e      # Exact runtime tail-mass pet-fast sweep"
 	@echo "  make a_imagenet  # ImageNet fast-path surgery sweep"
 	@echo "  make all    # Run all sections"
 

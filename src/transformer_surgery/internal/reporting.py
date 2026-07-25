@@ -17,9 +17,12 @@ CALIBRATION_LEGEND_TEXT = (
     "student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val "
     "after transform, before distill. "
     "student_post_distill_*: after Jeffreys distillation (acc and mean CE / Jeffreys). "
-    "gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores "
-    "(fit on train batches, not val); "
-    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
+    "gibbs_tail_prob_eps_exact_*: observed dense-softmax omitted tail mass for top-k scores "
+    "(mean/std/min/max on train batches); "
+    "gibbs_tail_prob_eps_calibrated_*: per-block means copied into GibbsTopKSoftmax when not using "
+    "exact runtime tail mass; "
+    "gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters; "
+    "use_exact_tail_mass: runtime q_tail via N*mean(exp) centroid partition instead of calibrated scalar."
 )
 
 

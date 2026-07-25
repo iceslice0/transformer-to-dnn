@@ -1,0 +1,21 @@
+{
+  "model_key": "deit_tiny_pet",
+  "data_dir": "./data",
+  "batch_size": 32,
+  "workers": 2,
+  "top_k": 128,
+  "eps": 1e-3,
+  "gibbs_tail_prob_eps": 1e-3,
+  "gibbs_tail_calibration_batches": null,
+  "disable_calib_gibbs_tail_prob": true,
+  "use_exact_tail_mass": true,
+  "reference_checkpoint": "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
+  "device": "cuda",
+  "surgery_dtype": "bfloat16",
+  "disable_layernorm_replacement": false,
+  "disable_attention_surgery": false,
+  "disable_softmax_replacement": false,
+  "allow_matmul": true,
+  "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk128_fast_tailmass_exact.pt",
+  "log_dir": "artifacts/logs"
+}

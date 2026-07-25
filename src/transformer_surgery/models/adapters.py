@@ -172,7 +172,8 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
                     if cfg.allow_matmul
                     else "SparseWeightedSumBySquare(square identity)"
                 )
-                attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax+{mix})"
+                tail = "+exact_tail" if bool(getattr(cfg, "use_exact_tail_mass", False)) else ""
+                attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax{tail}+{mix})"
         mapping: Dict[str, str] = {}
         depth = len(model.blocks) if model is not None else 12
         for i in range(depth):

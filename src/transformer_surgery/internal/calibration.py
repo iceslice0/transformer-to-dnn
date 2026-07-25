@@ -64,11 +64,15 @@ def topk_tail_mass_stats(
         tail_mass = (1.0 - top_mass).clamp(0.0, 1.0)
     else:
         tail_mass = torch.zeros(teacher.shape[0], device=teacher.device, dtype=torch.float32)
+    count = int(tail_mass.numel())
+    sum_sq = float((tail_mass.float() ** 2).sum().cpu()) if count else 0.0
     return {
-        "mean": float(tail_mass.mean().cpu()),
-        "min": float(tail_mass.min().cpu()),
-        "max": float(tail_mass.max().cpu()),
-        "count": int(tail_mass.numel()),
+        "mean": float(tail_mass.mean().cpu()) if count else 0.0,
+        "std": float(tail_mass.std(unbiased=False).cpu()) if count else 0.0,
+        "min": float(tail_mass.min().cpu()) if count else 0.0,
+        "max": float(tail_mass.max().cpu()) if count else 0.0,
+        "sum_sq": sum_sq,
+        "count": count,
     }
 
 
@@ -102,6 +106,7 @@ def _ensure_tail_slot(
     counts: List[int],
     mins: List[float],
     maxs: List[float],
+    sum_sqs: List[float],
     block_idx: int,
 ) -> None:
     while len(sums) <= block_idx:
@@ -109,6 +114,7 @@ def _ensure_tail_slot(
         counts.append(0)
         mins.append(float("inf"))
         maxs.append(float("-inf"))
+        sum_sqs.append(0.0)
 
 
 def _accumulate_tail_stats_for_block(
@@ -119,18 +125,27 @@ def _accumulate_tail_stats_for_block(
     nk: int,
     k_top: int,
     *,
-    disable_tail_calib: bool,
+    gather_exact_stats: bool,
     tail_eps_sum_by_block: List[float],
     tail_eps_count_by_block: List[int],
     tail_eps_min_by_block: List[float],
     tail_eps_max_by_block: List[float],
+    tail_eps_sum_sq_by_block: List[float],
 ) -> None:
-    if disable_tail_calib:
+    if not gather_exact_stats:
         return
     tail_stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
     count = int(tail_stats["count"])
-    _ensure_tail_slot(tail_eps_sum_by_block, tail_eps_count_by_block, tail_eps_min_by_block, tail_eps_max_by_block, block_idx)
+    _ensure_tail_slot(
+        tail_eps_sum_by_block,
+        tail_eps_count_by_block,
+        tail_eps_min_by_block,
+        tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block,
+        block_idx,
+    )
     tail_eps_sum_by_block[block_idx] += float(tail_stats["mean"]) * count
+    tail_eps_sum_sq_by_block[block_idx] += float(tail_stats["sum_sq"])
     tail_eps_count_by_block[block_idx] += count
     tail_eps_min_by_block[block_idx] = min(tail_eps_min_by_block[block_idx], float(tail_stats["min"]))
     tail_eps_max_by_block[block_idx] = max(tail_eps_max_by_block[block_idx], float(tail_stats["max"]))
@@ -140,6 +155,7 @@ def _finalize_gibbs_tail_calibration_stats(
     stats: Dict[str, Any],
     *,
     disable_tail_calib: bool,
+    use_exact_tail_mass: bool,
     gibbs_tail_prob_eps: float,
     cal_batches_cfg: Any,
     processed_batches: int,
@@ -147,25 +163,46 @@ def _finalize_gibbs_tail_calibration_stats(
     tail_eps_count_by_block: List[int],
     tail_eps_min_by_block: List[float],
     tail_eps_max_by_block: List[float],
+    tail_eps_sum_sq_by_block: List[float],
 ) -> float:
     """Populate shared metadata keys; returns ``metric_tail_prob_eps`` for Jeffreys."""
     stats["disable_calib_gibbs_tail_prob"] = disable_tail_calib
+    stats["use_exact_tail_mass"] = use_exact_tail_mass
     stats["gibbs_tail_calibration_batches_requested"] = cal_batches_cfg
     stats["gibbs_tail_calibration_batches"] = processed_batches
     stats["gibbs_tail_prob_eps_configured"] = gibbs_tail_prob_eps
-    if disable_tail_calib:
+    gather_exact = use_exact_tail_mass or not disable_tail_calib
+    if not gather_exact:
         metric = gibbs_tail_prob_eps
     else:
-        tail_eps_by_block = [
-            tail_sum / max(tail_count, 1)
-            for tail_sum, tail_count in zip(tail_eps_sum_by_block, tail_eps_count_by_block)
-        ]
-        stats["gibbs_tail_prob_eps_calibrated_by_block"] = tail_eps_by_block
-        stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
-        stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
-        stats["gibbs_tail_prob_eps_calibration_rows_by_block"] = tail_eps_count_by_block
-        stats["gibbs_tail_prob_eps_calibrated_mean"] = float(sum(tail_eps_by_block) / max(len(tail_eps_by_block), 1))
-        metric = tail_eps_by_block[0] if tail_eps_by_block else gibbs_tail_prob_eps
+        sums = torch.as_tensor(tail_eps_sum_by_block, dtype=torch.float64)
+        counts = torch.as_tensor(tail_eps_count_by_block, dtype=torch.float64)
+        sum_sqs = torch.as_tensor(tail_eps_sum_sq_by_block, dtype=torch.float64)
+        n = counts.clamp_min(1.0)
+        means_t = sums / n
+        stds_t = (sum_sqs / n - means_t.square()).clamp_min(0.0).sqrt()
+        means = means_t.tolist()
+        stds = stds_t.tolist()
+        total_n = counts.sum()
+        pooled_mean_t = sums.sum() / total_n
+        pooled_std = float((sum_sqs.sum() / total_n - pooled_mean_t.square()).clamp_min(0.0).sqrt())
+        pooled_mean = float(pooled_mean_t)
+        stats["gibbs_tail_prob_eps_exact_mean_by_block"] = means
+        stats["gibbs_tail_prob_eps_exact_std_by_block"] = stds
+        stats["gibbs_tail_prob_eps_exact_min_by_block"] = tail_eps_min_by_block
+        stats["gibbs_tail_prob_eps_exact_max_by_block"] = tail_eps_max_by_block
+        stats["gibbs_tail_prob_eps_exact_rows_by_block"] = tail_eps_count_by_block
+        stats["gibbs_tail_prob_eps_exact_mean"] = pooled_mean
+        stats["gibbs_tail_prob_eps_exact_std"] = pooled_std
+        stats["gibbs_tail_prob_eps_exact_min"] = float(min(tail_eps_min_by_block))
+        stats["gibbs_tail_prob_eps_exact_max"] = float(max(tail_eps_max_by_block))
+        if not disable_tail_calib and not use_exact_tail_mass:
+            stats["gibbs_tail_prob_eps_calibrated_by_block"] = means
+            stats["gibbs_tail_prob_eps_calibrated_min_by_block"] = tail_eps_min_by_block
+            stats["gibbs_tail_prob_eps_calibrated_max_by_block"] = tail_eps_max_by_block
+            stats["gibbs_tail_prob_eps_calibration_rows_by_block"] = tail_eps_count_by_block
+            stats["gibbs_tail_prob_eps_calibrated_mean"] = pooled_mean
+        metric = means[0]
     stats["gibbs_tail_prob_eps_metric"] = float(metric)
     return float(metric)
 
@@ -197,13 +234,14 @@ def _append_jeffreys_reporting(
     )
 
 
-def _fresh_gibbs_tail_eps_lists() -> Tuple[List[float], List[int], List[float], List[float]]:
-    return [], [], [], []
+def _fresh_gibbs_tail_eps_lists() -> Tuple[List[float], List[int], List[float], List[float], List[float]]:
+    return [], [], [], [], []
 
 
 def _skipped_gibbs_tail_reporting(
     *,
     disable_tail_calib: bool,
+    use_exact_tail_mass: bool,
     cal_batches_cfg: Any,
     gibbs_tail_prob_eps: float,
     calibration_mode: str,
@@ -212,6 +250,7 @@ def _skipped_gibbs_tail_reporting(
     """Reporting-only dict when Gibbs-tail calibration does not run on a forward path."""
     return {
         "disable_calib_gibbs_tail_prob": disable_tail_calib,
+        "use_exact_tail_mass": use_exact_tail_mass,
         "gibbs_tail_calibration_batches_requested": cal_batches_cfg,
         "gibbs_tail_calibration_batches": batches,
         "gibbs_tail_prob_eps_configured": gibbs_tail_prob_eps,
@@ -226,6 +265,7 @@ def _write_gibbs_tail_reporting(
     mse_acc: float,
     n_ln: int,
     disable_tail_calib: bool,
+    use_exact_tail_mass: bool,
     gibbs_tail_prob_eps: float,
     cal_batches_cfg: Any,
     processed_batches: int,
@@ -233,6 +273,7 @@ def _write_gibbs_tail_reporting(
     tail_eps_count_by_block: List[int],
     tail_eps_min_by_block: List[float],
     tail_eps_max_by_block: List[float],
+    tail_eps_sum_sq_by_block: List[float],
     calibration_mode: str,
     device: torch.device,
     dt: torch.dtype,
@@ -244,6 +285,7 @@ def _write_gibbs_tail_reporting(
     metric_tail_prob_eps = _finalize_gibbs_tail_calibration_stats(
         stats,
         disable_tail_calib=disable_tail_calib,
+        use_exact_tail_mass=use_exact_tail_mass,
         gibbs_tail_prob_eps=gibbs_tail_prob_eps,
         cal_batches_cfg=cal_batches_cfg,
         processed_batches=processed_batches,
@@ -251,6 +293,7 @@ def _write_gibbs_tail_reporting(
         tail_eps_count_by_block=tail_eps_count_by_block,
         tail_eps_min_by_block=tail_eps_min_by_block,
         tail_eps_max_by_block=tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
     )
     stats["calibration_mode"] = calibration_mode
     _append_jeffreys_reporting(
@@ -303,12 +346,20 @@ def calibrate_vit_reference(
     eps = float(cfg.eps)
     gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
     disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
+    use_exact_tail_mass = bool(getattr(cfg, "use_exact_tail_mass", False))
+    gather_exact_stats = use_exact_tail_mass or not disable_tail_calib
     cal_batches_cfg = cfg.gibbs_tail_calibration_batches
     top_k = int(cfg.top_k)
     use_cuda = device.type == "cuda"
     mse_acc = 0.0
     n_ln = 0
-    tail_eps_sum_by_block, tail_eps_count_by_block, tail_eps_min_by_block, tail_eps_max_by_block = _fresh_gibbs_tail_eps_lists()
+    (
+        tail_eps_sum_by_block,
+        tail_eps_count_by_block,
+        tail_eps_min_by_block,
+        tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block,
+    ) = _fresh_gibbs_tail_eps_lists()
     block0_nk = 0
     block0_k_top = 0
 
@@ -350,7 +401,7 @@ def calibrate_vit_reference(
                 copy_ln_params_to_rewritten(rw, blk.norm1)
                 mse_acc += torch.mean((rw(h) - n1).pow(2)).item()
                 n_ln += 1
-                if block_idx == 0 or not disable_tail_calib:
+                if block_idx == 0 or gather_exact_stats:
                     scores = fused_qkv_attention_qk_scores(blk.attn, n1)
                     teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k)
                     _accumulate_tail_stats_for_block(
@@ -360,11 +411,12 @@ def calibrate_vit_reference(
                         idx,
                         nk,
                         k_top,
-                        disable_tail_calib=disable_tail_calib,
+                        gather_exact_stats=gather_exact_stats,
                         tail_eps_sum_by_block=tail_eps_sum_by_block,
                         tail_eps_count_by_block=tail_eps_count_by_block,
                         tail_eps_min_by_block=tail_eps_min_by_block,
                         tail_eps_max_by_block=tail_eps_max_by_block,
+                        tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
                     )
                     if block_idx == 0:
                         block0_nk = nk
@@ -394,6 +446,7 @@ def calibrate_vit_reference(
         mse_acc=mse_acc,
         n_ln=n_ln,
         disable_tail_calib=disable_tail_calib,
+        use_exact_tail_mass=use_exact_tail_mass,
         gibbs_tail_prob_eps=gibbs_tail_prob_eps,
         cal_batches_cfg=cal_batches_cfg,
         processed_batches=processed_batches,
@@ -401,6 +454,7 @@ def calibrate_vit_reference(
         tail_eps_count_by_block=tail_eps_count_by_block,
         tail_eps_min_by_block=tail_eps_min_by_block,
         tail_eps_max_by_block=tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
         calibration_mode="vit_reference",
         device=device,
         dt=dt,
@@ -412,6 +466,8 @@ def calibrate_vit_reference(
 
 
 def apply_gibbs_tail_calibration(model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
+    if bool(calibration.get("use_exact_tail_mass", False)):
+        return {}
     if bool(calibration.get("disable_calib_gibbs_tail_prob", False)):
         return {}
     values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
@@ -556,6 +612,8 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
     eps = float(cfg.eps)
     gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
     disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
+    use_exact_tail_mass = bool(getattr(cfg, "use_exact_tail_mass", False))
+    gather_exact_stats = use_exact_tail_mass or not disable_tail_calib
     cal_batches_cfg = cfg.gibbs_tail_calibration_batches
     top_k_cfg = int(cfg.top_k)
 
@@ -563,6 +621,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
     if not score_targets:
         return _skipped_gibbs_tail_reporting(
             disable_tail_calib=disable_tail_calib,
+            use_exact_tail_mass=use_exact_tail_mass,
             cal_batches_cfg=cal_batches_cfg,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             calibration_mode="skipped_no_gibbs_attention",
@@ -584,7 +643,13 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
 
         mse_acc = 0.0
         n_ln = 0
-        tail_eps_sum_by_block, tail_eps_count_by_block, tail_eps_min_by_block, tail_eps_max_by_block = _fresh_gibbs_tail_eps_lists()
+        (
+            tail_eps_sum_by_block,
+            tail_eps_count_by_block,
+            tail_eps_min_by_block,
+            tail_eps_max_by_block,
+            tail_eps_sum_sq_by_block,
+        ) = _fresh_gibbs_tail_eps_lists()
         block0_nk = 0
         block0_k_top = 0
 
@@ -604,7 +669,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
                 if not torch.is_tensor(output):
                     return
                 scores = output
-                if _bi == 0 or not disable_tail_calib:
+                if _bi == 0 or gather_exact_stats:
                     teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k_cfg)
                     _accumulate_tail_stats_for_block(
                         _bi,
@@ -613,11 +678,12 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
                         idx,
                         nk,
                         k_top,
-                        disable_tail_calib=disable_tail_calib,
+                        gather_exact_stats=gather_exact_stats,
                         tail_eps_sum_by_block=tail_eps_sum_by_block,
                         tail_eps_count_by_block=tail_eps_count_by_block,
                         tail_eps_min_by_block=tail_eps_min_by_block,
                         tail_eps_max_by_block=tail_eps_max_by_block,
+                        tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
                     )
                     if _bi == 0:
                         block0_nk = nk
@@ -674,6 +740,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
             mse_acc=mse_acc,
             n_ln=n_ln,
             disable_tail_calib=disable_tail_calib,
+            use_exact_tail_mass=use_exact_tail_mass,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             cal_batches_cfg=cal_batches_cfg,
             processed_batches=processed_batches,
@@ -681,6 +748,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
             tail_eps_count_by_block=tail_eps_count_by_block,
             tail_eps_min_by_block=tail_eps_min_by_block,
             tail_eps_max_by_block=tail_eps_max_by_block,
+            tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
             calibration_mode="surgery_student_k_eq_seq_len",
             device=device,
             dt=dt,

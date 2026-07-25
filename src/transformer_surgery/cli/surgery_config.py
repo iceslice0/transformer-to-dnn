@@ -22,6 +22,7 @@ class SurgeryConfig:
     gibbs_tail_prob_eps: float = 1e-5
     gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
+    use_exact_tail_mass: bool = False
     reference_checkpoint: Optional[str] = None
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
@@ -47,6 +48,10 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "gibbs_tail_prob_eps": "Initial omitted-tail probability mass; calibration overwrites per-block values.",
     "gibbs_tail_calibration_batches": "Training batches for Gibbs tail mass; JSON null uses the full train loader.",
     "disable_calib_gibbs_tail_prob": "Disable calibration/application of per-block Gibbs omitted-tail probability.",
+    "use_exact_tail_mass": (
+        "Compute omitted-tail mass at runtime from dense softmax via the centroid partition trick "
+        "(N * mean(exp)) instead of using the calibrated/fixed gibbs_tail_prob_eps scalar."
+    ),
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",

@@ -71,6 +71,7 @@ class SurgeryBlock(nn.Module):
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
         gibbs_tail_prob_eps: float = 1e-5,
+        use_exact_tail_mass: bool = False,
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
@@ -91,6 +92,7 @@ class SurgeryBlock(nn.Module):
             allow_matmul=allow_matmul,
             eps_ln=eps_ln,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
+            use_exact_tail_mass=use_exact_tail_mass,
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
@@ -132,6 +134,7 @@ class DeiTTinySurgeryModel(nn.Module):
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
         gibbs_tail_prob_eps: float = 1e-5,
+        use_exact_tail_mass: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -139,6 +142,7 @@ class DeiTTinySurgeryModel(nn.Module):
         self.use_surgery_layernorm = use_surgery_layernorm
         self.use_attention_surgery = use_attention_surgery
         self.use_surgery_softmax = use_surgery_softmax
+        self.use_exact_tail_mass = bool(use_exact_tail_mass)
         self.patch_embed = PatchEmbed(img_size, patch_size, 3, embed_dim)
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -168,6 +172,7 @@ class DeiTTinySurgeryModel(nn.Module):
                     use_surgery_softmax=use_surgery_softmax,
                     allow_matmul=allow_matmul,
                     gibbs_tail_prob_eps=gibbs_tail_prob_eps,
+                    use_exact_tail_mass=use_exact_tail_mass,
                 )
                 for i in range(depth)
             ]
@@ -195,6 +200,7 @@ class DeiTTinySurgeryModel(nn.Module):
             use_attention_surgery=not bool(cfg.disable_attention_surgery),
             use_surgery_softmax=not bool(cfg.disable_softmax_replacement),
             allow_matmul=bool(cfg.allow_matmul),
+            use_exact_tail_mass=bool(getattr(cfg, "use_exact_tail_mass", False)),
         )
 
     @classmethod
@@ -210,6 +216,7 @@ class DeiTTinySurgeryModel(nn.Module):
             use_attention_surgery=not bool(d["disable_attention_surgery"]),
             use_surgery_softmax=not bool(d["disable_softmax_replacement"]),
             allow_matmul=bool(d["allow_matmul"]),
+            use_exact_tail_mass=bool(d.get("use_exact_tail_mass", False)),
         )
 
     def _init_weights(self) -> None:
@@ -277,3 +284,10 @@ def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
                 m.inv_z.eps.requires_grad = False
             else:
                 m.log_z.eps.requires_grad = False
+            if m.use_exact_tail_mass:
+                m.gibbs_tail_prob_eps.requires_grad = False
+                if m.allow_matmul:
+                    m.inv_z_all.eps.requires_grad = False
+                else:
+                    m.log_z_all.eps.requires_grad = False
+                    m.log_z_top.eps.requires_grad = False

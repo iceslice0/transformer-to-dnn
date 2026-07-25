@@ -90,6 +90,9 @@ class PackageSmokeTests(unittest.TestCase):
         stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
         self.assertEqual(stats["count"], 2)
         self.assertGreaterEqual(stats["mean"], 0.0)
+        self.assertIn("std", stats)
+        self.assertGreaterEqual(stats["std"], 0.0)
+        self.assertLessEqual(stats["min"], stats["max"])
 
     def test_gibbs_topk_stabilizes_from_ordered_topk(self) -> None:
         import torch
@@ -111,6 +114,37 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.equal(idx, expected_idx))
         self.assertTrue(torch.allclose(probs, expected, atol=1e-6))
         self.assertTrue(torch.equal(q_tail, torch.zeros_like(q_tail)))
+
+    def test_gibbs_exact_tail_mass_matches_dense_omitted(self) -> None:
+        import torch
+
+        from transformer_surgery.ops import GibbsTopKSoftmax
+
+        scores = torch.tensor([[[[1.0, 5.0, 3.0, -2.0, 4.0], [0.5, -1.0, 2.0, 2.5, 0.0]]]])
+        for allow_matmul in (False, True):
+            gibbs = GibbsTopKSoftmax(
+                seq_len=5,
+                top_k=2,
+                eps=1e-6,
+                gibbs_tail_prob_eps=0.5,
+                allow_matmul=allow_matmul,
+                use_exact_tail_mass=True,
+            )
+            probs, idx, q_tail = gibbs(scores)
+            flat = scores.reshape(-1, 5)
+            dense = torch.softmax(flat, dim=-1)
+            top_mass = dense.gather(1, idx.reshape(-1, 2)).sum(dim=-1)
+            expected_tail = (1.0 - top_mass).reshape_as(q_tail.squeeze(-1))
+            self.assertTrue(torch.allclose(q_tail.squeeze(-1), expected_tail, atol=1e-5))
+            self.assertTrue(
+                torch.allclose(
+                    probs.sum(dim=-1) + q_tail.squeeze(-1),
+                    torch.ones_like(expected_tail),
+                    atol=1e-5,
+                )
+            )
+            kept = dense.gather(1, idx.reshape(-1, 2)).reshape_as(probs)
+            self.assertTrue(torch.allclose(probs, kept, atol=1e-5))
 
     def test_ptq_calibration_samples_random_batches(self) -> None:
         import torch

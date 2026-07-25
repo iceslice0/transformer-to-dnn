@@ -8,6 +8,7 @@ __pycache__/
 data/
 logs/
 models/
+mambal/
 !src/transformer_surgery/models/
 !src/transformer_surgery/models/*.py
 artifacts/
