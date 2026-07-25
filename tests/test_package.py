@@ -177,10 +177,52 @@ class PackageSmokeTests(unittest.TestCase):
         wrapper = make_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
         self.assertEqual(wrapper.quantizer.input_scale.numel(), 1)
         self.assertIsInstance(wrapper.accumulator, nn.Linear)
+        self.assertEqual(setup.activation_bits, 8)
         built = build_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
         skeleton = ptq_wrapper_from_reload_config(built.reload_config, nn.Linear(3, 2, bias=False))
         skeleton.load_state_dict(built.module.state_dict(), strict=True)
         self.assertEqual(tuple(skeleton(torch.ones(2, 3)).shape), (2, 2))
+
+        from transformer_surgery.internal.calibration import (
+            ptq_activation_bits_for_kind,
+            ptq_activation_group,
+        )
+
+        self.assertEqual(ptq_activation_group("linear"), "linear")
+        self.assertEqual(ptq_activation_group("conv2d"), "linear")
+        self.assertEqual(ptq_activation_group("affine_scale"), "affine")
+        self.assertEqual(ptq_activation_group("matmul"), "matmul")
+        # Linear/Conv keep activation_bits even when affine override is set.
+        self.assertEqual(
+            ptq_activation_bits_for_kind(
+                "linear", 8, affine_activation_bits=12, matmul_activation_bits=8
+            ),
+            8,
+        )
+        self.assertEqual(
+            ptq_activation_bits_for_kind(
+                "conv2d", 8, affine_activation_bits=12, matmul_activation_bits=8
+            ),
+            8,
+        )
+        self.assertEqual(
+            ptq_activation_bits_for_kind(
+                "affine_scale", 8, affine_activation_bits=12, matmul_activation_bits=8
+            ),
+            12,
+        )
+        self.assertEqual(
+            ptq_activation_bits_for_kind(
+                "matmul", 8, affine_activation_bits=12, matmul_activation_bits=8
+            ),
+            8,
+        )
+        self.assertEqual(
+            ptq_activation_bits_for_kind(
+                "affine_scale", 8, affine_activation_bits=None, matmul_activation_bits=None
+            ),
+            8,
+        )
 
     def test_traceable_artifact_names(self) -> None:
         from transformer_surgery.internal.reporting import (

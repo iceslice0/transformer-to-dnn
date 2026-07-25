@@ -41,6 +41,10 @@ fields are:
   `exclude_names`.
 - quantization fields: `weight_bits`, `activation_bits`, `affine_activation_bits`,
   `matmul_activation_bits`, `per_output_channel`, `dequant_var_eps`.
+  Activation bit-widths split into three groups: `activation_bits` for
+  `Linear`/`Conv2d`, `affine_activation_bits` for surgery affine nodes (falls
+  back to `activation_bits` when unset), and `matmul_activation_bits` for
+  `AffineMatMul`/`AffineHadamard` (same fallback).
 - optional architecture overrides: `top_k`, `eps`.
 - `output`: desired checkpoint directory/name. The final filename is normalized from the tool and
   config name.

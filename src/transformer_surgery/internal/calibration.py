@@ -729,7 +729,11 @@ def _gibbs_cal_batch_indices(
     return list(range(min(total, lim)))
 
 
+PTQ_LINEAR_KINDS = frozenset({"linear", "conv2d"})
 PTQ_MATMUL_KINDS = frozenset({"matmul", "matmul_hadamard"})
+PTQ_AFFINE_KINDS = frozenset(
+    {"affine_scale", "affine_scale_bias", "affine_fixed_mix", "affine_contract"}
+)
 
 _PTQ_KIND_BY_TYPE: Tuple[Tuple[type, str], ...] = (
     (nn.Linear, "linear"),
@@ -751,7 +755,11 @@ def ptq_module_kind(module: nn.Module) -> Optional[str]:
 
 
 def ptq_activation_group(kind: str) -> str:
-    return "matmul" if kind in PTQ_MATMUL_KINDS else "affine"
+    if kind in PTQ_LINEAR_KINDS:
+        return "linear"
+    if kind in PTQ_MATMUL_KINDS:
+        return "matmul"
+    return "affine"
 
 
 def ptq_activation_bits_for_kind(
@@ -761,7 +769,16 @@ def ptq_activation_bits_for_kind(
     affine_activation_bits: Optional[int] = None,
     matmul_activation_bits: Optional[int] = None,
 ) -> int:
+    """Resolve activation bit-width for a PTQ node kind.
+
+    Three groups:
+    - ``linear`` / ``conv2d`` → ``activation_bits``
+    - matmul kinds → ``matmul_activation_bits`` if set, else ``activation_bits``
+    - surgery affine kinds → ``affine_activation_bits`` if set, else ``activation_bits``
+    """
     default_bits = int(activation_bits)
+    if kind in PTQ_LINEAR_KINDS:
+        return default_bits
     if kind in PTQ_MATMUL_KINDS:
         return int(matmul_activation_bits) if matmul_activation_bits is not None else default_bits
     return int(affine_activation_bits) if affine_activation_bits is not None else default_bits

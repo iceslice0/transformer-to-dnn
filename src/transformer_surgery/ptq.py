@@ -234,10 +234,17 @@ def _ptq_summary(
         },
         "quantization": {
             "weight_bits": int(cfg.weight_bits),
-            "activation_bits": int(cfg.activation_bits),
-            "affine_activation_bits": int(
+            "activation_bits": int(
                 ptq_activation_bits_for_kind(
                     "linear",
+                    cfg.activation_bits,
+                    affine_activation_bits=cfg.affine_activation_bits,
+                    matmul_activation_bits=cfg.matmul_activation_bits,
+                )
+            ),
+            "affine_activation_bits": int(
+                ptq_activation_bits_for_kind(
+                    "affine_scale",
                     cfg.activation_bits,
                     affine_activation_bits=cfg.affine_activation_bits,
                     matmul_activation_bits=cfg.matmul_activation_bits,

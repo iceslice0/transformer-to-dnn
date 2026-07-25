@@ -27,6 +27,10 @@ class PTQSurgeryConfig:
     include_names: List[str] = field(default_factory=list)
     exclude_names: List[str] = field(default_factory=list)
     weight_bits: int = 8
+    # Activation bit-widths by node group:
+    # - activation_bits: Linear / Conv2d
+    # - affine_activation_bits: surgery affine ops (falls back to activation_bits)
+    # - matmul_activation_bits: AffineMatMul / AffineHadamard (falls back to activation_bits)
     activation_bits: int = 8
     affine_activation_bits: Optional[int] = None
     matmul_activation_bits: Optional[int] = None
