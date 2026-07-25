@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import os
+import statistics
 import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -61,16 +61,10 @@ def _clone_state_dict_to_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 def _validation_accuracy_summary(run_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     accs = [float(run["val_acc"]) for run in run_results]
-    n = len(accs)
-    mean = sum(accs) / n if n else 0.0
-    if n > 1:
-        std = math.sqrt(sum((acc - mean) ** 2 for acc in accs) / (n - 1))
-    else:
-        std = 0.0
     return {
-        "val_acc_mean": mean,
-        "val_acc_std": std,
-        "num_trainings": n,
+        "val_acc_mean": statistics.mean(accs),
+        "val_acc_std": statistics.stdev(accs) if len(accs) > 1 else 0.0,
+        "num_trainings": len(accs),
     }
 
 
@@ -101,8 +95,7 @@ def eval_distillation_metrics(
         j_sum_t += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().double()
         correct_t += (s_log.argmax(dim=-1) == y).sum()
         n += y.size(0)
-    denom = max(n, 1)
-    return correct_t.item() / denom, ce_sum_t.item() / denom, j_sum_t.item() / denom
+    return correct_t.item() / n, ce_sum_t.item() / n, j_sum_t.item() / n
 
 
 def distill_student_from_teacher(

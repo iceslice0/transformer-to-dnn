@@ -158,8 +158,7 @@ def validate_model(model: nn.Module, loader, criterion: nn.Module) -> Tuple[floa
         loss_sum_t += criterion(logits.float(), y).double() * y.size(0)
         correct_t += (logits.argmax(dim=-1) == y).sum()
         n += y.size(0)
-    denom = max(n, 1)
-    return correct_t.item() / denom, loss_sum_t.item() / denom
+    return correct_t.item() / n, loss_sum_t.item() / n
 
 
 def _build_ptq_model(

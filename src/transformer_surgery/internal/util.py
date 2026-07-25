@@ -131,8 +131,6 @@ def accuracy_and_loss(
             nc = int(num_classes) if num_classes is not None else int(logits.shape[-1])
             acc_metric = MulticlassAccuracy(num_classes=nc, average="micro").to(device)
         acc_metric.update(logits, y)
-    if acc_metric is None or n_samples == 0:
-        return 0.0, 0.0
     return float(acc_metric.compute().item()), loss_sum_t.item() / n_samples
 
 

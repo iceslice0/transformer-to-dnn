@@ -65,13 +65,12 @@ def topk_tail_mass_stats(
     else:
         tail_mass = torch.zeros(teacher.shape[0], device=teacher.device, dtype=torch.float32)
     count = int(tail_mass.numel())
-    sum_sq = float((tail_mass.float() ** 2).sum().cpu()) if count else 0.0
     return {
-        "mean": float(tail_mass.mean().cpu()) if count else 0.0,
-        "std": float(tail_mass.std(unbiased=False).cpu()) if count else 0.0,
-        "min": float(tail_mass.min().cpu()) if count else 0.0,
-        "max": float(tail_mass.max().cpu()) if count else 0.0,
-        "sum_sq": sum_sq,
+        "mean": float(tail_mass.mean().cpu()),
+        "std": float(tail_mass.std(unbiased=False).cpu()),
+        "min": float(tail_mass.min().cpu()),
+        "max": float(tail_mass.max().cpu()),
+        "sum_sq": float((tail_mass.float() ** 2).sum().cpu()),
         "count": count,
     }
 
@@ -178,9 +177,8 @@ def _finalize_gibbs_tail_calibration_stats(
         sums = torch.as_tensor(tail_eps_sum_by_block, dtype=torch.float64)
         counts = torch.as_tensor(tail_eps_count_by_block, dtype=torch.float64)
         sum_sqs = torch.as_tensor(tail_eps_sum_sq_by_block, dtype=torch.float64)
-        n = counts.clamp_min(1.0)
-        means_t = sums / n
-        stds_t = (sum_sqs / n - means_t.square()).clamp_min(0.0).sqrt()
+        means_t = sums / counts
+        stds_t = (sum_sqs / counts - means_t.square()).clamp_min(0.0).sqrt()
         means = means_t.tolist()
         stds = stds_t.tolist()
         total_n = counts.sum()
@@ -217,8 +215,6 @@ def _append_jeffreys_reporting(
     metric_tail_prob_eps: float,
 ) -> None:
     """Append block-0 Jeffreys synthetic check (shape from last block-0 top-k sample)."""
-    if block0_nk <= 0 or block0_k_top <= 0:
-        return
     teacher2 = torch.randn(4096, block0_nk, device=device, dtype=dt)
     t2_stable = _logit_stable_rows(teacher2)
     vals2, idx2 = torch.topk(t2_stable, k=block0_k_top, dim=-1, largest=True, sorted=True)
@@ -263,7 +259,7 @@ def _write_gibbs_tail_reporting(
     stats: Dict[str, Any],
     *,
     mse_acc: float,
-    n_ln: int,
+    n_ln: Optional[int],
     disable_tail_calib: bool,
     use_exact_tail_mass: bool,
     gibbs_tail_prob_eps: float,
@@ -281,7 +277,8 @@ def _write_gibbs_tail_reporting(
     block0_k_top: int,
 ) -> None:
     """LN MSE summary, tail metadata, mode, and Jeffreys reporting (shared by vit and surgery paths)."""
-    stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / max(n_ln, 1)
+    if n_ln is not None:
+        stats["ln_rewrite_mse_all_norms_mean"] = mse_acc / n_ln
     metric_tail_prob_eps = _finalize_gibbs_tail_calibration_stats(
         stats,
         disable_tail_calib=disable_tail_calib,
@@ -592,7 +589,7 @@ def _effective_gibbs_seq_len(model: nn.Module) -> int:
         if sl >= 1:
             return sl
     gibbs_list = _gibbs_modules_in_module_order(model)
-    return int(gibbs_list[0].seq_len) if gibbs_list else 0
+    return int(gibbs_list[0].seq_len)
 
 
 @torch.no_grad()
@@ -738,7 +735,7 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
         _write_gibbs_tail_reporting(
             stats,
             mse_acc=mse_acc,
-            n_ln=n_ln,
+            n_ln=n_ln if ln_names else None,
             disable_tail_calib=disable_tail_calib,
             use_exact_tail_mass=use_exact_tail_mass,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
@@ -788,10 +785,12 @@ def _gibbs_cal_batch_indices(
     """Minibatch indices for Gibbs-tail calibration (all, first N, or random N)."""
     total = int(total_batches)
     if total < 1:
-        return []
+        raise ValueError("gibbs tail calibration requires a non-empty loader")
     if cal_batches_cfg is None:
         return list(range(total))
-    lim = max(1, int(cal_batches_cfg))
+    lim = int(cal_batches_cfg)
+    if lim < 1:
+        raise ValueError(f"gibbs_tail_calibration_batches must be >= 1 or null, got {cal_batches_cfg!r}")
     if random_when_limited:
         return sample_calibration_batch_indices(total, lim, generator=generator)
     return list(range(min(total, lim)))
