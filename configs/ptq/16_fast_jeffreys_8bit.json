@@ -17,7 +17,7 @@
   "exclude_names": [],
   "weight_bits": 8,
   "activation_bits": 8,
-  "affine_activation_bits": 12,
+  "affine_activation_bits": 8,
   "matmul_activation_bits": 8,
   "per_output_channel": true
 }
