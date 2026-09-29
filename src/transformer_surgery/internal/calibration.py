@@ -20,7 +20,6 @@ from transformer_surgery.ops import (
     AffineScaleBias,
     CalibratedAffinePTQWrapper,
     RewrittenLayerNorm,
-    SurgeryAttention,
     ptq_quantize_proxy,
     ptq_signed_qrange,
 )
@@ -40,8 +39,17 @@ def sample_topk_scores(
     top_k: int,
     *,
     max_rows: int = 4096,
+    exclude_nonfinite: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     flat = scores.reshape(-1, scores.shape[-1])
+    if exclude_nonfinite:
+        # Keep rows that have at least one finite logit (causal rows always do).
+        finite_rows = torch.isfinite(flat).any(dim=-1)
+        flat = flat[finite_rows]
+        if flat.numel() == 0:
+            raise ValueError("sample_topk_scores: no finite score rows after exclude_nonfinite")
+        # Replace remaining non-finite (future keys) with a large negative for top-k / softmax.
+        flat = torch.where(torch.isfinite(flat), flat, torch.full_like(flat, -1e4))
     rows = min(flat.shape[0], max_rows)
     teacher = flat[torch.randperm(flat.shape[0], device=flat.device)[:rows]].float()
     t = _logit_stable_rows(teacher)
@@ -215,6 +223,11 @@ def _append_jeffreys_reporting(
     metric_tail_prob_eps: float,
 ) -> None:
     """Append block-0 Jeffreys synthetic check (shape from last block-0 top-k sample)."""
+    # top_k==0 (uniform attn) yields empty top-k and exact omitted mass 1.0; sparse Jeffreys is undefined.
+    if block0_k_top <= 0 or block0_nk <= 0:
+        return
+    # Match apply_gibbs_tail_calibration clamp so diagnostic stays in [0, 1).
+    metric_tail_prob_eps = max(0.0, min(float(metric_tail_prob_eps), 1.0 - 1e-7))
     teacher2 = torch.randn(4096, block0_nk, device=device, dtype=dt)
     t2_stable = _logit_stable_rows(teacher2)
     vals2, idx2 = torch.topk(t2_stable, k=block0_k_top, dim=-1, largest=True, sorted=True)
@@ -530,7 +543,10 @@ def forward_calibration_batches(
         if bi not in batch_set:
             continue
         batch_ctx.idx = bi
-        x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
+        if x.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+            x = x.to(device, non_blocking=use_cuda)
+        else:
+            x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
         with maybe_surgery_cuda_autocast(device, dt_eval):
             model(x)
         n_run += 1
@@ -559,12 +575,24 @@ def run_hook_phase(
 
 
 def _surgery_score_hook_submodules(model: nn.Module) -> List[Tuple[str, int]]:
-    """``(name, block_index)`` for each :class:`~transformer_surgery.ops.SurgeryAttention` dot output (QK scores)."""
+    """``(name, block_index)`` for each surgery attention score output used by Gibbs.
+
+    Prefers ``mask_scores`` (post causal/window mask) when present, else ``dot`` (raw QK).
+    """
     out: List[Tuple[str, int]] = []
     for name, m in model.named_modules():
-        if isinstance(m, SurgeryAttention) and m.use_attention_surgery and m.use_surgery_softmax:
-            fq = f"{name}.dot" if name else "dot"
-            out.append((fq, len(out)))
+        use_attn = bool(getattr(m, "use_attention_surgery", False))
+        use_soft = bool(getattr(m, "use_surgery_softmax", False))
+        if not (use_attn and use_soft):
+            continue
+        if hasattr(m, "mask_scores"):
+            leaf = "mask_scores"
+        elif hasattr(m, "dot"):
+            leaf = "dot"
+        else:
+            continue
+        fq = f"{name}.{leaf}" if name else leaf
+        out.append((fq, len(out)))
     return out
 
 
@@ -600,8 +628,9 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: Any) ->
     ``cfg.top_k`` (training k). Restores each block's ``gibbs.top_k`` before return; apply configured
     ``k`` and calibrated tail weights via ``apply_gibbs_tail_calibration`` after this call.
 
-    Discovers :class:`~transformer_surgery.ops.SurgeryAttention` score outputs and
-    :class:`~transformer_surgery.ops.RewrittenLayerNorm` modules by tree walk (no ``blocks`` layout required).
+    Discovers surgery-attention score outputs (``mask_scores`` when present, else ``dot`` + Gibbs
+    softmax) and :class:`~transformer_surgery.ops.RewrittenLayerNorm` modules by tree walk (no
+    ``blocks`` layout required).
     """
     device = get_device()
     dt = get_surgery_dtype()
@@ -1521,3 +1550,140 @@ def _bake_output_scale_into_weight(q_weight: torch.Tensor, out_scale: torch.Tens
     wshape = [1] * q_weight.ndim
     wshape[0] = -1
     return q_weight * out_scale.view(*wshape).to(dtype=torch.float32)
+
+
+@torch.no_grad()
+def calibrate_softmax_layernorm_reference(
+    reference: nn.Module, loader: DataLoader, cfg: Any
+) -> Dict[str, Any]:
+    """Gibbs tail / Jeffreys stats and LN-rewrite MSE from a *stock* reference by hooking its
+    ``nn.Softmax`` (attention scores) and ``nn.LayerNorm`` modules.
+
+    Model-agnostic counterpart to :func:`calibrate_vit_reference`: instead of a ViT structural
+    walk it hooks the reference's own softmax/LayerNorm, so it fits any architecture whose
+    attention softmax sees 4-D ``[B, H, Nq, Nk]`` scores (e.g. MambaIR window attention). Softmax
+    modules are indexed in firing order, which matches the depth-first ``GibbsTopKSoftmax`` order
+    in the surgery student, so :func:`apply_gibbs_tail_calibration` aligns per-block tail masses.
+    """
+    device = get_device()
+    dt = get_surgery_dtype()
+    reference.eval()
+    stats: Dict[str, Any] = {}
+    eps = float(cfg.eps)
+    gibbs_tail_prob_eps = float(cfg.gibbs_tail_prob_eps)
+    disable_tail_calib = bool(cfg.disable_calib_gibbs_tail_prob)
+    use_exact_tail_mass = bool(getattr(cfg, "use_exact_tail_mass", False))
+    gather_exact_stats = use_exact_tail_mass or not disable_tail_calib
+    cal_batches_cfg = cfg.gibbs_tail_calibration_batches
+    top_k = int(cfg.top_k)
+
+    (
+        tail_eps_sum_by_block,
+        tail_eps_count_by_block,
+        tail_eps_min_by_block,
+        tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block,
+    ) = _fresh_gibbs_tail_eps_lists()
+    block0 = {"nk": 0, "k_top": 0}
+    ln_state = {"mse_acc": 0.0, "n_ln": 0}
+    softmax_block: Dict[int, int] = {}
+    ln_cache: Dict[int, RewrittenLayerNorm] = {}
+
+    ln_modules = [m for _n, m in reference.named_modules() if isinstance(m, nn.LayerNorm)]
+    layer0_ln_id = id(ln_modules[0]) if ln_modules else None
+
+    def _softmax_hook(mod: nn.Module, inputs: Tuple[Any, ...], output: Any, *, batch_idx: int = 0) -> None:
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return
+        scores = inputs[0]
+        if scores.dim() != 4:
+            return
+        key = id(mod)
+        if key not in softmax_block:
+            softmax_block[key] = len(softmax_block)
+        bi = softmax_block[key]
+        if bi == 0 or gather_exact_stats:
+            teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k)
+            _accumulate_tail_stats_for_block(
+                bi,
+                teacher,
+                vals,
+                idx,
+                nk,
+                k_top,
+                gather_exact_stats=gather_exact_stats,
+                tail_eps_sum_by_block=tail_eps_sum_by_block,
+                tail_eps_count_by_block=tail_eps_count_by_block,
+                tail_eps_min_by_block=tail_eps_min_by_block,
+                tail_eps_max_by_block=tail_eps_max_by_block,
+                tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
+            )
+            if bi == 0:
+                block0["nk"] = nk
+                block0["k_top"] = k_top
+
+    def _ln_hook(mod: nn.Module, inputs: Tuple[Any, ...], output: Any, *, batch_idx: int = 0) -> None:
+        if not inputs or not torch.is_tensor(inputs[0]) or not torch.is_tensor(output):
+            return
+        h = inputs[0]
+        key = id(mod)
+        rw = ln_cache.get(key)
+        if rw is None:
+            rw = RewrittenLayerNorm(int(mod.normalized_shape[0]), eps=eps, allow_matmul=cfg.allow_matmul).to(
+                device=h.device, dtype=h.dtype
+            )
+            copy_ln_params_to_rewritten(rw, mod)
+            ln_cache[key] = rw
+        mse_t = (rw(h) - output).pow(2)
+        ln_state["mse_acc"] += float(mse_t.mean().item())
+        ln_state["n_ln"] += 1
+        if batch_idx == 0 and key == layer0_ln_id:
+            stats["ln_rewrite_mse_layer0_minibatch"] = float(mse_t.mean().cpu())
+
+    def install(bc: CurrentBatch, bs: set[int]) -> List[Any]:
+        handles: List[Any] = []
+
+        def _wrap(fn: Callable[..., None]) -> Callable[..., None]:
+            def inner(m: nn.Module, inp: Tuple[Any, ...], out: Any) -> None:
+                if bc.idx not in bs:
+                    return
+                fn(m, inp, out, batch_idx=bc.idx)
+
+            return inner
+
+        for m in reference.modules():
+            if isinstance(m, nn.Softmax):
+                handles.append(m.register_forward_hook(_wrap(_softmax_hook)))
+            elif isinstance(m, nn.LayerNorm):
+                handles.append(m.register_forward_hook(_wrap(_ln_hook)))
+        return handles
+
+    batch_indices = _gibbs_cal_batch_indices(len(loader), cal_batches_cfg, random_when_limited=False)
+    if not batch_indices:
+        raise ValueError("gibbs tail calibration requires at least one training batch")
+    processed_batches = run_hook_phase(reference, loader, batch_indices, install)
+    if processed_batches == 0:
+        raise ValueError("gibbs tail calibration requires at least one training batch")
+
+    _write_gibbs_tail_reporting(
+        stats,
+        mse_acc=ln_state["mse_acc"],
+        n_ln=ln_state["n_ln"] if ln_modules else None,
+        disable_tail_calib=disable_tail_calib,
+        use_exact_tail_mass=use_exact_tail_mass,
+        gibbs_tail_prob_eps=gibbs_tail_prob_eps,
+        cal_batches_cfg=cal_batches_cfg,
+        processed_batches=processed_batches,
+        tail_eps_sum_by_block=tail_eps_sum_by_block,
+        tail_eps_count_by_block=tail_eps_count_by_block,
+        tail_eps_min_by_block=tail_eps_min_by_block,
+        tail_eps_max_by_block=tail_eps_max_by_block,
+        tail_eps_sum_sq_by_block=tail_eps_sum_sq_by_block,
+        calibration_mode="reference_softmax_layernorm",
+        device=device,
+        dt=dt,
+        block0_nk=block0["nk"],
+        block0_k_top=block0["k_top"],
+    )
+    stats["calibration_loader_split"] = "train"
+    return stats

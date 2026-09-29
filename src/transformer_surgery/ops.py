@@ -44,6 +44,29 @@ def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
     return x.squeeze() if dim is None else x.squeeze(dim)
 
 
+def RoutingAdd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Pure broadcast add used for score masking / residual wiring helpers."""
+    return a + b
+
+
+def build_causal_attn_mask(seq_len: int, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Additive causal mask ``[1, 1, N, N]``: 0 on allowed keys, ``-inf`` on future keys."""
+    n = int(seq_len)
+    mask = torch.zeros((1, 1, n, n), dtype=dtype)
+    future = torch.triu(torch.ones((n, n), dtype=torch.bool), diagonal=1)
+    mask = mask.masked_fill(future, float("-inf"))
+    return mask
+
+
+def build_causal_valid_key_mean_matrix(seq_len: int, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Lower-triangular mean matrix ``L[i, j] = 1/(i+1)`` for ``j <= i`` (valid-key mean of V)."""
+    n = int(seq_len)
+    idx = torch.arange(n, dtype=dtype)
+    valid = idx + 1.0
+    tril = torch.tril(torch.ones((n, n), dtype=dtype))
+    return tril / valid.unsqueeze(1)
+
+
 # ---------------------------------------------------------------------------
 # Op vocabulary: three groups.
 #   Affine*  - linear in each operand: parameterized layers, fixed-coeff einsum, per-channel
@@ -73,11 +96,32 @@ class AffineScale(nn.Module):
         return x * s.to(dtype=x.dtype)
 
 
+class AffineScaleTensor(nn.Module):
+    """Elementwise scale by a fixed buffer tensor (broadcastable), e.g. rotary cos/sin tables."""
+
+    def __init__(self, scale: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("scale", scale.clone().detach())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = self.scale
+        if s.device != x.device:
+            s = s.to(device=x.device)
+        return x * s.to(dtype=x.dtype)
+
+
 class AffineHadamard(nn.Module):
     """Elementwise / broadcast product ``a * b``; both operands are tensors (bilinear, no ``@``)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a * b
+
+
+class AffineAdd(nn.Module):
+    """Elementwise / broadcast sum ``a + b`` (e.g. additive attention masks)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a + b
 
 
 class AffineMatMul(nn.Module):
@@ -651,6 +695,224 @@ class SurgeryAttention(nn.Module):
         attn = self.proj(attn)
         attn = self.proj_drop(attn)
         return attn
+
+
+class SurgeryCausalAttention(nn.Module):
+    """
+    Causal GPT-NeoX-style attention in the surgery vocabulary.
+
+    Fused QKV uses the NeoX head-interleaved layout ``(B, H, N, 3*D) -> chunk Q/K/V``.
+    Partial rotary is applied with fixed cos/sin buffers, then scores are masked with an
+    additive causal ``-inf`` mask before Gibbs top-k / softmax.
+
+    Sparse omitted-tail redistribution is query-position aware: for row ``i`` the allowed
+    key count is ``i+1``, and exact tail mass is reinjected only over valid keys via a
+    fixed lower-triangular mean matrix. Dense runs set ``top_k == seq_len`` so ``q_tail=0``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        seq_len: int,
+        top_k: int,
+        *,
+        rotary_ndims: int,
+        rope_theta: float = 10000.0,
+        attn_bias: bool = True,
+        attn_drop: float = 0.0,
+        use_attention_surgery: bool = True,
+        use_surgery_softmax: bool = True,
+        allow_matmul: bool = False,
+        eps_ln: float = 1e-5,
+        gibbs_tail_prob_eps: float = 1e-5,
+        use_exact_tail_mass: bool = False,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = int(num_heads)
+        self.head_dim = dim // num_heads
+        self.seq_len = int(seq_len)
+        self.rotary_ndims = int(rotary_ndims)
+        if self.rotary_ndims < 0 or self.rotary_ndims > self.head_dim:
+            raise ValueError(f"rotary_ndims={rotary_ndims} out of range for head_dim={self.head_dim}")
+        if self.rotary_ndims % 2 != 0:
+            raise ValueError(f"rotary_ndims must be even, got {self.rotary_ndims}")
+        self.use_attention_surgery = bool(use_attention_surgery)
+        self.use_surgery_softmax = bool(use_surgery_softmax)
+        self.allow_matmul = bool(allow_matmul)
+        self.use_exact_tail_mass = bool(use_exact_tail_mass)
+        self.top_k = int(top_k)
+
+        self.query_key_value = nn.Linear(dim, dim * 3, bias=attn_bias)
+        self.dense = nn.Linear(dim, dim, bias=attn_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+
+        self.register_buffer("causal_mask", build_causal_attn_mask(self.seq_len), persistent=False)
+        self._init_rotary_buffers(rope_theta)
+
+        if use_attention_surgery:
+            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
+            # Hookable masked-score node so calibration sees causal logits (not raw QK).
+            self.mask_scores = AffineAdd()
+            if use_surgery_softmax:
+                # Softmax normalizer floor is independent of LayerNorm eps; use 0 to match
+                # dense softmax (no additive floor in logZ / reciprocal).
+                self.gibbs = GibbsTopKSoftmax(
+                    self.seq_len,
+                    top_k,
+                    eps=0.0,
+                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
+                    allow_matmul=allow_matmul,
+                    use_exact_tail_mass=use_exact_tail_mass,
+                )
+                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
+                self._init_causal_tail_modules(top_k)
+            elif allow_matmul:
+                self.matmul = AffineMatMul()
+        else:
+            self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
+            if allow_matmul:
+                self.matmul = AffineMatMul()
+
+        self.rotate_neg = AffineScale(-1.0)
+        self.rope_cos_mul = AffineHadamard()
+        self.rope_sin_mul = AffineHadamard()
+        self.rope_sum = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+        )
+
+    def _init_rotary_buffers(self, rope_theta: float) -> None:
+        n = self.seq_len
+        rd = self.rotary_ndims
+        if rd == 0:
+            self.register_buffer("cos_cached", torch.ones(1, 1, n, 0), persistent=False)
+            self.register_buffer("sin_cached", torch.zeros(1, 1, n, 0), persistent=False)
+            return
+        inv_freq = 1.0 / (
+            float(rope_theta)
+            ** (torch.arange(0, rd, 2, dtype=torch.float64) / float(rd))
+        )
+        positions = torch.arange(n, dtype=torch.float64)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=get_surgery_dtype())
+        sin = emb.sin().to(dtype=get_surgery_dtype())
+        self.register_buffer("cos_cached", cos.view(1, 1, n, rd), persistent=False)
+        self.register_buffer("sin_cached", sin.view(1, 1, n, rd), persistent=False)
+
+    def _init_causal_tail_modules(self, top_k: int) -> None:
+        n = self.seq_len
+        k_eff = min(int(top_k), n)
+        valid = torch.arange(1, n + 1, dtype=torch.float32)
+        n_dropped = torch.clamp(valid - float(k_eff), min=1.0)
+        inv_dropped = 1.0 / n_dropped
+        valid_over_dropped = valid / n_dropped
+        self.register_buffer("inv_n_dropped", inv_dropped.view(1, 1, n, 1), persistent=False)
+        self.register_buffer("valid_over_dropped", valid_over_dropped.view(1, 1, n, 1), persistent=False)
+        self.valid_key_mean = AffineContract(
+            "nk,bhkd->bhnd",
+            build_causal_valid_key_mean_matrix(n, dtype=get_surgery_dtype()),
+        )
+        self.scale_mean_v_by_tail = AffineHadamard()
+        self.scale_q_tail_by_inv_dropped = AffineHadamard()
+        self.scale_tail_by_valid_over_dropped = AffineHadamard()
+        self.scale_top_probs_by_valid = AffineHadamard()
+        self.adj_probs_contract = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
+        )
+        self.attn_tail_sum = AffineContract(
+            "i,...i->...",
+            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
+        )
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return RoutingCat((self.rotate_neg(x2), x1), dim=-1)
+
+    def _apply_rotary(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        rd = self.rotary_ndims
+        if rd == 0:
+            return q, k
+        cos = self.cos_cached.to(device=q.device, dtype=q.dtype)
+        sin = self.sin_cached.to(device=q.device, dtype=q.dtype)
+        q_rot, q_pass = q[..., :rd], q[..., rd:]
+        k_rot, k_pass = k[..., :rd], k[..., rd:]
+        q_embed = self.rope_sum(
+            RoutingStack(
+                (self.rope_cos_mul(q_rot, cos), self.rope_sin_mul(self._rotate_half(q_rot), sin)),
+                dim=-1,
+            )
+        )
+        k_embed = self.rope_sum(
+            RoutingStack(
+                (self.rope_cos_mul(k_rot, cos), self.rope_sin_mul(self._rotate_half(k_rot), sin)),
+                dim=-1,
+            )
+        )
+        return RoutingCat((q_embed, q_pass), dim=-1), RoutingCat((k_embed, k_pass), dim=-1)
+
+    def _split_qkv(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, n, _ = hidden.shape
+        # NeoX layout: (B, N, H, 3*D) -> (B, H, N, 3*D) -> chunk on last dim.
+        qkv = self.query_key_value(hidden).view(b, n, self.num_heads, 3 * self.head_dim)
+        qkv = qkv.transpose(1, 2)
+        return tuple(qkv.chunk(3, dim=-1))  # type: ignore[return-value]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+        if n != self.seq_len:
+            raise ValueError(f"SurgeryCausalAttention expected seq_len={self.seq_len}, got {n}")
+        q, k, v = self._split_qkv(x)
+        q, k = self._apply_rotary(q, k)
+        mask = self.causal_mask.to(device=q.device, dtype=q.dtype)
+
+        if not self.use_attention_surgery:
+            s = self.attn_scale.to(device=q.device, dtype=q.dtype)
+            qs = q * s
+            kt = RoutingTranspose(k, -2, -1)
+            scores = self.matmul(qs, kt) if self.allow_matmul else torch.matmul(qs, kt)
+            scores = RoutingAdd(scores, mask)
+            attn = scores.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            attn = self.matmul(attn, v) if self.allow_matmul else torch.matmul(attn, v)
+        elif self.use_surgery_softmax:
+            scores = self.mask_scores(self.dot(q, k), mask)
+            probs, idx, q_tail = self.gibbs(scores)
+            # When valid_keys < top_k, topk may return future (-inf) filler indices with ~0
+            # probability. Zero them explicitly so no mass is routed past the causal boundary.
+            query_pos = torch.arange(n, device=idx.device).view(1, 1, n, 1)
+            valid = (idx <= query_pos).to(dtype=probs.dtype)
+            probs = self.scale_top_probs_by_valid(probs, valid)
+            inv = self.inv_n_dropped.to(device=probs.device, dtype=probs.dtype)
+            vod = self.valid_over_dropped.to(device=probs.device, dtype=probs.dtype)
+            q_tail_adj = self.scale_q_tail_by_inv_dropped(q_tail, inv)
+            _p, _qta = RoutingBroadcastTensors(probs, q_tail_adj)
+            adjusted_probs = self.adj_probs_contract(RoutingStack((_p, _qta), dim=-1))
+            adjusted_probs = self.scale_top_probs_by_valid(adjusted_probs, valid)
+            attn_top = self.sparse_mix(adjusted_probs, idx, v)
+            mean_v = self.valid_key_mean(v)
+            tail_scaled = self.scale_mean_v_by_tail(mean_v, q_tail)
+            tail_contrib = self.scale_tail_by_valid_over_dropped(tail_scaled, vod)
+            _a, _t = RoutingBroadcastTensors(attn_top, tail_contrib)
+            attn = self.attn_tail_sum(RoutingStack((_a, _t), dim=-1))
+        else:
+            scores = self.mask_scores(self.dot(q, k), mask)
+            attn = scores.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            if self.allow_matmul:
+                attn = self.matmul(attn, v)
+            else:
+                _, _, nq, nk = attn.shape
+                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
+                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
+
+        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
+        return self.dense(attn)
 
 
 # ---------------------------------------------------------------------------

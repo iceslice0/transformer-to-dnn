@@ -24,7 +24,6 @@ from transformer_surgery.internal.reporting import (
     write_model_structure_txt,
 )
 from transformer_surgery.internal.util import (
-    accuracy_and_loss,
     get_device,
     get_surgery_dtype,
     namespace_from_mapping,
@@ -71,22 +70,22 @@ def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
         log_line(f"gibbs_tail_prob_eps calibration disabled; using configured value {configured:.6g}")
 
 
-def _timed_accuracy_and_loss(
-    model: nn.Module, val_loader: Any, criterion: nn.Module, device: Any
-) -> tuple[float, float, float, int | None]:
+def _timed_evaluate(
+    adapter: Any, model: nn.Module, val_loader: Any, cfg: Any, device: Any
+) -> tuple[float, float, float, int | None, dict]:
     peak_memory_bytes: int | None = None
     if getattr(device, "type", None) == "cuda":
         torch_device = device
         torch.cuda.synchronize(torch_device)
         torch.cuda.reset_peak_memory_stats(torch_device)
     t0 = time.perf_counter()
-    acc, loss = accuracy_and_loss(model, val_loader, criterion)
+    primary, loss, extra = adapter.evaluate(model, val_loader, cfg)
     if getattr(device, "type", None) == "cuda":
         torch_device = device
         torch.cuda.synchronize(torch_device)
         peak_memory_bytes = int(torch.cuda.max_memory_allocated(torch_device))
     elapsed_s = time.perf_counter() - t0
-    return float(acc), float(loss), float(elapsed_s), peak_memory_bytes
+    return float(primary), float(loss), float(elapsed_s), peak_memory_bytes, dict(extra)
 
 
 def surgery(cfg: "SurgeryConfig") -> None:
@@ -108,21 +107,26 @@ def surgery(cfg: "SurgeryConfig") -> None:
     ref = adapter.load_reference_checkpoint(reference_path).to(device=device, dtype=dtype)
 
     before_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_before_surgery")
-    write_model_structure_txt(before_log_path, ref, "Reference Model (before surgery transform)")
+    example_input = adapter.example_model_input(cfg)
+    write_model_structure_txt(
+        before_log_path,
+        ref,
+        "Reference Model (before surgery transform)",
+        example_input=example_input,
+    )
     log_wrote(before_log_path)
 
-    criterion = nn.CrossEntropyLoss()
-    ref_acc, ref_loss, ref_val_time_s, ref_peak_memory = _timed_accuracy_and_loss(
-        ref, val_loader, criterion, device
+    ref_acc, ref_loss, ref_val_time_s, ref_peak_memory, ref_extra = _timed_evaluate(
+        adapter, ref, val_loader, cfg, device
     )
     log_line(
-        f"Reference model val acc={ref_acc:.4f} loss={ref_loss:.4f} "
+        f"Reference model val primary={ref_acc:.4f} loss={ref_loss:.4f} "
+        f"({adapter.primary_metric_name()}) "
         f"time={ref_val_time_s:.3f}s"
+        + (f" {ref_extra}" if ref_extra else "")
     )
 
     cal = adapter.calibrate_reference(ref, train_loader, cfg)
-    log_json_block("Calibration:", cal)
-    _log_tail_prob_calibration(cal, float(cfg.gibbs_tail_prob_eps))
 
     log_line(
         "Building surgery model | "
@@ -136,6 +140,12 @@ def surgery(cfg: "SurgeryConfig") -> None:
     mapping = adapter.copy_reference_weights(model, ref)
     adapter.freeze_surgery_parameters(model)
 
+    after_build_cal = adapter.calibrate_after_build(model, train_loader, cfg)
+    if after_build_cal:
+        cal.update(after_build_cal)
+    log_json_block("Calibration:", cal)
+    _log_tail_prob_calibration(cal, float(cfg.gibbs_tail_prob_eps))
+
     applied_cal = adapter.apply_calibration(model, cal)
     applied_mean = None
     if applied_cal:
@@ -145,16 +155,23 @@ def surgery(cfg: "SurgeryConfig") -> None:
             log_line(f"Applied gibbs_tail_prob_eps mean={float(applied_mean):.6g}")
 
     after_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_after_surgery")
-    write_model_structure_txt(after_log_path, model, "Surgery Model (after transform, pre-finetune checkpoint)")
+    write_model_structure_txt(
+        after_log_path,
+        model,
+        "Surgery Model (after transform, pre-finetune checkpoint)",
+        example_input=example_input,
+    )
     log_wrote(after_log_path)
 
-    pre_acc, pre_loss, pre_val_time_s, pre_peak_memory = _timed_accuracy_and_loss(
-        model, val_loader, criterion, device
+    pre_acc, pre_loss, pre_val_time_s, pre_peak_memory, pre_extra = _timed_evaluate(
+        adapter, model, val_loader, cfg, device
     )
     rel_slowdown = pre_val_time_s / ref_val_time_s if ref_val_time_s > 0 else 0.0
     log_line(
-        f"Post-transform val acc={pre_acc:.4f} loss={pre_loss:.4f} "
+        f"Post-transform val primary={pre_acc:.4f} loss={pre_loss:.4f} "
+        f"({adapter.primary_metric_name()}) "
         f"time={pre_val_time_s:.3f}s slowdown_vs_ref={rel_slowdown:.3f}x"
+        + (f" {pre_extra}" if pre_extra else "")
     )
 
     pre_path = traceable_artifact_path(cfg.pre_ft_checkpoint, cfg, "ts-surgery", extension=".pt")
@@ -173,15 +190,23 @@ def surgery(cfg: "SurgeryConfig") -> None:
         meta.gibbs_tail_prob_eps = float(applied_mean)
     meta.calibration.ref_val_acc = float(ref_acc)
     meta.calibration.ref_val_loss = float(ref_loss)
+    meta.calibration.ref_val_primary = float(ref_acc)
+    meta.calibration.ref_val_primary_name = adapter.primary_metric_name()
     meta.calibration.ref_val_wall_time_sec = float(ref_val_time_s)
     meta.calibration.student_pre_ft_val_acc = float(pre_acc)
     meta.calibration.student_pre_ft_mean_ce = float(pre_loss)
+    meta.calibration.student_pre_ft_val_primary = float(pre_acc)
+    meta.calibration.student_pre_ft_val_loss = float(pre_loss)
     meta.calibration.student_pre_ft_val_wall_time_sec = float(pre_val_time_s)
     meta.calibration.student_pre_ft_val_relative_slowdown_vs_ref = float(rel_slowdown)
     if ref_peak_memory is not None:
         meta.calibration.ref_val_peak_gpu_mem_bytes = int(ref_peak_memory)
     if pre_peak_memory is not None:
         meta.calibration.student_pre_ft_val_peak_gpu_mem_bytes = int(pre_peak_memory)
+    for key, value in ref_extra.items():
+        setattr(meta.calibration, f"ref_val_{key}", float(value))
+    for key, value in pre_extra.items():
+        setattr(meta.calibration, f"student_pre_ft_val_{key}", float(value))
 
     write_json(meta_path, namespace_to_mapping(meta))
     os.makedirs(os.path.dirname(pre_path) or ".", exist_ok=True)
@@ -193,4 +218,4 @@ def surgery(cfg: "SurgeryConfig") -> None:
 
     log_wrote(meta_path)
     log_wrote(pre_path)
-    log_line("Next: run the distill stage.")
+    log_line(adapter.next_stage_hint())

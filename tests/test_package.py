@@ -25,8 +25,10 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(transformer_surgery.__all__)
         self.assertTrue(hasattr(models, "DeiTTinySurgeryModel"))
         self.assertEqual(get_model_adapter("deit_tiny_pet").patient_name, "DeiT-Tiny")
+        self.assertEqual(get_model_adapter("pythia_70m_wikitext2").patient_name, "Pythia-70M")
         self.assertTrue(hasattr(ops, "AffineContract"))
         self.assertTrue(hasattr(ops, "SurgeryAttention"))
+        self.assertTrue(hasattr(ops, "SurgeryCausalAttention"))
         self.assertFalse(hasattr(ops, "RoutingMax"))
         self.assertEqual(pet.PET_NUM_CLASSES, 37)
         self.assertTrue(hasattr(reporting, "traceable_artifact_path"))
@@ -81,7 +83,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_gibbs_tail_calibration_helpers(self) -> None:
         import torch
 
-        from transformer_surgery.models.adapters import sample_topk_scores, topk_tail_mass_stats
+        from transformer_surgery.internal.calibration import sample_topk_scores, topk_tail_mass_stats
 
         scores = torch.arange(4 * 7, dtype=torch.float32).reshape(4, 7)
         teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k=3, max_rows=2)
@@ -394,9 +396,9 @@ class PackageSmokeTests(unittest.TestCase):
         adapter = get_model_adapter("deit_tiny_pet")
         for helper_name in ("_attention_scores", "_sample_topk_scores", "_topk_tail_mass_stats"):
             self.assertFalse(hasattr(adapter, helper_name), helper_name)
-        self.assertTrue(hasattr(adapters, "sample_topk_scores"))
-        self.assertTrue(hasattr(adapters, "topk_tail_mass_stats"))
-        self.assertTrue(hasattr(adapters, "apply_gibbs_tail_calibration"))
+        self.assertTrue(hasattr(calibration_mod, "sample_topk_scores"))
+        self.assertTrue(hasattr(calibration_mod, "topk_tail_mass_stats"))
+        self.assertTrue(hasattr(calibration_mod, "apply_gibbs_tail_calibration"))
         self.assertTrue(hasattr(calibration_mod, "calibrate_vit_reference"))
         self.assertTrue(hasattr(calibration_mod, "fused_qkv_attention_qk_scores"))
 
@@ -426,6 +428,172 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(applied["gibbs_tail_prob_eps_applied_by_block"], [0.02, 0.03])
         self.assertAlmostEqual(float(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.02, places=3)
         self.assertTrue(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.requires_grad)
+
+    def test_pythia_adapter_and_causal_attention(self) -> None:
+        import torch
+        from types import SimpleNamespace
+
+        from transformer_surgery.models.adapters import get_model_adapter
+        from transformer_surgery.models.pythia.surgery_model import (
+            PYTHIA_70M_DEFAULTS,
+            PythiaSurgeryModel,
+            arch_dict_from_hf_config,
+        )
+        from transformer_surgery.ops import (
+            SurgeryCausalAttention,
+            build_causal_attn_mask,
+            build_causal_valid_key_mean_matrix,
+        )
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
+
+        adapter = get_model_adapter("pythia_70m_wikitext2")
+        self.assertEqual(adapter.patient_name, "Pythia-70M")
+        self.assertEqual(adapter.primary_metric_name(), "neg_nll")
+        self.assertIn("Surgery-only", adapter.next_stage_hint())
+
+        mask = build_causal_attn_mask(4)
+        self.assertTrue(torch.isneginf(mask[0, 0, 0, 3]))
+        self.assertEqual(float(mask[0, 0, 3, 0]), 0.0)
+        L = build_causal_valid_key_mean_matrix(3)
+        self.assertTrue(torch.allclose(L[2], torch.tensor([1 / 3, 1 / 3, 1 / 3])))
+
+        attn = SurgeryCausalAttention(
+            32, 4, 8, 8, rotary_ndims=8, allow_matmul=True, gibbs_tail_prob_eps=0.0
+        )
+        x = torch.randn(2, 8, 32)
+        y1 = attn(x)
+        x2 = x.clone()
+        x2[:, -1] += 5.0
+        y2 = attn(x2)
+        self.assertTrue(torch.allclose(y1[:, :-1], y2[:, :-1], atol=1e-5))
+
+        # Sparse exact-tail mass: top probs + q_tail ~= 1; early rows have ~0 tail.
+        sparse = SurgeryCausalAttention(
+            32, 4, 16, 4, rotary_ndims=8, allow_matmul=True, use_exact_tail_mass=True, gibbs_tail_prob_eps=0.5
+        )
+        xs = torch.randn(1, 16, 32)
+        q, k, v = sparse._split_qkv(xs)
+        q, k = sparse._apply_rotary(q, k)
+        scores = sparse.dot(q, k) + sparse.causal_mask
+        probs, idx, q_tail = sparse.gibbs(scores)
+        query_pos = torch.arange(16).view(1, 1, 16, 1)
+        valid = idx <= query_pos
+        probs = probs * valid.to(probs.dtype)
+        self.assertTrue(torch.allclose(probs.sum(-1) + q_tail.squeeze(-1), torch.ones(1, 4, 16), atol=1e-4))
+        self.assertLess(float(q_tail[0, 0, :4].detach().abs().max()), 1e-3)
+        # After zeroing, no mass on future slots.
+        future_mass = (probs * (~valid).to(probs.dtype)).detach().abs().sum()
+        self.assertEqual(float(future_mass), 0.0)
+        _ = sparse(xs)  # full forward
+
+        # Synthetic reconstruct from extra (no HF download).
+        cfg = SimpleNamespace(
+            top_k=16,
+            eps=1e-5,
+            gibbs_tail_prob_eps=0.0,
+            disable_layernorm_replacement=False,
+            disable_attention_surgery=False,
+            disable_softmax_replacement=False,
+            allow_matmul=True,
+            use_exact_tail_mass=False,
+            context_length=16,
+        )
+        arch = dict(PYTHIA_70M_DEFAULTS)
+        arch.update(
+            {
+                "vocab_size": 128,
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "intermediate_size": 64,
+            }
+        )
+        model = PythiaSurgeryModel.from_arch_and_surgery(arch, cfg)
+        ids = torch.randint(0, 128, (2, 16))
+        logits = model(ids)
+        self.assertEqual(tuple(logits.shape), (2, 16, 128))
+        extra = {
+            "top_k": 16,
+            "gibbs_tail_prob_eps": 0.0,
+            "disable_layernorm_replacement": False,
+            "disable_attention_surgery": False,
+            "disable_softmax_replacement": False,
+            "allow_matmul": True,
+            "use_exact_tail_mass": False,
+            "context_length": 16,
+            "eps_ln": 1e-5,
+            "arch": {**arch, "seq_len": 16, "context_length": 16},
+        }
+        rebuilt = PythiaSurgeryModel.from_pretrained_extra(extra, cfg)
+        rebuilt.load_state_dict(model.state_dict(), strict=True)
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(model(ids), rebuilt(ids), atol=1e-6))
+
+        # Optional HF parity when transformers is installed.
+        try:
+            from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
+        except ImportError:
+            return
+        hf_cfg = GPTNeoXConfig(
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=64,
+            max_position_embeddings=32,
+            rope_scaling={"rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.25},
+            use_parallel_residual=True,
+            attention_bias=True,
+            hidden_act="gelu",
+        )
+        ref = GPTNeoXForCausalLM(hf_cfg).eval()
+        scfg = SimpleNamespace(
+            top_k=16,
+            eps=1e-5,
+            gibbs_tail_prob_eps=0.0,
+            disable_layernorm_replacement=True,
+            disable_attention_surgery=True,
+            disable_softmax_replacement=True,
+            allow_matmul=True,
+            use_exact_tail_mass=False,
+            context_length=16,
+        )
+        student = PythiaSurgeryModel.from_arch_and_surgery(arch_dict_from_hf_config(hf_cfg), scfg).eval()
+        student.load_from_reference(ref)
+        with torch.no_grad():
+            a = ref(input_ids=ids, use_cache=False).logits
+            b = student(ids)
+        self.assertTrue(torch.allclose(a, b, atol=1e-5, rtol=1e-4))
+
+        # Configs load.
+        dense = ROOT / "configs/surgery/pythia_70m_topk128_fast_tailmass_exact.json"
+        sparse = ROOT / "configs/surgery/pythia_70m_topk32_fast_tailmass_exact.json"
+        self.assertTrue(dense.is_file())
+        self.assertTrue(sparse.is_file())
+        dcfg = SurgeryConfig.load(str(dense))
+        sc = SurgeryConfig.load(str(sparse))
+        self.assertEqual(dcfg.model_key, "pythia_70m_wikitext2")
+        self.assertEqual(dcfg.top_k, 128)
+        self.assertTrue(dcfg.use_exact_tail_mass)
+        self.assertTrue(sc.use_exact_tail_mass)
+        self.assertEqual(sc.top_k, 32)
+
+    def test_tokenize_and_window_helpers(self) -> None:
+        import torch
+
+        from transformer_surgery.models.pythia.loaders import tokenize_and_window
+
+        class _Tok:
+            def __call__(self, text, add_special_tokens=False, return_attention_mask=False):
+                # One id per character for determinism.
+                return {"input_ids": list(range(len(text)))}
+
+        x, y = tokenize_and_window("abcdefghij", tokenizer=_Tok(), context_length=4)
+        self.assertEqual(tuple(x.shape), (2, 4))  # tokens 0..9 -> windows at 0 and 4
+        self.assertTrue(torch.equal(x[0], torch.tensor([0, 1, 2, 3])))
+        self.assertTrue(torch.equal(y[0], torch.tensor([1, 2, 3, 4])))
+        self.assertTrue(torch.equal(x[1], torch.tensor([4, 5, 6, 7])))
+        self.assertTrue(torch.equal(y[1], torch.tensor([5, 6, 7, 8])))
 
 
 if __name__ == "__main__":

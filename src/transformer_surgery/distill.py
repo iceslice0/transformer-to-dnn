@@ -15,7 +15,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
-from transformer_surgery.internal.metrics import jeffreys_divergence_dense
 from transformer_surgery.internal.reporting import (
     CALIBRATION_LEGEND_TEXT,
     describe_device,
@@ -38,6 +37,7 @@ from transformer_surgery.internal.util import (
 
 if TYPE_CHECKING:
     from transformer_surgery.cli.distill_config import JeffreysDistillConfig
+    from transformer_surgery.models.adapters import SurgeryModelAdapter
 
 
 def _copy_state_into(src: nn.Module, dst: nn.Module) -> None:
@@ -68,36 +68,6 @@ def _validation_accuracy_summary(run_results: List[Dict[str, Any]]) -> Dict[str,
     }
 
 
-@torch.no_grad()
-def eval_distillation_metrics(
-    teacher: nn.Module,
-    student: nn.Module,
-    val_loader: DataLoader,
-    temperature: float = 1.0,
-) -> Tuple[float, float, float]:
-    """Student accuracy, mean CE, and mean Jeffreys divergence against a teacher."""
-    device = get_device()
-    teacher.eval()
-    student.eval()
-    use_cuda = device.type == "cuda"
-    ce_sum_t = torch.zeros((), device=device, dtype=torch.float64)
-    j_sum_t = torch.zeros((), device=device, dtype=torch.float64)
-    correct_t = torch.zeros((), device=device, dtype=torch.long)
-    n = 0
-    dt = get_surgery_dtype()
-    for x, y in val_loader:
-        x = x.to(device, dtype=dt, non_blocking=use_cuda)
-        y = y.to(device, non_blocking=use_cuda)
-        with maybe_surgery_cuda_autocast(device, dt):
-            t_log = teacher(x)
-            s_log = student(x)
-        ce_sum_t += torch.nn.functional.cross_entropy(s_log.float(), y, reduction="sum").double()
-        j_sum_t += jeffreys_divergence_dense(t_log, s_log, temperature=temperature).sum().double()
-        correct_t += (s_log.argmax(dim=-1) == y).sum()
-        n += y.size(0)
-    return correct_t.item() / n, ce_sum_t.item() / n, j_sum_t.item() / n
-
-
 def distill_student_from_teacher(
     student: nn.Module,
     teacher: nn.Module,
@@ -105,11 +75,16 @@ def distill_student_from_teacher(
     val_loader: DataLoader,
     cfg: "JeffreysDistillConfig",
     *,
+    adapter: "SurgeryModelAdapter",
     log_prefix: str = "distill",
     seed: Optional[int] = None,
     baseline: Optional[Tuple[float, float, float]] = None,
 ) -> Dict[str, Any]:
-    """Train any classifier student with mixed hard-label CE plus Jeffreys teacher matching."""
+    """Train a student with a task-defined hard loss mixed with teacher matching.
+
+    ``adapter`` supplies ``(hard_loss, match_loss)`` per step and ``(primary, loss, match)`` for
+    evaluation, so this loop serves classification (CE + Jeffreys) and SR (L1 + teacher L1) alike.
+    """
     if seed is not None:
         set_seed(seed)
     device = get_device()
@@ -148,7 +123,7 @@ def distill_student_from_teacher(
     baseline_teacher.eval()
     if baseline is None:
         baseline_student = train_student if use_master_fp32 else student
-        baseline_acc, baseline_ce, baseline_j = eval_distillation_metrics(
+        baseline_acc, baseline_ce, baseline_j = adapter.eval_student_vs_teacher(
             baseline_teacher,
             baseline_student,
             val_loader,
@@ -184,8 +159,7 @@ def distill_student_from_teacher(
             else:
                 with maybe_surgery_cuda_autocast(device, dt):
                     s_log = train_student(x)
-            ce_loss = torch.nn.functional.cross_entropy(s_log.float(), y, reduction="mean")
-            j_loss = jeffreys_divergence_dense(t_log, s_log, temperature=cfg.temperature).mean()
+            ce_loss, j_loss = adapter.distill_step_losses(s_log, t_log, y, temperature=cfg.temperature)
             mix = float(cfg.distill_weight)
             loss = (1.0 - mix) * ce_loss + mix * j_loss
             loss.backward()
@@ -215,14 +189,14 @@ def distill_student_from_teacher(
                     log_line(
                         f"  {pf}epoch {ep + 1}/{epochs} train {n_batches}/{steps_per_epoch} "
                         f"step {global_step}/{total_steps} loss={li:.6f} loss_avg={avg:.6f} "
-                        f"ce={float(ce_loss.item()):.6f} j={float(j_loss.item()):.6f} "
+                        f"hard={float(ce_loss.item()):.6f} match={float(j_loss.item()):.6f} "
                         f"lr={lr_c:.2e} {rate:.2f} batch/s epoch_eta~{eta_s / 60.0:.1f}m"
                     )
             if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
         if use_master_fp32:
             _copy_state_into(train_student, student)
-        acc, ce_v, j_v = eval_distillation_metrics(
+        acc, ce_v, j_v = adapter.eval_student_vs_teacher(
             baseline_teacher,
             student,
             val_loader,
@@ -358,10 +332,10 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     _log_distill_session_line(cfg, teacher_path)
 
     _, baseline_val_loader = adapter.build_loaders(cfg)
-    baseline = eval_distillation_metrics(
+    baseline = adapter.eval_student_vs_teacher(
         teacher, probe_student, baseline_val_loader, temperature=cfg.temperature
     )
-    log_line(f"baseline val acc={baseline[0]:.4f} ce={baseline[1]:.4f} jeffreys={baseline[2]:.4f}")
+    log_line(f"baseline val primary={baseline[0]:.4f} loss={baseline[1]:.4f} match={baseline[2]:.4f}")
     del probe_student, baseline_val_loader
 
     run_results: List[Dict[str, Any]] = []
@@ -380,6 +354,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
             train_loader,
             val_loader,
             cfg,
+            adapter=adapter,
             log_prefix=f"distill[{run_number}/{num_trainings}]",
             seed=seed,
             baseline=baseline,

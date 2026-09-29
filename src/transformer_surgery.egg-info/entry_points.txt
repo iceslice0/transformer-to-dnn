@@ -1,5 +1,6 @@
 [console_scripts]
 ts-distill = transformer_surgery.cli.distill:main
+ts-download-sr = transformer_surgery.cli.download_sr:main
 ts-pretrain-pet = transformer_surgery.cli.pretrain_pet:main
 ts-ptq = transformer_surgery.cli.ptq:main
 ts-surgery = transformer_surgery.cli.surgery:main

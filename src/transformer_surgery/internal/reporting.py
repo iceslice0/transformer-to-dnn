@@ -162,7 +162,11 @@ def write_model_structure_txt(
             if x is None:
                 x = torch.zeros(default_input_shape, device=device, dtype=dtype)
             else:
-                x = x.to(device=device, dtype=dtype)
+                # Preserve dtype for integer token ids (causal LM); only move device.
+                if x.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                    x = x.to(device=device)
+                else:
+                    x = x.to(device=device, dtype=dtype)
             x_log = x
 
             hooks: List[Any] = []

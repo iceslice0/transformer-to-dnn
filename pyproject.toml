@@ -7,6 +7,7 @@ name = "transformer-surgery"
 version = "0.1.0"
 description = "Demo code for Transformer to DNN surgery."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.1",
@@ -15,11 +16,29 @@ dependencies = [
   "torchmetrics>=1.0.0",
 ]
 
+[project.optional-dependencies]
+# MambaIR SR extras only. Do NOT pull mamba-ssm from PyPI here — install a CUDA-matched
+# GitHub release wheel (see README). Architecture comes from mambal/softmax/MambaIR on path.
+mambair = [
+  "einops",
+  "scikit-image",
+  "Pillow",
+  "numpy",
+  "opencv-python-headless",
+  "transformers",
+]
+# Causal LM patient (Pythia-70M + WikiText-2). Heavy imports stay lazy inside the adapter.
+llm = [
+  "transformers",
+  "datasets",
+]
+
 [project.scripts]
 ts-pretrain-pet = "transformer_surgery.cli.pretrain_pet:main"
 ts-surgery = "transformer_surgery.cli.surgery:main"
 ts-distill = "transformer_surgery.cli.distill:main"
 ts-ptq = "transformer_surgery.cli.ptq:main"
+ts-download-sr = "transformer_surgery.cli.download_sr:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -31,7 +31,7 @@ adapter:
 - patient: DeiT-Tiny from timm, fine-tuned on Oxford-IIIT Pet.
 - dataset: Oxford-IIIT Pet classification (37 classes).
 - surgery model: `DeiTTinySurgeryModel` in
-  [src/transformer_surgery/models/deit_tiny.py](../src/transformer_surgery/models/deit_tiny.py).
+  [src/transformer_surgery/models/deit_tiny/surgery_model.py](../src/transformer_surgery/models/deit_tiny/surgery_model.py).
 
 Extra models or datasets are added by registering a new adapter, not by branching the surgery
 driver.
@@ -337,3 +337,20 @@ The surgery stage is expected to satisfy:
    flags.
 7. The CLI writes the checkpoint, metadata JSON, and before/after structure logs for the run
    config.
+
+## Causal LM patient (`pythia_70m_wikitext2`)
+
+Surgery also supports Hugging Face Pythia-70M on WikiText-2 via
+``SurgeryCausalAttention``:
+
+- Fixed ``context_length`` windows (default 128); Gibbs ``seq_len`` equals that length.
+- Additive causal ``-inf`` mask before Gibbs / softmax; future keys never receive probability.
+- Full-context baseline: ``top_k = context_length`` (``pythia_70m_topk128_*``). Exact tail is
+  enabled for uniformity; with ``k = N`` there is no omitted mass so it does not change the math.
+- Sparse: smaller ``top_k`` with ``use_exact_tail_mass=true``. Exact per-query tail is required
+  because causal rows have different valid key counts; the block-level scalar
+  ``gibbs_tail_prob_eps`` calibration used for ViT is incorrect here and is disabled by the
+  adapter. Tail mass is reinjected only over allowed keys via a fixed lower-triangular valid-key
+  mean matrix.
+- All Pythia configs set ``use_exact_tail_mass=true``.
+- Metrics: token NLL and perplexity (primary = ``-NLL``). Surgery-only — no distill stage.

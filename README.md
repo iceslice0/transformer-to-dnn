@@ -1,6 +1,8 @@
 # Transformer Surgery
 
-A transformer is just a DNN. This repo demonstrates that operationally: it compiles a trained transformer (timm DeiT-Tiny on Oxford-IIIT Pet) into an explicit graph built from a small, fixed vocabulary of standard neural-network ops, and shows the compiled model retains the reference accuracy after a brief distillation pass and tolerates 8-bit PTQ like any conventional DNN.
+License: [MIT](LICENSE).
+
+A transformer is just a DNN. This repo demonstrates that operationally: it compiles a trained transformer into an explicit graph built from a small, fixed vocabulary of standard neural-network ops. Primary patients are timm DeiT-Tiny (Oxford-IIIT Pet / ImageNet), MambaIRv2 Light SR, and a surgery-only causal LM (Pythia-70M on WikiText-2). Vision students retain reference accuracy after a brief distillation pass and tolerate 8-bit PTQ like any conventional DNN; the LLM patient shows the same compile applies at full support without noticeable degradation (float32).
 
 There is no architectural magic in attention, LayerNorm, or softmax. Each is a particular composition of three op classes:
 
@@ -40,9 +42,9 @@ python -m transformer_surgery.cli.ptq            # 4. 8-bit PTQ on selected affi
 
 Equivalent console scripts after `pip install -e .`: `ts-pretrain-pet`, `ts-surgery`, `ts-distill`, `ts-ptq`.
 
-`pretrain_pet` is the only model-specific stage. `surgery`, `distill`, and `ptq` go through a model adapter (`model_key`, default `deit_tiny_pet`); adding a new transformer means registering an adapter, not branching the stage code. Two adapters ship in the repo: `deit_tiny_pet` (DeiT-Tiny on Oxford-IIIT Pet) and `imagenet` ([src/transformer_surgery/models/imagenet.py](src/transformer_surgery/models/imagenet.py)).
+`pretrain_pet` is the only model-specific stage. `surgery`, `distill`, and `ptq` go through a model adapter (`model_key`, default `deit_tiny_pet`); adding a new transformer means registering an adapter, not branching the stage code. Adapters that ship in the repo: `deit_tiny_pet` (DeiT-Tiny on Oxford-IIIT Pet), `imagenet` ([src/transformer_surgery/models/imagenet.py](src/transformer_surgery/models/imagenet.py)), `mambair_lightsr` (MambaIRv2 Light SR; see Install below), and `pythia_70m_wikitext2` (Pythia-70M on WikiText-2, surgery-only).
 
-A top-level `Makefile` orchestrates the full experiment grid (top-k sweeps, tail-mass ablations, strict vs fast, PTQ variants, ImageNet). Use `make help` to list targets, or `make a` / `make a_imagenet` / `make all` to run a sweep; targets call into the same CLIs and write to `artifacts/`.
+A top-level `Makefile` orchestrates the full experiment grid (top-k sweeps, tail-mass ablations, strict vs fast, PTQ variants, ImageNet, MambaIR, Pythia). Use `make help` to list targets, or `make a` / `make a_imagenet` / `make mambair` / `make pythia` / `make all` to run a sweep; targets call into the same CLIs and write to `artifacts/`.
 
 ## Install
 
@@ -53,7 +55,57 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The dataset is expected under `data/oxford-iiit-pet/`. If missing, the torchvision loader downloads it once into `data/`.
+The Pet dataset is expected under `data/oxford-iiit-pet/`. If missing, the torchvision loader downloads it once into `data/`.
+
+### MambaIR (optional)
+
+The `mambair_lightsr` adapter compiles MambaIRv2 Light SR (window attention + LayerNorm surgery on DIV2K/Set5). The network definition is the **csguoh/MambaIR** tree already under `mambal/softmax/MambaIR` (imported as `basicsr` — not the PyPI package). `mamba-ssm` is **not** installed from PyPI; use a GitHub release wheel that matches your Python / torch / CUDA / CXX11 ABI.
+
+```bash
+# SR Python deps (no mamba-ssm from PyPI)
+pip install -e '.[mambair]'
+
+# Fused selective-scan CUDA kernel from state-spaces/mamba releases (required for usable speed).
+# List wheels: https://github.com/state-spaces/mamba/releases/tag/v2.3.1
+# Example that works with torch 2.11+cu130, Python 3.12, cxx11 ABI True on linux x86_64:
+pip install --no-deps \
+  'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+
+# Verify:
+python -c "from mamba_ssm.ops.selective_scan_interface import selective_scan_fn; import selective_scan_cuda; print('ok')"
+
+# Released Light-SR weights used by the default configs (already present if you keep mambal/):
+#   mambal/softmax/mambairv2_lightSR_x2.pth
+#   mambal/softmax/mambairv2_lightSR_x4.pth
+```
+
+If no prebuilt wheel matches, you need a CUDA *toolkit* equal to `torch.version.cuda` and:
+
+```bash
+MAMBA_FORCE_BUILD=TRUE MAMBA_KEEP_CUDA_BUILD=TRUE \
+  pip install --no-cache-dir --no-deps --no-build-isolation \
+  'git+https://github.com/state-spaces/mamba.git@v2.3.1'
+```
+
+Then `make mambair-data` (DIV2K + Set5 x2/x4 LR) and `make mambair` / `make mambair-x4` (surgery + distill). Configs: `configs/surgery/mambair_x{2,4}_*.json`, `configs/distill/mambair_x{2,4}_*.json`. Reference pipeline: [mambal/softmax/README.md](mambal/softmax/README.md).
+
+### Pythia-70M (optional, surgery-only)
+
+Causal-LM patient using Hugging Face `EleutherAI/pythia-70m` and WikiText-2 (`wikitext-2-raw-v1`) at a fixed non-overlapping `context_length` (default 128). Surgery-only: no distill or PTQ for this adapter. Use `surgery_dtype=float32`; a full bfloat16 weight cast drops accuracy sharply on this patient.
+
+```bash
+pip install -e '.[llm]'
+
+# Full-context baseline (top_k == context_length):
+python -m transformer_surgery.cli.surgery --config configs/surgery/pythia_70m_topk128_fast_tailmass_exact.json
+
+# Sparse causal with exact per-query tail mass:
+python -m transformer_surgery.cli.surgery --config configs/surgery/pythia_70m_topk32_fast_tailmass_exact.json
+
+# Or via Make: make pythia-smoke | make pythia | make pythia-tailmass0
+```
+
+Evaluation reports token NLL and perplexity (primary metric is `-NLL`). Scalar per-block `gibbs_tail_prob_eps` is disabled: causal rows have different valid key counts. Exact-tail configs set `use_exact_tail_mass=true`; `*_tailmass0` configs drop omitted mass (ablation). Exact omitted-tail stats (`gibbs_tail_prob_eps_exact_*`) are written into surgery metadata by the shared student calibration path. Sweep table: [docs/pythia_results.md](docs/pythia_results.md).
 
 ## Configs
 
@@ -80,5 +132,7 @@ Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64
 ## Method Notes
 
 - [docs/surgery.md](docs/surgery.md) - the strict / fast op vocabulary, LayerNorm rewrite, attention rewrite, Gibbs top-k softmax, calibration, and metadata schema.
+- [docs/exact_tail_mass.md](docs/exact_tail_mass.md) - exact runtime omitted-tail mass.
+- [docs/pythia_results.md](docs/pythia_results.md) - Pythia-70M WikiText-2 surgery sweep (exact vs tail0).
 - [docs/distill.md](docs/distill.md) - CE + Jeffreys distillation loop and metric definitions.
 - [docs/ptq.md](docs/ptq.md) - single-pass calibration-driven post-training quantization.

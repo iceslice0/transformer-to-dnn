@@ -17,6 +17,24 @@ class SurgeryConfig:
     data_dir: str = "./data"
     batch_size: int = 128
     workers: int = 2
+    # Super-resolution (MambaIR) fields; ignored by classification adapters.
+    scale: int = 2
+    train_hr: Optional[str] = None
+    train_lr: Optional[str] = None
+    val_hr: Optional[str] = None
+    val_lr: Optional[str] = None
+    patch_size: int = 64
+    train_repeat: int = 1
+    max_train_items: Optional[int] = None
+    max_val_items: Optional[int] = None
+    sr_download: bool = True
+    # Causal LM (Pythia) fields; ignored by vision / SR adapters.
+    context_length: int = 128
+    hf_model_id: str = "EleutherAI/pythia-70m"
+    dataset_name: str = "wikitext"
+    dataset_config: str = "wikitext-2-raw-v1"
+    max_train_tokens: Optional[int] = None
+    max_val_tokens: Optional[int] = None
     top_k: int = 32
     eps: float = 1e-5
     gibbs_tail_prob_eps: float = 1e-5
@@ -58,6 +76,12 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "allow_matmul": "Debug: use matmul fast paths where supported.",
     "surgery_dtype": "torch dtype name for surgery compute, e.g. bfloat16, float16, or float32.",
     "log_dir": "Directory for model structure dumps.",
+    "context_length": "Fixed token window length for causal-LM surgery (Pythia).",
+    "hf_model_id": "Hugging Face model id or local path for the causal-LM reference.",
+    "dataset_name": "HF datasets name for LM evaluation (default wikitext).",
+    "dataset_config": "HF datasets config name (default wikitext-2-raw-v1).",
+    "max_train_tokens": "Optional cap on concatenated train tokens before windowing.",
+    "max_val_tokens": "Optional cap on concatenated validation tokens before windowing.",
 }
 
 CLI_SURGERY_DESCRIPTION = "Model-adapter surgery: reference checkpoint -> surgery student + metadata"

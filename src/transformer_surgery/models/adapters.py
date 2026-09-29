@@ -3,7 +3,7 @@ Model adapter registry for surgery/distillation/PTQ.
 
 The processing code is model-agnostic; concrete adapters own dataset loaders, checkpoint
 construction, surgery-model reconstruction, generic calibration plumbing, and simple replacement
-metadata.
+metadata. Adapter implementations live under ``models/<family>/adapter.py``.
 """
 
 from __future__ import annotations
@@ -14,20 +14,18 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from transformer_surgery.internal.calibration import (
-    add_sparse_topk_jeffreys_stats,
-    apply_gibbs_tail_calibration,
-    sample_topk_scores,
-    topk_tail_mass_stats,
-)
+from transformer_surgery.internal.calibration import apply_gibbs_tail_calibration
+from transformer_surgery.internal.metrics import jeffreys_divergence_dense
 from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
-from transformer_surgery.internal.util import get_surgery_dtype, set_surgery_dtype
+from transformer_surgery.internal.util import accuracy_and_loss, get_surgery_dtype, set_surgery_dtype
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
     ensure_mapping,
     get_device,
+    maybe_surgery_cuda_autocast,
     namespace_from_mapping,
     torch_dtype_from_name,
 )
@@ -67,6 +65,10 @@ class SurgeryModelAdapter:
         return None
 
     def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+        return {}
+
+    def calibrate_after_build(self, model: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+        """Optional Gibbs/LN stats gathered on the built surgery student (e.g. causal LM)."""
         return {}
 
     def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
@@ -109,127 +111,58 @@ class SurgeryModelAdapter:
         )
         return ex
 
+    # -- Task hooks (classification defaults; regression models override) -------------------
+    # ``primary`` is a higher-is-better scalar (accuracy for classification, PSNR for SR), so
+    # keep-best logic in surgery/distill is task-agnostic.
 
-class DeiTTinyPetAdapter(SurgeryModelAdapter):
-    key = DEFAULT_MODEL_KEY
-    patient_name = "DeiT-Tiny"
-    dataset_name = "Oxford-IIIT Pet"
+    def example_model_input(self, cfg: Any = None) -> Optional[torch.Tensor]:
+        """Optional representative input for structure dumps; ``None`` uses the image default."""
+        return None
 
-    def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
-        from transformer_surgery.models.pet import build_pet_loaders
+    def primary_metric_name(self) -> str:
+        return "accuracy"
 
-        return build_pet_loaders(cfg)
+    def next_stage_hint(self) -> str:
+        return "Next: run the distill stage."
 
-    def load_reference_checkpoint(self, path: str) -> nn.Module:
-        from transformer_surgery.models.pet import load_timm_deit_pet_checkpoint
+    def evaluate(self, model: nn.Module, val_loader: DataLoader, cfg: Any = None) -> Tuple[float, float, Dict[str, float]]:
+        """Return ``(primary, loss, extra_metrics)`` for a standalone model on ``val_loader``."""
+        acc, loss = accuracy_and_loss(model, val_loader, nn.CrossEntropyLoss())
+        return float(acc), float(loss), {}
 
-        return load_timm_deit_pet_checkpoint(path)
+    @torch.no_grad()
+    def eval_student_vs_teacher(
+        self, teacher: nn.Module, student: nn.Module, val_loader: DataLoader, *, temperature: float = 1.0
+    ) -> Tuple[float, float, float]:
+        """Return ``(primary, loss, teacher_match)`` for a student against a teacher."""
+        device = get_device()
+        teacher.eval()
+        student.eval()
+        use_cuda = device.type == "cuda"
+        loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        match_sum = torch.zeros((), device=device, dtype=torch.float64)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        n = 0
+        dt = get_surgery_dtype()
+        for x, y in val_loader:
+            x = x.to(device, dtype=dt, non_blocking=use_cuda)
+            y = y.to(device, non_blocking=use_cuda)
+            with maybe_surgery_cuda_autocast(device, dt):
+                t_out = teacher(x)
+                s_out = student(x)
+            loss_sum += F.cross_entropy(s_out.float(), y, reduction="sum").double()
+            match_sum += jeffreys_divergence_dense(t_out, s_out, temperature=temperature).sum().double()
+            correct += (s_out.argmax(dim=-1) == y).sum()
+            n += y.size(0)
+        return correct.item() / n, loss_sum.item() / n, match_sum.item() / n
 
-    def build_surgery_model(self, cfg: Any) -> nn.Module:
-        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.models.pet import PET_NUM_CLASSES
-
-        return DeiTTinySurgeryModel.from_surgery_config(cfg, num_classes=PET_NUM_CLASSES)
-
-    def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
-        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.models.pet import PET_NUM_CLASSES
-
-        return DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=PET_NUM_CLASSES)
-
-    def copy_reference_weights(self, student: nn.Module, reference: nn.Module) -> Dict[str, str]:
-        return student.load_from_timm(reference)
-
-    def freeze_surgery_parameters(self, model: nn.Module) -> None:
-        from transformer_surgery.models.deit_tiny import freeze_eps_parameters
-
-        freeze_eps_parameters(model)
-
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
-        from transformer_surgery.internal.calibration import calibrate_vit_reference
-
-        return calibrate_vit_reference(reference, loader, cfg)
-
-    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-        return super().apply_calibration(model, calibration)
-
-    def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
-        if cfg.disable_layernorm_replacement:
-            ln = "nn.LayerNorm"
-        elif cfg.allow_matmul:
-            ln = "RewrittenLayerNorm(rsqrt.mul)"
-        else:
-            ln = "RewrittenLayerNorm(log/sqrt_exp)"
-        if cfg.disable_attention_surgery:
-            attn = "SurgeryAttention(vanilla scaled QK^T softmax @ V)"
-        else:
-            dot = "PairwiseDotBySquare(QK^T matmul)" if cfg.allow_matmul else "PairwiseDotBySquare(square identity)"
-            if cfg.disable_softmax_replacement:
-                attn = f"SurgeryAttention({dot}+full_softmax+dense@V)"
-            else:
-                mix = (
-                    "SparseWeightedSumBySquare(elementwise p*v)"
-                    if cfg.allow_matmul
-                    else "SparseWeightedSumBySquare(square identity)"
-                )
-                tail = "+exact_tail" if bool(getattr(cfg, "use_exact_tail_mass", False)) else ""
-                attn = f"SurgeryAttention({dot}+GibbsTopKSoftmax{tail}+{mix})"
-        mapping: Dict[str, str] = {}
-        depth = len(model.blocks) if model is not None else 12
-        for i in range(depth):
-            mapping[f"blocks.{i}.norm1"] = ln
-            mapping[f"blocks.{i}.attn"] = attn
-            mapping[f"blocks.{i}.norm2"] = ln
-            mapping[f"blocks.{i}.mlp.act"] = "NLGELU"
-        mapping["fc_norm"] = ln
-        return mapping
-
-
-class DeiTTinyImageNetAdapter(SurgeryModelAdapter):
-    key = "deit_tiny_imagenet"
-    patient_name = "DeiT-Tiny"
-    dataset_name = "ImageNet-1k"
-
-    def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
-        from transformer_surgery.models.imagenet import build_imagenet_loaders
-
-        return build_imagenet_loaders(cfg)
-
-    def load_reference_checkpoint(self, path: str) -> nn.Module:
-        from transformer_surgery.models.imagenet import load_timm_deit_imagenet_checkpoint
-
-        return load_timm_deit_imagenet_checkpoint(path)
-
-    def build_surgery_model(self, cfg: Any) -> nn.Module:
-        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.models.imagenet import IMAGENET_NUM_CLASSES
-
-        return DeiTTinySurgeryModel.from_surgery_config(cfg, num_classes=IMAGENET_NUM_CLASSES)
-
-    def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
-        from transformer_surgery.models.deit_tiny import DeiTTinySurgeryModel
-        from transformer_surgery.models.imagenet import IMAGENET_NUM_CLASSES
-
-        return DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=IMAGENET_NUM_CLASSES)
-
-    def copy_reference_weights(self, student: nn.Module, reference: nn.Module) -> Dict[str, str]:
-        return student.load_from_timm(reference)
-
-    def freeze_surgery_parameters(self, model: nn.Module) -> None:
-        from transformer_surgery.models.deit_tiny import freeze_eps_parameters
-
-        freeze_eps_parameters(model)
-
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
-        from transformer_surgery.internal.calibration import calibrate_vit_reference
-
-        return calibrate_vit_reference(reference, loader, cfg)
-
-    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-        return super().apply_calibration(model, calibration)
-
-    def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
-        return DeiTTinyPetAdapter.build_module_mapping(self, cfg, model)
+    def distill_step_losses(
+        self, student_out: torch.Tensor, teacher_out: torch.Tensor, target: torch.Tensor, *, temperature: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(hard_loss, teacher_match_loss)`` for one training batch."""
+        hard = F.cross_entropy(student_out.float(), target, reduction="mean")
+        match = jeffreys_divergence_dense(teacher_out, student_out, temperature=temperature).mean()
+        return hard, match
 
 
 _ADAPTERS: Dict[str, SurgeryModelAdapter] = {}
@@ -282,5 +215,15 @@ def load_surgery_student_checkpoint(
     return model, ensure_mapping(extra_ns)
 
 
+# Concrete adapters (heavy imports stay lazy inside each adapter's methods).
+from transformer_surgery.models.deit_tiny.adapter import (  # noqa: E402
+    DeiTTinyImageNetAdapter,
+    DeiTTinyPetAdapter,
+)
+from transformer_surgery.models.mambair.adapter import MambaIRLightSRAdapter  # noqa: E402
+from transformer_surgery.models.pythia.adapter import Pythia70MWikiText2Adapter  # noqa: E402
+
 register_model_adapter(DeiTTinyPetAdapter())
 register_model_adapter(DeiTTinyImageNetAdapter())
+register_model_adapter(MambaIRLightSRAdapter())
+register_model_adapter(Pythia70MWikiText2Adapter())

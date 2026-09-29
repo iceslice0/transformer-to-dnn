@@ -19,6 +19,17 @@ class JeffreysDistillConfig:
     epochs: int = 2
     batch_size: int = 128
     workers: int = 2
+    # Super-resolution (MambaIR) fields; ignored by classification adapters.
+    scale: int = 2
+    train_hr: Optional[str] = None
+    train_lr: Optional[str] = None
+    val_hr: Optional[str] = None
+    val_lr: Optional[str] = None
+    patch_size: int = 64
+    train_repeat: int = 1
+    max_train_items: Optional[int] = None
+    max_val_items: Optional[int] = None
+    sr_download: bool = True
     lr: float = 5e-4
     weight_decay: float = 0.05
     warmup_epochs: Optional[int] = None
