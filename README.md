@@ -87,7 +87,7 @@ MAMBA_FORCE_BUILD=TRUE MAMBA_KEEP_CUDA_BUILD=TRUE \
   'git+https://github.com/state-spaces/mamba.git@v2.3.1'
 ```
 
-Then `make mambair-data` (DIV2K + Set5 x2/x4 LR) and `make mambair` / `make mambair-x4` (surgery + distill). Configs: `configs/surgery/mambair_x{2,4}_*.json`, `configs/distill/mambair_x{2,4}_*.json`. Reference pipeline: [mambal/softmax/README.md](mambal/softmax/README.md).
+Then `make mambair-data` (DIV2K + Set5 x2/x4 LR) and `make mambair` / `make mambair-x4` (surgery + distill); `make mambair-x4-exact` and `make mambair-x4-tailmass0` run the exact-tail and tail-drop (q=0) sweeps. Results: [docs/mambair_results.md](docs/mambair_results.md). Configs: `configs/surgery/mambair_x{2,4}_*.json`, `configs/distill/mambair_x{2,4}_*.json`. Reference pipeline: [mambal/softmax/README.md](mambal/softmax/README.md).
 
 ### Pythia-70M (optional, surgery-only)
 
@@ -134,5 +134,7 @@ Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64
 - [docs/surgery.md](docs/surgery.md) - the strict / fast op vocabulary, LayerNorm rewrite, attention rewrite, Gibbs top-k softmax, calibration, and metadata schema.
 - [docs/exact_tail_mass.md](docs/exact_tail_mass.md) - exact runtime omitted-tail mass.
 - [docs/pythia_results.md](docs/pythia_results.md) - Pythia-70M WikiText-2 surgery sweep (exact vs tail0).
+- [docs/profile.md](docs/profile.md) - per-module GPU time and memory, strict vs fast.
+- [docs/mambair_results.md](docs/mambair_results.md) - MambaIRv2-Light Set5 sweeps (tail drop, calibrated, exact).
 - [docs/distill.md](docs/distill.md) - CE + Jeffreys distillation loop and metric definitions.
 - [docs/ptq.md](docs/ptq.md) - single-pass calibration-driven post-training quantization.

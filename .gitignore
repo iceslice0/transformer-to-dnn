@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.codex
+.cursor
 
 data/
 logs/
@@ -13,4 +15,3 @@ mambal/
 !src/transformer_surgery/models/*.py
 artifacts/
 *_meta.json
-.codex

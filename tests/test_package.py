@@ -148,6 +148,52 @@ class PackageSmokeTests(unittest.TestCase):
             kept = dense.gather(1, idx.reshape(-1, 2)).reshape_as(probs)
             self.assertTrue(torch.allclose(probs, kept, atol=1e-5))
 
+    def test_ptq_per_tensor_weights_keep_per_channel_bias(self) -> None:
+        import torch
+        import torch.nn as nn
+
+        from transformer_surgery.internal.calibration import (
+            build_ptq_node_setup,
+            build_ptq_wrapper,
+            gather_ptq_dequant_moments,
+            gather_ptq_range_moments,
+        )
+
+        torch.manual_seed(0)
+        cases = (
+            ("conv2d", nn.Conv2d(2, 3, kernel_size=1, bias=True), (4, 2, 5, 5)),
+            ("linear", nn.Linear(4, 3, bias=True), (4, 6, 4)),
+        )
+        for kind, layer, shape in cases:
+            with torch.no_grad():
+                layer.bias.copy_(torch.tensor([-2.0, 0.5, 3.0]))
+            model = nn.Sequential(layer)
+            selected = {"0": kind}
+            loader = [(torch.randn(*shape), torch.zeros(shape[0], dtype=torch.long)) for _ in range(4)]
+            batch_indices = list(range(len(loader)))
+            x = loader[0][0]
+            with torch.no_grad():
+                ref = layer(x)
+            stats = gather_ptq_range_moments(model, loader, selected, batch_indices)
+            setup = build_ptq_node_setup(
+                "0",
+                layer,
+                stats["0"],
+                weight_bits=8,
+                activation_bits=8,
+                affine_activation_bits=None,
+                matmul_activation_bits=None,
+                per_output_channel=False,
+            )
+            self.assertEqual(setup.weight_scale.ndim, 0)
+            gather_ptq_dequant_moments(model, loader, selected, stats, {"0": setup}, batch_indices)
+            built = build_ptq_wrapper(layer, setup, stats["0"], dequant_var_eps=1e-8)
+            # Per-tensor weights still keep one output bias per channel.
+            self.assertEqual(built.module.out_bias.numel(), 3)
+            with torch.no_grad():
+                out = built.module(x)
+            self.assertLess((out - ref).abs().max().item(), 0.1 * ref.abs().max().item(), msg=kind)
+
     def test_ptq_calibration_samples_random_batches(self) -> None:
         import torch
         import torch.nn as nn

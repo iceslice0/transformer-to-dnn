@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-data pythia-smoke pythia pythia-tailmass0 help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -44,6 +44,11 @@ MAMBAIR_X4_TARGETS := $(foreach k,$(MAMBAIR_KS),artifacts/checkpoints/ts_surgery
 MAMBAIR_X4_EXACT_SURGERY_TARGETS := $(foreach k,$(MAMBAIR_KS),artifacts/checkpoints/ts_surgery_mambair_x4_topk$(k)_fast_tailmass_exact.pt)
 MAMBAIR_X4_EXACT_DISTILL_TARGETS := $(foreach k,$(MAMBAIR_KS),artifacts/checkpoints/ts_distill_mambair_x4_topk$(k)_tailmass_exact.pt)
 MAMBAIR_X4_EXACT_TARGETS := $(MAMBAIR_X4_EXACT_SURGERY_TARGETS) $(MAMBAIR_X4_EXACT_DISTILL_TARGETS)
+# Tail-drop ablation (q=0, no calibration): k=0 is skipped since an empty support with q=0 has no output.
+MAMBAIR_TAIL0_KS := 1 2 4 16 64
+MAMBAIR_X4_TAIL0_SURGERY_TARGETS := $(foreach k,$(MAMBAIR_TAIL0_KS),artifacts/checkpoints/ts_surgery_mambair_x4_topk$(k)_fast_tailmass0.pt)
+MAMBAIR_X4_TAIL0_DISTILL_TARGETS := $(foreach k,$(MAMBAIR_TAIL0_KS),artifacts/checkpoints/ts_distill_mambair_x4_topk$(k)_tailmass0.pt)
+MAMBAIR_X4_TAIL0_TARGETS := $(MAMBAIR_X4_TAIL0_SURGERY_TARGETS) $(MAMBAIR_X4_TAIL0_DISTILL_TARGETS)
 
 # Pythia-70M / WikiText-2 (surgery-only). k=128 is full context; smaller k use exact tail.
 PYTHIA_SMOKE_KS := 32 128
@@ -78,6 +83,8 @@ mambair-x2: $(MAMBAIR_X2_TARGETS)
 mambair-x4: $(MAMBAIR_X4_TARGETS)
 # Exact runtime q_tail (use_exact_tail_mass) surgery + distill sweep for x4.
 mambair-x4-exact: $(MAMBAIR_X4_EXACT_TARGETS)
+# Tail-drop (q=0) surgery + distill sweep for x4.
+mambair-x4-tailmass0: $(MAMBAIR_X4_TAIL0_TARGETS)
 
 # Download DIV2K train + Set5 benchmark into ./data (loaders also auto-download on demand).
 mambair-data:
@@ -102,6 +109,7 @@ help:
 	@echo "  make mambair-x2  # MambaIR x2 sweep only"
 	@echo "  make mambair-x4  # MambaIR x4 sweep only"
 	@echo "  make mambair-x4-exact  # MambaIR x4 exact-tail surgery+distill (all k)"
+	@echo "  make mambair-x4-tailmass0  # MambaIR x4 tail-drop (q=0) surgery+distill (k=1..64)"
 	@echo "  make pythia-smoke # Pythia-70M capped WikiText-2 smoke (topk32 + topk128 exact-tail)"
 	@echo "  make pythia       # Pythia-70M full exact-tail surgery sweep (k=1..128)"
 	@echo "  make pythia-tailmass0 # Pythia-70M zero fixed-tail (no exact mass) sweep (k=1..128)"
@@ -144,6 +152,14 @@ artifacts/checkpoints/ts_distill_mambair_x$(1)_topk$(2)_tailmass_exact.pt: confi
 endef
 
 $(foreach k,$(MAMBAIR_KS),$(eval $(call MAMBAIR_EXACT_DISTILL_RULE,4,$(k))))
+
+# Tail-drop MambaIR distill depends on the matching tail-drop surgery checkpoint.
+define MAMBAIR_TAIL0_DISTILL_RULE
+artifacts/checkpoints/ts_distill_mambair_x$(1)_topk$(2)_tailmass0.pt: configs/distill/mambair_x$(1)_topk$(2)_tailmass0.json artifacts/checkpoints/ts_surgery_mambair_x$(1)_topk$(2)_fast_tailmass0.pt
+	$$(PYTHON) -m transformer_surgery.cli.distill --config "$$<"
+endef
+
+$(foreach k,$(MAMBAIR_TAIL0_KS),$(eval $(call MAMBAIR_TAIL0_DISTILL_RULE,4,$(k))))
 
 # PTQ checkpoints rebuild when PTQ JSON or source float checkpoint changes.
 define PTQ_RULE
