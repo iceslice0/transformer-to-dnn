@@ -963,7 +963,9 @@ class PTQBiasFitStats:
         out_scale = out_scale.to(device=acc.device, dtype=torch.float32)
         acc_fp = acc.to(dtype=torch.float32)
         out_fp = out.to(dtype=torch.float32)
-        if per_channel and channel_axis is not None and out_scale.ndim > 0 and acc.ndim > 0:
+        # The output bias is fitted per channel whenever the output has a channel axis, also for a
+        # scalar out_scale (per-tensor weights): the layer bias is a per-channel vector in both cases.
+        if per_channel and channel_axis is not None and acc.ndim > 0:
             axis = channel_axis if channel_axis >= 0 else acc.ndim + channel_axis
             if 0 <= axis < acc.ndim and axis < out.ndim and acc.shape[axis] == out.shape[axis]:
                 residual = out_fp - _broadcast_axis(out_scale, acc_fp, axis) * acc_fp
@@ -1264,7 +1266,9 @@ def build_ptq_wrapper(
         out_scale_buf = out_scale.to(dtype=torch.float32)
         skip_out_scale = False
 
-    out_bcast_shape = _out_bcast_shape(setup, out_scale)
+    # Linear/Conv: the per-channel bias needs its channel axis even when out_scale is a scalar
+    # (per-tensor weights). With per-channel weights both vectors give the same shape.
+    out_bcast_shape = _out_bcast_shape(setup, out_bias if skip_out_scale else out_scale)
     accumulator = _prepare_accumulator_module(module, setup.kind, q_weight)
     wrapper = CalibratedAffinePTQWrapper(
         activation_bits=setup.activation_bits,
