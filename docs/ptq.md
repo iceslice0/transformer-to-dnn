@@ -155,3 +155,25 @@ The metadata JSON records:
 installs skeleton `CalibratedAffinePTQWrapper` modules from `ptq_wrappers`, and then loads the
 checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
 are checked through the same path downstream code uses.
+
+## Results (Pet, 2026-10-03)
+
+Weights W8; every node input A8, except `affine_activation_bits=12` on the compiled affine nodes of the strict graph
+(`configs/ptq/*_strict_*.json`). Strict rows quantize the surgery graph before distillation; extended (fast) rows the
+Jeffreys-distilled graph. Per-tensor rows use the bias-fit fix in `internal/calibration.py` (the output bias stays per
+channel when the weight scale is a scalar, as in standard per-tensor PTQ). Logs: `artifacts/logs/ptq_pertensor_fix_2026-10-03/`
+(per-tensor runs and all fast runs) and `artifacts/logs/ptq_rerun/` (strict per-channel). Earlier per-tensor and fast
+per-channel metadata are kept in `artifacts/metadata/ptq_pertensor_backup_2026-10-03/` and
+`artifacts/metadata/ptq_fast_channel_backup_2026-10-03/`.
+
+| k | graph | nodes | bf16 | PTQ per-channel | Δ | PTQ per-tensor | Δ |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 16 | strict | 283 | 85.09 | 84.30 | -0.79 | 84.57 | -0.52 |
+| 32 | strict | 283 | 88.63 | 88.47 | -0.16 | 88.06 | -0.57 |
+| 64 | strict | 283 | 90.27 | 89.86 | -0.41 | 89.78 | -0.49 |
+| 197 | strict | 271 | 90.24 | 90.08 | -0.16 | 90.16 | -0.08 |
+| 16 | extended | 246 | 88.12 | 85.55 | -2.56 | 85.53 | -2.59 |
+| 32 | extended | 246 | 90.22 | 87.03 | -3.19 | 86.56 | -3.65 |
+| 64 | extended | 246 | 91.11 | 87.52 | -3.60 | 87.30 | -3.82 |
+| 197 | extended | 234 | 91.66 | 88.91 | -2.75 | 89.29 | -2.37 |
+

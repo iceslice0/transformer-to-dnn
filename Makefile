@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -57,6 +57,18 @@ PYTHIA_SMOKE_TARGETS := $(foreach k,$(PYTHIA_SMOKE_KS),artifacts/checkpoints/ts_
 PYTHIA_SURGERY_TARGETS := $(foreach k,$(PYTHIA_KS),artifacts/checkpoints/ts_surgery_pythia_70m_topk$(k)_fast_tailmass_exact.pt)
 PYTHIA_TAILMASS0_TARGETS := $(foreach k,$(PYTHIA_KS),artifacts/checkpoints/ts_surgery_pythia_70m_topk$(k)_fast_tailmass0.pt)
 
+# Query-centroid support routing: fixed k-means query centroids (calibrated on train data) select
+# the sparse support; exact scores are read only on it. Calibrated / exact / tail-drop tail modes.
+ROUTING_KS := 8 16 32 64
+ROUTING_TARGETS := $(foreach k,$(ROUTING_KS),$(foreach m,_qc32 _qc32_tailmass_exact _qc32_tailmass0,artifacts/checkpoints/ts_surgery_topk$(k)_fast$(m).pt)) \
+	artifacts/checkpoints/ts_surgery_topk16_fast_qc8.pt artifacts/checkpoints/ts_surgery_topk16_fast_qc128.pt
+PYTHIA_ROUTING_KS := 8 16 32
+PYTHIA_ROUTING_TARGETS := $(foreach k,$(PYTHIA_ROUTING_KS),$(foreach m,_qc32_tailmass_exact _qc32_tailmass0,artifacts/checkpoints/ts_surgery_pythia_70m_topk$(k)_fast$(m).pt)) \
+	artifacts/checkpoints/ts_surgery_pythia_70m_topk16_fast_qc8_tailmass_exact.pt \
+	artifacts/checkpoints/ts_surgery_pythia_70m_topk16_fast_qc128_tailmass_exact.pt
+
+STRICT_ROUTING_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_qc32.pt)
+
 all: a b c d e a_imagenet mambair
 
 # A. Main Fast-Path Top-k Results
@@ -96,6 +108,16 @@ pythia-smoke: $(PYTHIA_SMOKE_TARGETS)
 pythia: $(PYTHIA_SURGERY_TARGETS)
 pythia-tailmass0: $(PYTHIA_TAILMASS0_TARGETS)
 
+# Query-centroid support routing (surgery-only; routed checkpoints are not reloaded downstream).
+routing: $(ROUTING_TARGETS)
+pythia-routing: $(PYTHIA_ROUTING_TARGETS)
+# Strict graph with routed support (scores formed only on the support), and a same-session cost bench
+# against strict top-k (accuracy, latency, peak memory, unary evaluations per image).
+routing-strict: $(STRICT_ROUTING_TARGETS)
+routing-strict-bench: $(STRICT_ROUTING_TARGETS) $(STRICT_STRICT_TARGETS) $(STRICT_FAST_TARGETS) $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_qc32.pt)
+	$(PYTHON) scripts/bench_strict_routing.py strict $(STRICT_KS)
+	$(PYTHON) scripts/bench_strict_routing.py fast $(STRICT_KS)
+
 help:
 	@echo "Targets:"
 	@echo "  make a      # Main fast-path top-k sweep"
@@ -113,6 +135,10 @@ help:
 	@echo "  make pythia-smoke # Pythia-70M capped WikiText-2 smoke (topk32 + topk128 exact-tail)"
 	@echo "  make pythia       # Pythia-70M full exact-tail surgery sweep (k=1..128)"
 	@echo "  make pythia-tailmass0 # Pythia-70M zero fixed-tail (no exact mass) sweep (k=1..128)"
+	@echo "  make routing      # DeiT Pet query-centroid support routing (k=8..64, calibrated/exact/tail-drop)"
+	@echo "  make pythia-routing # Pythia-70M query-centroid support routing (k=8..32, exact/tail-drop)"
+	@echo "  make routing-strict # DeiT strict graph with routed support (k=16,32,64)"
+	@echo "  make routing-strict-bench # same-session cost: strict top-k vs strict routed"
 	@echo "  make all    # Run all sections"
 
 # Surgery checkpoints rebuild when surgery JSON changes.

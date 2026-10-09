@@ -133,6 +133,7 @@ Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64
 
 - [docs/surgery.md](docs/surgery.md) - the strict / fast op vocabulary, LayerNorm rewrite, attention rewrite, Gibbs top-k softmax, calibration, and metadata schema.
 - [docs/exact_tail_mass.md](docs/exact_tail_mass.md) - exact runtime omitted-tail mass.
+- [docs/cluster_routing.md](docs/cluster_routing.md) - query-centroid support routing (fixed k-means centroids select the sparse support before the scores; `make routing`, `make pythia-routing`, `make routing-strict`, `make routing-strict-bench`).
 - [docs/pythia_results.md](docs/pythia_results.md) - Pythia-70M WikiText-2 surgery sweep (exact vs tail0).
 - [docs/profile.md](docs/profile.md) - per-module GPU time and memory, strict vs fast.
 - [docs/mambair_results.md](docs/mambair_results.md) - MambaIRv2-Light Set5 sweeps (tail drop, calibrated, exact).

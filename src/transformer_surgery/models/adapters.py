@@ -210,7 +210,11 @@ def load_surgery_student_checkpoint(
     model = adapter.build_surgery_model_from_extra(ensure_mapping(extra_ns), cfg).to(
         device=device, dtype=get_surgery_dtype()
     )
+    from transformer_surgery.internal.routing import install_routers_from_state_dict
+
+    install_routers_from_state_dict(model, state_dict)
     model.load_state_dict(state_dict, strict=True)
+    model.to(device=device)
     adapter.freeze_surgery_parameters(model)
     return model, ensure_mapping(extra_ns)
 

@@ -117,6 +117,45 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(probs, expected, atol=1e-6))
         self.assertTrue(torch.equal(q_tail, torch.zeros_like(q_tail)))
 
+    def test_routed_support_selection(self) -> None:
+        import torch
+
+        from transformer_surgery.internal.routing import kmeans_per_head
+        from transformer_surgery.ops import GibbsTopKSoftmax, QueryCentroidRouter
+
+        torch.manual_seed(0)
+        q = torch.randn(1, 2, 6, 4)
+        k = torch.randn(1, 2, 6, 4)
+        scores = q @ k.transpose(-2, -1) / 2.0
+        for exact in (False, True):
+            gibbs = GibbsTopKSoftmax(
+                seq_len=6, top_k=3, eps=1e-6, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact
+            )
+            # Exact scores as selection scores reproduce the default top-k path.
+            for a, b in zip(gibbs(scores), gibbs(scores, scores)):
+                self.assertTrue(torch.allclose(a, b, atol=1e-6))
+            # Centroids equal to the queries route every query to its own exact top-k.
+            router = QueryCentroidRouter(q[0])
+            for a, b in zip(gibbs(scores), gibbs(scores, router(q, k))):
+                self.assertTrue(torch.allclose(a, b, atol=1e-5))
+        self.assertEqual(tuple(router(q, k).shape), (1, 2, 6, 6))
+        # Sparse scoring on the routed support equals the dense routed path (strict and fast).
+        from transformer_surgery.ops import PairwiseDotBySquare
+
+        router = QueryCentroidRouter(torch.randn(2, 3, 4))
+        gibbs = GibbsTopKSoftmax(seq_len=6, top_k=3, eps=1e-6, gibbs_tail_prob_eps=0.2)
+        for allow_matmul in (False, True):
+            dot = PairwiseDotBySquare(4, allow_matmul=allow_matmul)
+            dense = gibbs(dot(q, k), router(q, k))
+            support = router.support(q, k, 3)
+            sparse = gibbs.forward_selected(dot.selected(q, k, support), support, 6)
+            for a, b in zip(dense, sparse):
+                self.assertTrue(torch.allclose(a.float(), b.float(), atol=1e-5))
+        x = torch.cat((torch.randn(2, 50, 3) * 0.01 + 5.0, torch.randn(2, 50, 3) * 0.01 - 5.0), dim=1)
+        km = kmeans_per_head(x, 2, 10, torch.Generator().manual_seed(0))
+        self.assertTrue(torch.all(km["relative_inertia"] < 1e-3))
+        self.assertTrue(torch.all(km["empty_clusters"] == 0))
+
     def test_gibbs_exact_tail_mass_matches_dense_omitted(self) -> None:
         import torch
 

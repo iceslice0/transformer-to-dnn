@@ -397,6 +397,19 @@ class PairwiseDotBySquare(nn.Module):
         ke_b = RoutingExpand(ke, -1, -1, nq, -1, -1)
         return self.square_chain(qe_b, ke_b)
 
+    def selected(self, q: torch.Tensor, k: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Scores on a given support only: ``q`` [B,H,Nq,D], ``idx`` [B,H,Nq,K] -> [B,H,Nq,K]."""
+        nq = q.shape[2]
+        d = k.shape[-1]
+        kk = idx.shape[-1]
+        idx_e = RoutingExpand(RoutingUnsqueeze(idx, -1), -1, -1, -1, -1, d)
+        k_g = RoutingGather(RoutingExpand(RoutingUnsqueeze(k, 2), -1, -1, nq, -1, -1), 3, idx_e)
+        if self.allow_matmul:
+            qs = RoutingUnsqueeze(self.q_scale(q), -2)
+            return RoutingSqueeze(self.qk_matmul(qs, RoutingTranspose(k_g, -2, -1)), -2)
+        q_b = RoutingExpand(RoutingUnsqueeze(q, 3), -1, -1, -1, kk, -1)
+        return self.square_chain(q_b, k_g)
+
 
 # ---------------------------------------------------------------------------
 # Gibbs Top-K softmax with fixed omitted-tail probability
@@ -488,14 +501,48 @@ class GibbsTopKSoftmax(nn.Module):
                     torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
                 )
 
-    def forward(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, scores: torch.Tensor, selection_scores: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         scores: [B, H, Nq, Nk]
+        selection_scores: optional [B, H, Nq, Nk] that choose the support (e.g. from
+        :class:`QueryCentroidRouter`); ``None`` keeps the top-k of ``scores``.
         returns probs [B,H,Nq,K], idx [B,H,Nq,K], q_tail [B,H,Nq,1]
         """
         _b, _h, _nq, nk = scores.shape
         k = min(self.top_k, nk)
-        raw_vals, idx = RoutingTopK(scores, k=k, dim=-1, largest=True, sorted=True)
+        if selection_scores is None:
+            raw_vals, idx = RoutingTopK(scores, k=k, dim=-1, largest=True, sorted=True)
+        else:
+            _sel_vals, sel_idx = RoutingTopK(selection_scores, k=k, dim=-1, largest=True, sorted=False)
+            # Exact scores on the routed support, ordered so the first slot holds the row max.
+            raw_vals, order = RoutingTopK(
+                RoutingGather(scores, -1, sel_idx), k=k, dim=-1, largest=True, sorted=True
+            )
+            idx = RoutingGather(sel_idx, -1, order)
+        return self._normalize_support(raw_vals, idx, nk, scores)
+
+    def forward_selected(
+        self, selected_scores: torch.Tensor, idx: torch.Tensor, nk: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Exact scores read only on a support chosen elsewhere (e.g. :meth:`QueryCentroidRouter.support`).
+
+        selected_scores, idx: [B, H, Nq, K]; nk: number of keys. Calibrated or fixed tail mass only:
+        exact mode needs every score for the dense normalizer.
+        """
+        if self.use_exact_tail_mass:
+            raise ValueError("forward_selected needs a calibrated or fixed tail mass, not exact mode")
+        kk = selected_scores.shape[-1]
+        raw_vals, order = RoutingTopK(selected_scores, k=kk, dim=-1, largest=True, sorted=True)
+        return self._normalize_support(raw_vals, RoutingGather(idx, -1, order), int(nk), None)
+
+    def _normalize_support(
+        self, raw_vals: torch.Tensor, idx: torch.Tensor, nk: int, scores: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Probabilities on the support from scores sorted in descending order; ``scores`` for exact mode."""
+        k = raw_vals.shape[-1]
         row_max = raw_vals[..., :1]
         _v, _r = RoutingBroadcastTensors(raw_vals, row_max)
         vals = self.top_vals_stable_contract(RoutingStack((_v, _r), dim=-1))
@@ -538,6 +585,54 @@ class GibbsTopKSoftmax(nn.Module):
             q_tail = RoutingFullLike(s_k, 0.0)
 
         return probs, idx, q_tail
+
+
+# ---------------------------------------------------------------------------
+# Sparse support routing by fixed query centroids
+# ---------------------------------------------------------------------------
+
+
+class QueryCentroidRouter(nn.Module):
+    """
+    Selection scores for the sparse support from fixed query centroids ``c[h, m]`` (calibrated offline).
+
+    Query ``i`` goes to its nearest centroid ``m(i) = argmax_m (q_i . c_m - |c_m|^2 / 2)`` and scores key
+    ``j`` by ``c_{m(i)} . k_j``. Both contractions have fixed coefficients and the assignment and gather
+    are routing, so the router adds no unary evaluation and no activation-activation product.
+    :class:`GibbsTopKSoftmax` keeps the top-k keys of these scores and reads exact scores only there.
+    """
+
+    def __init__(self, centroids: torch.Tensor) -> None:
+        super().__init__()
+        c = centroids.detach().float()
+        if c.dim() != 3:
+            raise ValueError(f"centroids must be [heads, clusters, head_dim], got {tuple(c.shape)}")
+        self.num_clusters = int(c.shape[1])
+        self.assign_scores = AffineContract("hcd,bhnd->bhnc", c)
+        self.key_scores = AffineContract("hcd,bhkd->bhck", c)
+        self.register_buffer("assign_bias", (-0.5 * c.pow(2).sum(-1)).view(1, c.shape[0], 1, c.shape[1]))
+        self.add_assign_bias = AffineAdd()
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """q: [B,H,Nq,D], k: [B,H,Nk,D], optional additive mask; returns selection scores [B,H,Nq,Nk]."""
+        bias = self.assign_bias.to(device=q.device, dtype=q.dtype)
+        assign = self.add_assign_bias(self.assign_scores(q), bias)
+        _a, m = RoutingTopK(assign, k=1, dim=-1)
+        key_scores = self.key_scores(k)
+        m_e = RoutingExpand(m, -1, -1, -1, key_scores.shape[-1])
+        selection = RoutingGather(key_scores, 2, m_e)
+        return selection if mask is None else RoutingAdd(selection, mask)
+
+    def support(self, q: torch.Tensor, k: torch.Tensor, top_k: int) -> torch.Tensor:
+        """Unmasked support ``[B,H,Nq,K]``: top-k keys per centroid, gathered by each query's centroid.
+
+        Equals the top-k of :meth:`forward` row by row without forming an ``Nq x Nk`` matrix.
+        """
+        bias = self.assign_bias.to(device=q.device, dtype=q.dtype)
+        assign = self.add_assign_bias(self.assign_scores(q), bias)
+        _a, m = RoutingTopK(assign, k=1, dim=-1)
+        _v, idx_c = RoutingTopK(self.key_scores(k), k=int(top_k), dim=-1, largest=True, sorted=False)
+        return RoutingGather(idx_c, 2, RoutingExpand(m, -1, -1, -1, int(top_k)))
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +722,8 @@ class SurgeryAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
+        self.router: Optional[nn.Module] = None
         if use_attention_surgery:
             self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
             if use_surgery_softmax:
@@ -672,8 +769,15 @@ class SurgeryAttention(nn.Module):
             attn = self.attn_drop(attn)
             attn = attn @ v
         elif self.use_surgery_softmax:
-            scores = self.dot(q, k)
-            probs, idx, q_tail = self.gibbs(scores)
+            nk = k.shape[2]
+            if self.router is not None and self.gibbs.top_k < nk and not self.gibbs.use_exact_tail_mass:
+                # Routed support first, exact scores only on it: no Nq x Nk score matrix.
+                support = self.router.support(q, k, self.gibbs.top_k)
+                probs, idx, q_tail = self.gibbs.forward_selected(self.dot.selected(q, k, support), support, nk)
+            else:
+                scores = self.dot(q, k)
+                selection = self.router(q, k) if self.router is not None else None
+                probs, idx, q_tail = self.gibbs(scores, selection)
             _p, _qt = RoutingBroadcastTensors(probs, q_tail)
             adjusted_probs = self.adj_probs_contract(RoutingStack((_p, _qt), dim=-1))
             attn_top = self.sparse_mix(adjusted_probs, idx, v)
@@ -748,6 +852,8 @@ class SurgeryCausalAttention(nn.Module):
         self.query_key_value = nn.Linear(dim, dim * 3, bias=attn_bias)
         self.dense = nn.Linear(dim, dim, bias=attn_bias)
         self.attn_drop = nn.Dropout(attn_drop)
+        # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
+        self.router: Optional[nn.Module] = None
 
         self.register_buffer("causal_mask", build_causal_attn_mask(self.seq_len), persistent=False)
         self._init_rotary_buffers(rope_theta)
@@ -881,8 +987,19 @@ class SurgeryCausalAttention(nn.Module):
             attn = self.attn_drop(attn)
             attn = self.matmul(attn, v) if self.allow_matmul else torch.matmul(attn, v)
         elif self.use_surgery_softmax:
-            scores = self.mask_scores(self.dot(q, k), mask)
-            probs, idx, q_tail = self.gibbs(scores)
+            if self.router is not None and self.gibbs.top_k < n and not self.gibbs.use_exact_tail_mass:
+                # The causal mask differs per row, so the support is the top-k of the masked selection;
+                # exact scores are formed only on it.
+                _sv, support = RoutingTopK(
+                    self.router(q, k, mask), k=self.gibbs.top_k, dim=-1, largest=True, sorted=False
+                )
+                mask_sel = RoutingGather(RoutingExpand(mask, b, self.num_heads, n, n), -1, support)
+                scores_sel = self.mask_scores(self.dot.selected(q, k, support), mask_sel)
+                probs, idx, q_tail = self.gibbs.forward_selected(scores_sel, support, n)
+            else:
+                scores = self.mask_scores(self.dot(q, k), mask)
+                selection = self.router(q, k, mask) if self.router is not None else None
+                probs, idx, q_tail = self.gibbs(scores, selection)
             # When valid_keys < top_k, topk may return future (-inf) filler indices with ~0
             # probability. Zero them explicitly so no mass is routed past the causal boundary.
             query_pos = torch.arange(n, device=idx.device).view(1, 1, n, 1)

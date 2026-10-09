@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 
 from transformer_surgery.models.adapters import get_model_adapter
+from transformer_surgery.internal.routing import calibrate_support_routing, log_support_routing
+from transformer_surgery.internal.pointwise import count_pointwise_per_input
 from transformer_surgery.internal.reporting import (
     describe_device,
     describe_dtype,
@@ -154,6 +156,15 @@ def surgery(cfg: "SurgeryConfig") -> None:
         if applied_mean is not None:
             log_line(f"Applied gibbs_tail_prob_eps mean={float(applied_mean):.6g}")
 
+    if str(cfg.support_routing) != "topk":
+        routing_stats = calibrate_support_routing(model, train_loader, val_loader, cfg)
+        log_support_routing(routing_stats)
+        cal.update(routing_stats)
+        routed_mean = routing_stats.get("gibbs_tail_prob_eps_applied_mean")
+        if routed_mean is not None:
+            applied_mean = routed_mean
+            log_line(f"Applied routed gibbs_tail_prob_eps mean={float(applied_mean):.6g}")
+
     after_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_after_surgery")
     write_model_structure_txt(
         after_log_path,
@@ -167,6 +178,8 @@ def surgery(cfg: "SurgeryConfig") -> None:
         adapter, model, val_loader, cfg, device
     )
     rel_slowdown = pre_val_time_s / ref_val_time_s if ref_val_time_s > 0 else 0.0
+    pointwise = count_pointwise_per_input(model, next(iter(val_loader))[0])
+    log_line(f"Pointwise (unary) evaluations per input: {pointwise['pointwise_per_input']:.6g}")
     log_line(
         f"Post-transform val primary={pre_acc:.4f} loss={pre_loss:.4f} "
         f"({adapter.primary_metric_name()}) "
@@ -203,6 +216,8 @@ def surgery(cfg: "SurgeryConfig") -> None:
         meta.calibration.ref_val_peak_gpu_mem_bytes = int(ref_peak_memory)
     if pre_peak_memory is not None:
         meta.calibration.student_pre_ft_val_peak_gpu_mem_bytes = int(pre_peak_memory)
+    meta.calibration.student_pointwise_per_input = float(pointwise["pointwise_per_input"])
+    meta.calibration.student_pointwise_per_input_by_type = dict(pointwise["pointwise_per_input_by_type"])
     for key, value in ref_extra.items():
         setattr(meta.calibration, f"ref_val_{key}", float(value))
     for key, value in pre_extra.items():

@@ -41,6 +41,15 @@ class SurgeryConfig:
     gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
     use_exact_tail_mass: bool = False
+    # Sparse support selection: "topk" keeps the top-k exact scores; "query_centroids" keeps the
+    # top-k keys of the nearest fixed query centroid (k-means on calibration queries).
+    support_routing: str = "topk"
+    routing_clusters: int = 32
+    routing_calibration_batches: Optional[int] = 20
+    routing_max_samples: int = 65536
+    routing_kmeans_iters: int = 30
+    routing_seed: int = 0
+    routing_eval_batches: Optional[int] = None
     reference_checkpoint: Optional[str] = None
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
@@ -70,6 +79,16 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
         "Compute omitted-tail mass at runtime from dense softmax via the centroid partition trick "
         "(N * mean(exp)) instead of using the calibrated/fixed gibbs_tail_prob_eps scalar."
     ),
+    "support_routing": (
+        "Sparse support selection: 'topk' (top-k exact scores) or 'query_centroids' "
+        "(top-k keys of the nearest fixed query centroid; no activation-activation products)."
+    ),
+    "routing_clusters": "Number of k-means query centroids per head for support_routing=query_centroids.",
+    "routing_calibration_batches": "Training batches sampled for the centroid fit; JSON null uses all.",
+    "routing_max_samples": "Cap on query vectors per head used by k-means.",
+    "routing_kmeans_iters": "Lloyd iterations after k-means++ initialization.",
+    "routing_seed": "Seed for batch sampling, query subsampling and k-means++.",
+    "routing_eval_batches": "Validation batches for support diagnostics (captured mass, recall); JSON null uses all.",
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",
