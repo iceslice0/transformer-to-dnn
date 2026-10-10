@@ -46,6 +46,10 @@ class SurgeryConfig:
     strict_unary: str = "sigmoid_rsqrt"
     # MLP activation: "exact" GELU or "sigmoid" x*sigmoid(1.702x) (model change for NPUs without GELU).
     gelu: str = "exact"
+    # Hadamard graph (DeiT-Tiny): the strict graph with every product of two activations, squares included, as one
+    # elementwise product instead of polarization; QK^T and PV as products plus sums. Needs allow_matmul=False
+    # and strict_unary="sigmoid_rsqrt"; the unary maps are then the sigmoid, the inverse square root and GELU.
+    hadamard: bool = False
     # Sparse support selection: "topk" keeps the top-k exact scores; "query_centroids" keeps the
     # top-k keys of the nearest fixed query centroid (k-means on calibration queries).
     support_routing: str = "topk"
@@ -86,6 +90,10 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     ),
     "strict_unary": "Strict unary set: 'sigmoid_rsqrt' (default; squares, sigmoid, rsqrt) or deprecated 'log_exp'.",
     "gelu": "MLP activation: 'exact' GELU or 'sigmoid' x*sigmoid(1.702x) (a model change).",
+    "hadamard": (
+        "DeiT-Tiny Hadamard graph: elementwise products instead of polarization, QK^T and PV as products plus "
+        "sums, no matmul; needs allow_matmul=false and strict_unary='sigmoid_rsqrt'."
+    ),
     "support_routing": (
         "Sparse support selection: 'topk' (top-k exact scores) or 'query_centroids' "
         "(top-k keys of the nearest fixed query centroid; no activation-activation products)."

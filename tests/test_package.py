@@ -188,6 +188,65 @@ class PackageSmokeTests(unittest.TestCase):
         finally:
             set_surgery_dtype(torch.bfloat16)
 
+    def test_hadamard_graph_matches_reference_with_two_unary_maps(self) -> None:
+        import torch
+
+        from transformer_surgery.internal.util import set_surgery_dtype
+        from transformer_surgery.models.deit_tiny.surgery_model import DeiTTinySurgeryModel
+        from transformer_surgery.ops import (
+            GibbsTopKSoftmax,
+            PairwiseDotBySquare,
+            RewrittenLayerNorm,
+            SigmoidGELU,
+            SurgeryAttention,
+        )
+
+        set_surgery_dtype(torch.float64)
+        try:
+            torch.manual_seed(0)
+            x = torch.randn(2, 7, 12, dtype=torch.float64) * 3 + 1
+            ref = torch.nn.LayerNorm(12, eps=1e-3).double()
+            ln = RewrittenLayerNorm(12, eps=1e-3, hadamard=True).double()
+            self.assertTrue(torch.allclose(ln(x), ref(x), atol=1e-10))
+            scores = torch.randn(1, 2, 5, 9, dtype=torch.float64) * 4
+            for exact in (False, True):
+                kw = dict(seq_len=9, top_k=4, eps=0.0, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
+                fast = GibbsTopKSoftmax(allow_matmul=True, **kw).double()
+                had = GibbsTopKSoftmax(hadamard=True, **kw).double()
+                for a, b in zip(fast(scores), had(scores)):
+                    self.assertTrue(torch.allclose(a.double(), b.double(), atol=1e-10))
+            g = SigmoidGELU(hadamard=True).double()
+            self.assertTrue(torch.allclose(g(x), x * torch.sigmoid(1.702 * x), atol=1e-10))
+            q, k = torch.randn(2, 2, 5, 6, dtype=torch.float64), torch.randn(2, 2, 7, 6, dtype=torch.float64)
+            dot_f, dot_h = PairwiseDotBySquare(6, allow_matmul=True), PairwiseDotBySquare(6, hadamard=True)
+            self.assertTrue(torch.allclose(dot_f(q, k), dot_h(q, k), atol=1e-10))
+            idx = torch.randint(0, 7, (2, 2, 5, 3))
+            self.assertTrue(torch.allclose(dot_f.selected(q, k, idx), dot_h.selected(q, k, idx), atol=1e-10))
+            for exact in (False, True):
+                for top_k in (3, 7):
+                    torch.manual_seed(1)
+                    kw = dict(dim=12, num_heads=2, seq_len=7, top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                    fast = SurgeryAttention(allow_matmul=True, **kw).double()
+                    had = SurgeryAttention(hadamard=True, **kw).double()
+                    had.load_state_dict(fast.state_dict(), strict=False)
+                    self.assertTrue(torch.allclose(fast(x), had(x), atol=1e-9))
+            with self.assertRaises(ValueError):
+                RewrittenLayerNorm(8, eps=1e-6, allow_matmul=True, hadamard=True)
+            # Unary maps of the whole Hadamard graph: sigmoid and inverse square root, plus GELU unless replaced.
+            for gelu, expected in (("exact", {"NLGELU", "NLRsqrtPlusEps", "NLSigmoid"}), ("sigmoid", {"NLRsqrtPlusEps", "NLSigmoid"})):
+                model = DeiTTinySurgeryModel(
+                    num_classes=3, img_size=32, patch_size=16, embed_dim=12, depth=1, num_heads=2, top_k=3,
+                    hadamard=True, gelu=gelu, drop_path_rate=0.0,
+                ).double().eval()
+                seen = set()
+                for m in model.modules():
+                    if type(m).__name__.startswith("NL"):
+                        m.register_forward_hook(lambda mod, _i, _o: seen.add(type(mod).__name__))
+                model(torch.randn(2, 3, 32, 32, dtype=torch.float64))
+                self.assertEqual(seen, expected)
+        finally:
+            set_surgery_dtype(torch.bfloat16)
+
     def test_gibbs_exact_tail_mass_matches_dense_omitted(self) -> None:
         import torch
 

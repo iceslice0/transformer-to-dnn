@@ -73,7 +73,8 @@ def build_causal_valid_key_mean_matrix(seq_len: int, *, dtype: torch.dtype = tor
 # Op vocabulary: three groups.
 #   Affine*  - linear in each operand: parameterized layers, fixed-coeff einsum, per-channel
 #              scale+bias, fixed 2x2 mixes, linear unary reductions/scalings, and the variable
-#              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul.
+#              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul (and AffineHadamard
+#              alone gated by ``hadamard``).
 #   NL*      - strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
 #              reciprocal+eps, GELU).
 #   Routing* - pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
@@ -117,6 +118,13 @@ class AffineHadamard(nn.Module):
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a * b
+
+
+class AffineSelfHadamard(nn.Module):
+    """Square ``x * x`` as one elementwise product of an activation with itself (Hadamard basis, not unary)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * x
 
 
 class AffineAdd(nn.Module):
@@ -205,6 +213,16 @@ def check_strict_unary(strict_unary: str) -> str:
     value = str(strict_unary)
     if value not in STRICT_UNARY_SETS:
         raise ValueError(f"strict_unary must be one of {STRICT_UNARY_SETS}, got {value!r}")
+    return value
+
+
+def check_hadamard(hadamard: bool, *, allow_matmul: bool, strict_unary: str = "sigmoid_rsqrt") -> bool:
+    """``hadamard=True`` is the Hadamard graph: the strict graph with every product of two activations, squares
+    included, as one elementwise product instead of polarization, and QK^T and PV as products plus sums (no
+    matmul). It requires ``allow_matmul=False`` and ``strict_unary="sigmoid_rsqrt"``."""
+    value = bool(hadamard)
+    if value and (allow_matmul or str(strict_unary) != "sigmoid_rsqrt"):
+        raise ValueError("hadamard=True needs allow_matmul=False and strict_unary='sigmoid_rsqrt'")
     return value
 
 
@@ -303,12 +321,12 @@ class SquareIdentityOperandChain(nn.Module):
 class ElementwiseProduct(nn.Module):
     """
     Product of two activations ``a * b`` (broadcast). Strict: polarization ``((a+b)^2-(a-b)^2)/4``,
-    two squares per entry. ``allow_matmul=True``: one :class:`AffineHadamard` node.
+    two squares per entry. ``allow_matmul=True`` or ``hadamard=True``: one :class:`AffineHadamard` node.
     """
 
-    def __init__(self, *, allow_matmul: bool = False) -> None:
+    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
         super().__init__()
-        self.allow_matmul = bool(allow_matmul)
+        self.allow_matmul = bool(allow_matmul) or bool(hadamard)
         if self.allow_matmul:
             self.hadamard = AffineHadamard()
         else:
@@ -326,12 +344,12 @@ class ElementwiseProduct(nn.Module):
 
 
 class ReciprocalByRsqrt(nn.Module):
-    """``1/x = (x^{-1/2})^2`` for ``x > 0``: one inverse square root and one square."""
+    """``1/x = (x^{-1/2})^2`` for ``x > 0``: one inverse square root and one square (a self-product if ``hadamard``)."""
 
-    def __init__(self, eps: float = 0.0) -> None:
+    def __init__(self, eps: float = 0.0, *, hadamard: bool = False) -> None:
         super().__init__()
         self.rsqrt = NLRsqrtPlusEps(eps)
-        self.square = NLSquare()
+        self.square = AffineSelfHadamard() if hadamard else NLSquare()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.square(self.rsqrt(x))
@@ -341,14 +359,16 @@ class ExpBySigmoid(nn.Module):
     """
     ``exp(t) = sigmoid(t) / sigmoid(-t)`` with the reciprocal as :class:`ReciprocalByRsqrt` and the product
     by polarization: two sigmoids, one inverse square root and three squares per entry, no exp and no log.
+    ``hadamard=True``: the square and the product are elementwise products, so only the two sigmoids and the
+    inverse square root are unary.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, hadamard: bool = False) -> None:
         super().__init__()
         self.sigmoid = NLSigmoid()
         self.negate = AffineScale(-1.0)
-        self.reciprocal = ReciprocalByRsqrt(0.0)
-        self.product = ElementwiseProduct(allow_matmul=False)
+        self.reciprocal = ReciprocalByRsqrt(0.0, hadamard=hadamard)
+        self.product = ElementwiseProduct(allow_matmul=False, hadamard=hadamard)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.product(self.sigmoid(t), self.reciprocal(self.sigmoid(self.negate(t))))
@@ -357,11 +377,11 @@ class ExpBySigmoid(nn.Module):
 class SigmoidGELU(nn.Module):
     """GELU approximation ``x * sigmoid(1.702 x)`` (Hendrycks and Gimpel); product by polarization if strict."""
 
-    def __init__(self, *, allow_matmul: bool = False) -> None:
+    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
         super().__init__()
         self.scale = AffineScale(1.702)
         self.sigmoid = NLSigmoid()
-        self.product = ElementwiseProduct(allow_matmul=allow_matmul)
+        self.product = ElementwiseProduct(allow_matmul=allow_matmul, hadamard=hadamard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.product(x, self.sigmoid(self.scale(x)))
@@ -402,19 +422,29 @@ class RewrittenLayerNorm(nn.Module):
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
     ``inv_std = 1/sqrt(r2+eps)`` via :class:`NLRsqrtPlusEps` and :class:`AffineHadamard`, not the
     log-domain path.
+
+    **``hadamard=True`` (Hadamard graph):** ``u*u`` and ``u * inv_std`` are elementwise products; the inverse
+    square root is the only unary map.
     """
 
     def __init__(
-        self, normalized_shape: int, eps: float, *, allow_matmul: bool = False, strict_unary: str = "sigmoid_rsqrt"
+        self,
+        normalized_shape: int,
+        eps: float,
+        *,
+        allow_matmul: bool = False,
+        strict_unary: str = "sigmoid_rsqrt",
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
         e = float(eps)
         self.allow_matmul = allow_matmul
         self.strict_unary = check_strict_unary(strict_unary)
+        self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
         self.mean_u = AffineMean(-1, keepdim=True)
         self.mean_r2 = AffineMean(-1, keepdim=True)
-        self.square = NLSquare()
+        self.square = AffineSelfHadamard() if self.hadamard else NLSquare()
         self.u_center_contract = AffineContract(
             "i,...i->...",
             torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
@@ -425,7 +455,7 @@ class RewrittenLayerNorm(nn.Module):
             self.u_mul_invstd = AffineHadamard()
         elif self.strict_unary == "sigmoid_rsqrt":
             self.inv_sqrt_var = NLRsqrtPlusEps(e)
-            self.u_mul_invstd = ElementwiseProduct(allow_matmul=False)
+            self.u_mul_invstd = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
         else:
             warnings.warn(
                 "strict_unary='log_exp' (log-domain strict graph) is deprecated; use 'sigmoid_rsqrt'",
@@ -471,15 +501,23 @@ class PairwiseDotBySquare(nn.Module):
     Optional ``allow_matmul=True`` replaces this with fused ``(q/sqrt(d)) @ k.T`` for
     speed / debugging only; that path **does** use matrix multiply and is not valid for the
     strict surgery demonstration.
+
+    ``hadamard=True`` (Hadamard graph): ``(q/sqrt(d)) * k`` on the broadcast grid, one elementwise product
+    per term, then a fixed sum over the head dimension. No matmul and no unary map.
     """
 
-    def __init__(self, head_dim: int, *, allow_matmul: bool = False) -> None:
+    def __init__(self, head_dim: int, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.allow_matmul = allow_matmul
+        self.hadamard = bool(hadamard) and not allow_matmul
         if allow_matmul:
             self.q_scale = AffineScale(1.0 / math.sqrt(float(head_dim)))
             self.qk_matmul = AffineMatMul()
+        elif self.hadamard:
+            self.q_scale = AffineScale(1.0 / math.sqrt(float(head_dim)))
+            self.qk_hadamard = AffineHadamard()
+            self.reduce = AffineSum(-1)
         else:
             w = 0.25 / math.sqrt(float(head_dim))
             self.square_chain = SquareIdentityOperandChain(
@@ -498,6 +536,8 @@ class PairwiseDotBySquare(nn.Module):
         nk = k.shape[2]
         qe_b = RoutingExpand(qe, -1, -1, -1, nk, -1)
         ke_b = RoutingExpand(ke, -1, -1, nq, -1, -1)
+        if self.hadamard:
+            return self.reduce(self.qk_hadamard(self.q_scale(qe_b), ke_b))
         return self.square_chain(qe_b, ke_b)
 
     def selected(self, q: torch.Tensor, k: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -511,6 +551,8 @@ class PairwiseDotBySquare(nn.Module):
             qs = RoutingUnsqueeze(self.q_scale(q), -2)
             return RoutingSqueeze(self.qk_matmul(qs, RoutingTranspose(k_g, -2, -1)), -2)
         q_b = RoutingExpand(RoutingUnsqueeze(q, 3), -1, -1, -1, kk, -1)
+        if self.hadamard:
+            return self.reduce(self.qk_hadamard(self.q_scale(q_b), k_g))
         return self.square_chain(q_b, k_g)
 
 
@@ -555,12 +597,14 @@ class GibbsTopKSoftmax(nn.Module):
         allow_matmul: bool = False,
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
         self.top_k = top_k
         self.use_exact_tail_mass = bool(use_exact_tail_mass)
         self.strict_unary = check_strict_unary(strict_unary)
+        h = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
         # Strict graph without exp and log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2.
         self.sigmoid_rsqrt = (not allow_matmul) and self.strict_unary == "sigmoid_rsqrt"
         tail_prob = float(gibbs_tail_prob_eps)
@@ -582,9 +626,9 @@ class GibbsTopKSoftmax(nn.Module):
             self.inv_z = NLReciprocalPlusEps(e)
             self.mul_by_inv_z = AffineHadamard()
         elif self.sigmoid_rsqrt:
-            self.exp = ExpBySigmoid()
-            self.inv_z = ReciprocalByRsqrt(e)
-            self.mul_by_inv_z = ElementwiseProduct(allow_matmul=False)
+            self.exp = ExpBySigmoid(hadamard=h)
+            self.inv_z = ReciprocalByRsqrt(e, hadamard=h)
+            self.mul_by_inv_z = ElementwiseProduct(allow_matmul=False, hadamard=h)
         else:
             self.log_z = NLLogPlusEps(e)
             self.logit_logz_contract = AffineContract(
@@ -606,9 +650,9 @@ class GibbsTopKSoftmax(nn.Module):
                 self.inv_z_all = NLReciprocalPlusEps(e)
                 self.mul_ztop_inv_zall = AffineHadamard()
             elif self.sigmoid_rsqrt:
-                self.inv_z_all = ReciprocalByRsqrt(e)
-                self.mul_ztop_inv_zall = ElementwiseProduct(allow_matmul=False)
-                self.scale_top_probs_by_tail = ElementwiseProduct(allow_matmul=False)
+                self.inv_z_all = ReciprocalByRsqrt(e, hadamard=h)
+                self.mul_ztop_inv_zall = ElementwiseProduct(allow_matmul=False, hadamard=h)
+                self.scale_top_probs_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=h)
             else:
                 self.log_z_all = NLLogPlusEps(e)
                 self.log_z_top = NLLogPlusEps(e)
@@ -769,11 +813,16 @@ class SparseWeightedSumBySquare(nn.Module):
     mixed by one dense ``[Nq,Nk] @ [Nk,D]`` product, the same sum without a gathered ``[Nq,K,D]`` tensor.
     """
 
-    def __init__(self, *, allow_matmul: bool = False) -> None:
+    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
         super().__init__()
         self.allow_matmul = allow_matmul
+        # Hadamard graph: ``p * v`` as elementwise products, then a fixed sum over the support.
+        self.hadamard = bool(hadamard) and not allow_matmul
         if allow_matmul:
             self.pv_matmul = AffineMatMul()
+        elif self.hadamard:
+            self.pv_hadamard = AffineHadamard()
+            self.reduce = AffineSum(-2)
         else:
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
@@ -805,6 +854,8 @@ class SparseWeightedSumBySquare(nn.Module):
             return RoutingSqueeze(self.pv_matmul(RoutingUnsqueeze(probs, -2), v_g), -2)
         p = RoutingUnsqueeze(probs, -1)
         p_b = RoutingExpand(p, -1, -1, -1, -1, d)
+        if self.hadamard:
+            return self.reduce(self.pv_hadamard(p_b, v_g))
         return self.square_chain(p_b, v_g)
 
 
@@ -831,11 +882,13 @@ class SurgeryAttention(nn.Module):
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.strict_unary = check_strict_unary(strict_unary)
+        self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
         self.use_attention_surgery = use_attention_surgery
         self.use_surgery_softmax = use_surgery_softmax
         self.allow_matmul = allow_matmul
@@ -847,7 +900,7 @@ class SurgeryAttention(nn.Module):
         # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
         self.router: Optional[nn.Module] = None
         if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
+            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul, hadamard=self.hadamard)
             if use_surgery_softmax:
                 self.gibbs = GibbsTopKSoftmax(
                     seq_len,
@@ -857,15 +910,16 @@ class SurgeryAttention(nn.Module):
                     allow_matmul=allow_matmul,
                     use_exact_tail_mass=use_exact_tail_mass,
                     strict_unary=self.strict_unary,
+                    hadamard=self.hadamard,
                 )
-                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
+                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul, hadamard=self.hadamard)
                 k_eff = min(int(top_k), int(seq_len))
                 n_dropped = max(int(seq_len) - k_eff, 1)
                 inv_dropped = 1.0 / n_dropped
                 n_over_dropped = float(seq_len) / n_dropped
                 self.mean_v = AffineMean(dim=-2, keepdim=True)
                 if use_exact_tail_mass and not allow_matmul and self.strict_unary == "sigmoid_rsqrt":
-                    self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False)
+                    self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
                 else:
                     self.scale_mean_v_by_tail = AffineHadamard()
                 self.adj_probs_contract = AffineContract(

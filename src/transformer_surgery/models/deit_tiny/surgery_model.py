@@ -40,14 +40,21 @@ class PatchEmbed(nn.Module):
 
 class SurgeryMlp(nn.Module):
     def __init__(
-        self, in_features: int, hidden_features: int, drop: float = 0.0, *, gelu: str = "exact", allow_matmul: bool = False
+        self,
+        in_features: int,
+        hidden_features: int,
+        drop: float = 0.0,
+        *,
+        gelu: str = "exact",
+        allow_matmul: bool = False,
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         if gelu not in ("exact", "sigmoid"):
             raise ValueError(f"gelu must be 'exact' or 'sigmoid', got {gelu!r}")
         self.fc1 = nn.Linear(in_features, hidden_features)
         # "sigmoid": x * sigmoid(1.702 x), a model change used for NPUs without a GELU unit.
-        self.act = NLGELU() if gelu == "exact" else SigmoidGELU(allow_matmul=allow_matmul)
+        self.act = NLGELU() if gelu == "exact" else SigmoidGELU(allow_matmul=allow_matmul, hadamard=hadamard)
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(drop)
 
@@ -80,11 +87,16 @@ class SurgeryBlock(nn.Module):
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
         gelu: str = "exact",
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
-            self.norm1 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
-            self.norm2 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
+            self.norm1 = RewrittenLayerNorm(
+                dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
+            )
+            self.norm2 = RewrittenLayerNorm(
+                dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
+            )
         else:
             self.norm1 = nn.LayerNorm(dim, eps=eps_ln)
             self.norm2 = nn.LayerNorm(dim, eps=eps_ln)
@@ -102,9 +114,12 @@ class SurgeryBlock(nn.Module):
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             use_exact_tail_mass=use_exact_tail_mass,
             strict_unary=strict_unary,
+            hadamard=hadamard,
         )
         mlp_hidden = int(dim * mlp_ratio)
-        self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop, gelu=gelu, allow_matmul=allow_matmul)
+        self.mlp = SurgeryMlp(
+            in_features=dim, hidden_features=mlp_hidden, drop=drop, gelu=gelu, allow_matmul=allow_matmul, hadamard=hadamard
+        )
         self.drop_path = RoutingDropPath(drop_path)
         self.residual_contract = AffineContract(
             "i,...i->...",
@@ -146,11 +161,13 @@ class DeiTTinySurgeryModel(nn.Module):
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
         gelu: str = "exact",
+        hadamard: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.strict_unary = str(strict_unary)
         self.gelu = str(gelu)
+        self.hadamard = bool(hadamard)
         self.embed_dim = embed_dim
         self.use_surgery_layernorm = use_surgery_layernorm
         self.use_attention_surgery = use_attention_surgery
@@ -188,12 +205,15 @@ class DeiTTinySurgeryModel(nn.Module):
                     use_exact_tail_mass=use_exact_tail_mass,
                     strict_unary=strict_unary,
                     gelu=gelu,
+                    hadamard=hadamard,
                 )
                 for i in range(depth)
             ]
         )
         if use_surgery_layernorm:
-            self.fc_norm = RewrittenLayerNorm(embed_dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
+            self.fc_norm = RewrittenLayerNorm(
+                embed_dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
+            )
         else:
             self.fc_norm = nn.LayerNorm(embed_dim, eps=eps_ln)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -218,6 +238,7 @@ class DeiTTinySurgeryModel(nn.Module):
             use_exact_tail_mass=bool(getattr(cfg, "use_exact_tail_mass", False)),
             strict_unary=str(getattr(cfg, "strict_unary", "sigmoid_rsqrt")),
             gelu=str(getattr(cfg, "gelu", "exact")),
+            hadamard=bool(getattr(cfg, "hadamard", False)),
         )
 
     @classmethod
@@ -237,6 +258,7 @@ class DeiTTinySurgeryModel(nn.Module):
             # Checkpoints written before ``strict_unary`` existed are log-domain.
             strict_unary=str(d.get("strict_unary", "log_exp")),
             gelu=str(d.get("gelu", "exact")),
+            hadamard=bool(d.get("hadamard", False)),
         )
 
     def _init_weights(self) -> None:

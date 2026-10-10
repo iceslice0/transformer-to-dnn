@@ -139,6 +139,8 @@ def surgery(cfg: "SurgeryConfig") -> None:
         f"use_exact_tail_mass={cfg.use_exact_tail_mass}"
     )
     model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
+    if bool(getattr(cfg, "hadamard", False)) and not bool(getattr(model, "hadamard", False)):
+        raise ValueError(f"hadamard=True is implemented for DeiT-Tiny only, not {adapter.key}")
     mapping = adapter.copy_reference_weights(model, ref)
     adapter.freeze_surgery_parameters(model)
 

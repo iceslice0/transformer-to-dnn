@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -77,6 +77,13 @@ STRICT_SR_TARGETS := $(foreach k,$(SR_KS),$(foreach m,_strict_sr _strict_sr_gs,a
 	$(foreach k,$(STRICT_KS),$(foreach m,_strict_sr_qc32 _strict_sr_gs_qc32,artifacts/checkpoints/ts_surgery_topk$(k)$(m).pt))
 PTQ_STRICT_SR_TARGETS := $(foreach k,$(SR_KS),$(foreach m,strict_sr strict_sr_pertensor strict_sr_gs strict_sr_gs_pertensor,artifacts/checkpoints/ts_ptq_$(k)_$(m)_8bit.pt))
 
+# Hadamard graph (hadamard=true): the strict graph with every product of two activations, squares included,
+# as one elementwise product instead of polarization, and QK^T and PV as products plus sums (no matmul).
+# Unary maps: sigmoid and inverse square root, plus exact GELU (_hadamard_sr) or none (_hadamard_sr_gs);
+# _qc32 is the routed support of 32 query centroids.
+HADAMARD_SR_TARGETS := $(foreach k,$(SR_KS),$(foreach m,_hadamard_sr _hadamard_sr_gs,artifacts/checkpoints/ts_surgery_topk$(k)$(m).pt)) \
+	$(foreach k,$(STRICT_KS),$(foreach m,_hadamard_sr_qc32 _hadamard_sr_gs_qc32,artifacts/checkpoints/ts_surgery_topk$(k)$(m).pt))
+
 all: a b c d e a_imagenet mambair
 
 # A. Main Fast-Path Top-k Results
@@ -123,6 +130,29 @@ pythia-routing: $(PYTHIA_ROUTING_TARGETS)
 # against strict top-k (accuracy, latency, peak memory, unary evaluations per image).
 routing-strict: $(STRICT_ROUTING_TARGETS)
 strict-sr: $(STRICT_SR_TARGETS)
+hadamard-sr: $(HADAMARD_SR_TARGETS)
+
+# Per-module CUDA-event profile of the Hadamard graph with GELU ~ x*sigmoid(1.702x) (k=16,32,64), with the
+# strict and extended k=16 checkpoints as same-session controls. The exact-GELU Hadamard profile of the same
+# day is kept in artifacts/logs/profile_hadamard_2026-10-10/.
+PROFILE_HADAMARD_LOG := artifacts/logs/profile_hadamard_gs_2026-10-10
+PROFILE_HADAMARD_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_hadamard_sr_gs.pt) \
+	artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk16_fast.pt
+# Paper Table S4 in one profiling session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), the
+# routed strict graph, and the extended graph with exact GELU (k=16,32,64 for the strict and extended shares).
+PROFILE_GS_LOG := artifacts/logs/profile_gs_2026-10-10
+PROFILE_GS_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs.pt) \
+	artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs_qc32.pt artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs.pt \
+	$(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
+profile-gs: $(PROFILE_GS_CKPTS)
+	mkdir -p $(PROFILE_GS_LOG)
+	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json" > $(PROFILE_GS_LOG)/command.txt
+	$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json | tee $(PROFILE_GS_LOG)/profile.log
+
+profile-hadamard: $(PROFILE_HADAMARD_CKPTS)
+	mkdir -p $(PROFILE_HADAMARD_LOG)
+	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_HADAMARD_LOG)/profile.json" > $(PROFILE_HADAMARD_LOG)/command.txt
+	$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_HADAMARD_LOG)/profile.json | tee $(PROFILE_HADAMARD_LOG)/profile.log
 ptq-strict-sr: $(PTQ_STRICT_SR_TARGETS)
 routing-strict-bench: $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr.pt artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_qc32.pt) $(STRICT_FAST_TARGETS) $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_qc32.pt)
 	$(PYTHON) scripts/bench_strict_routing.py strict_sr $(STRICT_KS)
@@ -133,6 +163,12 @@ EXACT_FP64_LOG := artifacts/logs/exact_fp64_2026-10-10
 exact-fp64: artifacts/checkpoints/ts_surgery_topk197_fast.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
 	mkdir -p $(EXACT_FP64_LOG)
 	$(PYTHON) scripts/check_exact_fp64.py --checkpoints $^ --batches 2 | tee $(EXACT_FP64_LOG)/check.log
+
+# Same float64 check for the Hadamard graph (own log, so the exact-fp64 log is kept).
+EXACT_FP64_HADAMARD_LOG := artifacts/logs/exact_fp64_hadamard_2026-10-10
+exact-fp64-hadamard: artifacts/checkpoints/ts_surgery_topk197_hadamard_sr.pt
+	mkdir -p $(EXACT_FP64_HADAMARD_LOG)
+	$(PYTHON) scripts/check_exact_fp64.py --checkpoints $^ --batches 2 | tee $(EXACT_FP64_HADAMARD_LOG)/check.log
 
 help:
 	@echo "Targets:"
@@ -158,6 +194,10 @@ help:
 	@echo "  make exact-fp64   # float64 end-to-end check of exact compilation (k=197)"
 	@echo "  make strict-sr    # strict graph without exp/log (+GELU approx) and routed strict"
 	@echo "  make ptq-strict-sr # 8-bit PTQ of the new strict graphs"
+	@echo "  make hadamard-sr  # Hadamard graph: elementwise products instead of polarization (sigmoid, rsqrt)"
+	@echo "  make exact-fp64-hadamard # float64 check of the Hadamard graph (k=197)"
+	@echo "  make profile-hadamard # per-module GPU profile of the Hadamard graph (k=16,32,64)"
+	@echo "  make profile-gs   # Table S4 profile: strict/Hadamard with GELU approx, routed strict, extended"
 	@echo "  make all    # Run all sections"
 
 # Surgery checkpoints rebuild when surgery JSON changes.

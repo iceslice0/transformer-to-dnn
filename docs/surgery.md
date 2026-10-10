@@ -269,6 +269,12 @@ Graph options that change the compiled model (not debug flags):
   checkpoints written before the option existed reload as `"log_exp"`.
 - `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (paper Corollary 1; a model change).
 - `support_routing` - `"topk"` or `"query_centroids"` (see `docs/cluster_routing.md`).
+- `hadamard` - DeiT-Tiny only, with `allow_matmul=false` and `strict_unary="sigmoid_rsqrt"`: the Hadamard
+  graph. `ElementwiseProduct` becomes one `AffineHadamard` node and every square (`RewrittenLayerNorm`
+  second moment, `ReciprocalByRsqrt`) one `AffineSelfHadamard` node, so no `NLSquare` remains;
+  `PairwiseDotBySquare` and `SparseWeightedSumBySquare` form `(q/sqrt(d)) * k` and `p * v` on the
+  broadcast grid and sum with `AffineSum` (no `matmul`). Unary maps: `NLSigmoid`, `NLRsqrtPlusEps` and
+  `NLGELU` (none besides the first two with `gelu="sigmoid"`). Configs `topk{16,32,64,197}_hadamard_sr*.json`.
 
 `build_module_mapping` records the resulting per-block module choices (`norm1`, `attn`,
 `norm2`, `mlp.act`, `fc_norm`) into the surgery metadata.

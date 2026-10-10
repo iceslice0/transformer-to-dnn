@@ -168,6 +168,7 @@ def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object
         "support_routing": extra.get("support_routing", "topk"),
         "strict_unary": extra.get("strict_unary"),
         "allow_matmul": extra.get("allow_matmul"),
+        "hadamard": bool(extra.get("hadamard", False)),
         "surgery_dtype": extra.get("surgery_dtype"),
         "batches": len(total_ms),
         "batch_size": cfg.batch_size,
