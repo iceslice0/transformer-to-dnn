@@ -67,8 +67,13 @@ The graph shows an `AffineContract` child; the stack is plain tensor wiring in `
 
 Strictly nonlinear scalar maps:
 
-- Exact unaries: `NLSquare`, `NLExp`, `NLLogPlusEps`, `NLSqrtExp`,
+- Exact unaries: `NLSquare`, `NLSigmoid`, `NLExp`, `NLLogPlusEps`, `NLSqrtExp`,
   `NLRsqrtPlusEps`, `NLReciprocalPlusEps`, `NLGELU`.
+
+Composite modules built from these (no new unary types): `ElementwiseProduct` (polarization
+`((a+b)^2-(a-b)^2)/4` on the strict path, `AffineHadamard` with `allow_matmul`), `ReciprocalByRsqrt`
+(`1/x = (x^{-1/2})^2`), `ExpBySigmoid` (`exp(t) = sigmoid(t)/sigmoid(-t)`), `SigmoidGELU` (`x*sigmoid(1.702x)`),
+and `QueryCentroidRouter` (fixed affine centroid scores plus routing).
 
 `NLGELU` is an exact GELU basis op, not a piecewise-linear approximation and not a trainable
 parameter block.
@@ -106,7 +111,13 @@ Common prefix:
 - `u = AffineContract("i,...i->...", [1, -1])(stack(x, mu, dim=-1))` (centering, no add module).
 - `r2 = AffineMean(-1, keepdim=True)(NLSquare()(u))`.
 
-Strict path (`allow_matmul=False`, default):
+Strict path, `strict_unary="sigmoid_rsqrt"` (default; the paper's strict graph: squares, sigmoid, rsqrt):
+
+- `inv_std = NLRsqrtPlusEps(eps)(r2)` (one inverse square root per token).
+- `z = ElementwiseProduct()(u, inv_std)` (polarization, two squares per entry).
+- Unary count per LayerNorm: `3 N d_model + N` (paper Table 1).
+
+Strict path, `strict_unary="log_exp"` (deprecated log-domain form; emits a `FutureWarning`):
 
 - `au = stack(F.relu(u), F.relu(-u), dim=-2)` - magnitude split, no `abs`.
 - `log_num = NLLogPlusEps(eps)(au)`.
@@ -222,8 +233,12 @@ Tail term:
 
 Normalization:
 
-- Strict: `top_probs = exp(vals - log(sum_exp + eps))` via `NLLogPlusEps` + `AffineContract`
-  + `NLExp`, then `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`. No `/`
+- Strict, `strict_unary="sigmoid_rsqrt"`: `exp_vals = ExpBySigmoid()(vals)` (two sigmoids, one rsqrt, three
+  squares per entry), `inv_z = ReciprocalByRsqrt(eps)(sum_exp)` (one rsqrt and one square per row), and
+  `top_probs = ElementwiseProduct()(exp_vals, inv_z)` (two squares per entry): 8 unary maps per entry and 2 per
+  row (paper Table 1). No exp, no log, no `/` operator.
+- Strict, `strict_unary="log_exp"` (deprecated): `top_probs = exp(vals - log(sum_exp + eps))` via `NLLogPlusEps` +
+  `AffineContract` + `NLExp`, then `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`. No `/`
   operator.
 - Fast: `top_probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(eps)(sum_exp))`, then
   `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`.
@@ -247,12 +262,20 @@ exposes four debug flags that selectively bypass the rewrites:
   `RewrittenLayerNorm`, `PairwiseDotBySquare`, `SparseWeightedSumBySquare`, and
   `GibbsTopKSoftmax`.
 
+Graph options that change the compiled model (not debug flags):
+
+- `strict_unary` - `"sigmoid_rsqrt"` (default, paper) or the deprecated `"log_exp"` on the strict path. The
+  superseded log-domain configs (`topk*_strict.json`, `topk*_strict_qc32.json`) set `"log_exp"` explicitly;
+  checkpoints written before the option existed reload as `"log_exp"`.
+- `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (paper Corollary 1; a model change).
+- `support_routing` - `"topk"` or `"query_centroids"` (see `docs/cluster_routing.md`).
+
 `build_module_mapping` records the resulting per-block module choices (`norm1`, `attn`,
 `norm2`, `mlp.act`, `fc_norm`) into the surgery metadata.
 
 ## Calibration
 
-`adapter.calibrate_reference` walks up to `gibbs_tail_calibration_batches` validation minibatches.
+`adapter.calibrate_reference` walks up to `gibbs_tail_calibration_batches` training minibatches.
 For `deit_tiny_pet`, the model-local helper walks the timm DeiT blocks and calls common adapter
 helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reported diagnostics are:
 
@@ -260,14 +283,16 @@ helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reporte
   block 0 on the first calibration minibatch.
 - `ln_rewrite_mse_all_norms_mean` - mean MSE across all `norm1`/`norm2` and the final `norm`
   while replaying the residual stream of the reference model.
-- `gibbs_tail_calibration_batches` - actual number of validation minibatches used.
+- `gibbs_tail_calibration_batches` - actual number of training minibatches used.
 - `gibbs_tail_prob_eps_calibrated_by_block` - per-block estimates of the true omitted dense-softmax
   probability mass outside the top-k set over the calibration batches (copied into parameters when
   not using exact runtime tail mass).
 - `gibbs_tail_prob_eps_calibrated_mean` plus per-block min/max variants - summary statistics for
   those omitted-tail estimates. The surgery CLI prints the by-block values.
 - `gibbs_tail_prob_eps_exact_{mean,std,min,max}_by_block` - full exact omitted-mass diagnostics
-  (including std) gathered whenever calibration or `use_exact_tail_mass` is enabled.
+  (including std) gathered whenever calibration or `use_exact_tail_mass` is enabled. The scalar
+  `gibbs_tail_prob_eps_exact_std` is pooled over all blocks (since commit 1c48bf1); the paper's Table S2
+  reports the within-block std averaged over blocks.
 - `use_exact_tail_mass` - when true, runtime `q_tail` uses the centroid partition; calibrated
   scalars are not applied.
 - `gibbs_tail_prob_eps_calibration_rows_by_block` - sampled row count used per block.

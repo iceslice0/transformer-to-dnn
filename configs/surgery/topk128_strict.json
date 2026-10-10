@@ -15,6 +15,7 @@
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": false,
+  "strict_unary": "log_exp",
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk128_strict.pt",
   "log_dir": "artifacts/logs"
 }

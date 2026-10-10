@@ -15,3 +15,6 @@ mambal/
 !src/transformer_surgery/models/*.py
 artifacts/
 *_meta.json
+
+# Third-party NPU toolchain sources (mixed licenses); rebuild with docs/npu/fetch_sources.sh
+docs/npu/*/sources/

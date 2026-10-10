@@ -1,32 +1,39 @@
-# Per-Module Profile: Strict vs Fast (Pet, pre-distill surgery checkpoints)
+# Per-Module Profile: Strict vs Fast, Top-k vs Routed (Pet, pre-distill surgery checkpoints)
 
-GPU time and extra peak memory per top-level submodule of every block, measured with CUDA events
-and `torch.cuda.max_memory_allocated` in forward hooks (`scripts/profile_modules.py`), bf16 autocast,
-20 validation batches of 32 after 3 warm-up batches, NVIDIA RTX 4070 Ti SUPER. Times are summed over
-the 12 blocks per batch; peak memory is the largest extra allocation of one module call.
-Raw output: `artifacts/logs/profile_2026-10-03/profile_topk16_32_64.json`.
+GPU time and working memory per top-level submodule of every block, measured with CUDA events and
+`torch.cuda.max_memory_allocated` in forward hooks (`scripts/profile_modules.py`), bf16 autocast, 20 validation
+batches of 32 after 3 warm-up batches, NVIDIA RTX 4070 Ti SUPER. Times are summed over the 12 blocks per batch.
+Working memory is the peak memory a module call allocates above what is in use when it starts; the table reports
+the largest value over calls. Routed checkpoints (32 query centroids) call `dot.selected`, `gibbs.forward_selected`
+and `router.support` as methods; the script wraps and times them under the Score, Softmax and Routing groups.
+Strict = `strict_unary=sigmoid_rsqrt` (no exp, no log), reference LayerNorm eps 1e-6.
+Command: `artifacts/logs/profile_2026-10-10/command.txt`; raw output: `artifacts/logs/profile_2026-10-10/profile_topk16_32_64.json`.
+Earlier profile (log-domain strict, old eps): `artifacts/logs/profile_2026-10-03/`.
 
-- k=16 added=253.6 share_score_mix=90.8 fwd_ratio=3.62
-- k=32 added=265.6 share_score_mix=93.5 fwd_ratio=3.44
-- k=64 added=296.2 share_score_mix=93.6 fwd_ratio=3.60
+- k=16: module totals strict 322.7, strict routed 126.3, extended 54.1, extended routed 63.6 ms/batch; strict adds 268.6 ms over extended, 88.7% in Score and Mix
+- k=32: module totals strict 339.9, strict routed 161.0, extended 50.1, extended routed 67.8 ms/batch; strict adds 289.7 ms over extended, 89.3% in Score and Mix
+- k=64: module totals strict 378.4, strict routed 237.5, extended 67.0, extended routed 84.1 ms/batch; strict adds 311.3 ms over extended, 91.9% in Score and Mix
 
-| k | module | strict ms | extended ms | strict peak MiB | extended peak MiB |
-|---|---|---:|---:|---:|---:|
-| 16 | Score (QK^T) | 213.1 | 4.0 | 2751 | 14 |
-| 16 | Mix (PV) | 24.5 | 3.5 | 265 | 39 |
-| 16 | Softmax (top-k Gibbs) | 16.6 | 10.8 | 9 | 7 |
-| 16 | LayerNorm | 36.9 | 18.1 | 60 | 19 |
-| 16 | Linear (qkv, proj) | 3.8 | 4.6 | 7 | 9 |
-| 16 | MLP | 3.8 | 4.2 | 19 | 19 |
-| 32 | Score (QK^T) | 213.1 | 3.4 | 2751 | 14 |
-| 32 | Mix (PV) | 46.3 | 7.6 | 524 | 76 |
-| 32 | Softmax (top-k Gibbs) | 15.4 | 10.6 | 18 | 14 |
-| 32 | LayerNorm | 32.9 | 18.4 | 60 | 19 |
-| 32 | Linear (qkv, proj) | 3.4 | 4.4 | 7 | 9 |
-| 32 | MLP | 3.6 | 4.7 | 18 | 19 |
-| 64 | Score (QK^T) | 213.2 | 4.1 | 2751 | 14 |
-| 64 | Mix (PV) | 81.3 | 13.0 | 1041 | 150 |
-| 64 | Softmax (top-k Gibbs) | 15.4 | 10.3 | 35 | 28 |
-| 64 | LayerNorm | 32.9 | 17.7 | 60 | 19 |
-| 64 | Linear (qkv, proj) | 3.7 | 4.2 | 7 | 9 |
-| 64 | MLP | 3.6 | 4.4 | 19 | 18 |
+| k | module | strict ms | strict routed ms | extended ms | extended routed ms | strict MiB | strict routed MiB | extended MiB | extended routed MiB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | Score (QK^T) | 222.2 | 22.4 | 5.0 | 6.0 | 2751 | 261 | 14 | 42 |
+| 16 | Mix (PV) | 25.6 | 26.3 | 4.4 | 5.8 | 265 | 265 | 39 | 39 |
+| 16 | Softmax (top-k Gibbs) | 32.8 | 27.4 | 12.9 | 11.2 | 14 | 17 | 7 | 10 |
+| 16 | Routing (centroid select) | — | 8.5 | — | 9.4 | — | 4 | — | 4 |
+| 16 | LayerNorm | 34.0 | 33.3 | 21.3 | 20.7 | 40 | 39 | 19 | 19 |
+| 16 | Linear (qkv, proj) | 3.9 | 4.1 | 4.9 | 4.9 | 7 | 7 | 9 | 9 |
+| 16 | MLP | 4.1 | 4.3 | 5.5 | 5.6 | 19 | 18 | 19 | 18 |
+| 32 | Score (QK^T) | 222.4 | 40.8 | 3.7 | 9.7 | 2751 | 521 | 14 | 80 |
+| 32 | Mix (PV) | 47.8 | 48.0 | 7.9 | 9.3 | 524 | 524 | 76 | 76 |
+| 32 | Softmax (top-k Gibbs) | 30.4 | 26.2 | 10.7 | 11.7 | 28 | 33 | 14 | 19 |
+| 32 | Routing (centroid select) | — | 7.8 | — | 8.8 | — | 7 | — | 7 |
+| 32 | LayerNorm | 31.7 | 30.8 | 19.2 | 19.1 | 40 | 39 | 19 | 19 |
+| 32 | Linear (qkv, proj) | 3.7 | 3.7 | 4.3 | 4.3 | 7 | 7 | 9 | 9 |
+| 32 | MLP | 3.8 | 3.6 | 4.3 | 4.9 | 18 | 18 | 19 | 18 |
+| 64 | Score (QK^T) | 221.1 | 79.9 | 4.1 | 16.9 | 2751 | 1041 | 14 | 155 |
+| 64 | Mix (PV) | 84.7 | 83.8 | 15.7 | 16.6 | 1041 | 1041 | 150 | 150 |
+| 64 | Softmax (top-k Gibbs) | 31.6 | 27.8 | 13.9 | 11.9 | 55 | 65 | 28 | 37 |
+| 64 | Routing (centroid select) | — | 7.7 | — | 8.7 | — | 12 | — | 12 |
+| 64 | LayerNorm | 32.7 | 30.7 | 22.5 | 20.4 | 39 | 39 | 19 | 19 |
+| 64 | Linear (qkv, proj) | 4.3 | 3.8 | 5.0 | 4.6 | 7 | 7 | 9 | 9 |
+| 64 | MLP | 3.9 | 3.7 | 5.7 | 4.9 | 18 | 18 | 18 | 18 |

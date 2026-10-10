@@ -4,7 +4,7 @@
   "batch_size": 32,
   "workers": 2,
   "top_k": 197,
-  "eps": 0.001,
+  "eps": 1e-6,
   "gibbs_tail_prob_eps": 0.001,
   "gibbs_tail_calibration_batches": 10,
   "disable_calib_gibbs_tail_prob": false,

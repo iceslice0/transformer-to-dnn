@@ -1,6 +1,6 @@
 """Same-session cost of exact top-k against query-centroid routing (DeiT-Tiny / Pet).
 
-Usage: ``bench_strict_routing.py [strict|fast] [k ...]`` (default ``strict 16 32 64``).
+Usage: ``bench_strict_routing.py [strict_sr|strict|fast] [k ...]`` (default ``strict_sr 16 32 64``).
 For each k, loads ``ts_surgery_topk{k}_{graph}.pt`` (exact top-k: all N^2 scores) and
 ``ts_surgery_topk{k}_{graph}_qc32.pt`` (routed support: N*k scores only; polarization in the strict
 graph, a batched product in the fast/extended graph), and measures in one process, after one warm-up
@@ -26,7 +26,7 @@ def main() -> None:
     from transformer_surgery.surgery import _timed_evaluate
 
     args = sys.argv[1:]
-    graph = args.pop(0) if args and args[0] in ("strict", "fast") else "strict"
+    graph = args.pop(0) if args and args[0] in ("strict", "strict_sr", "fast") else "strict_sr"
     ks = [int(a) for a in args] or KS
     out_path = f"artifacts/metadata/routing_{graph}_bench.json"
     cfg = SurgeryConfig.load(f"configs/surgery/topk{ks[0]}_{graph}.json")

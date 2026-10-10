@@ -41,6 +41,11 @@ class SurgeryConfig:
     gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
     use_exact_tail_mass: bool = False
+    # Strict unary set: "sigmoid_rsqrt" (no exp and no log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2,
+    # products by polarization) or the deprecated "log_exp" (log-domain LayerNorm and softmax). Ignored when allow_matmul.
+    strict_unary: str = "sigmoid_rsqrt"
+    # MLP activation: "exact" GELU or "sigmoid" x*sigmoid(1.702x) (model change for NPUs without GELU).
+    gelu: str = "exact"
     # Sparse support selection: "topk" keeps the top-k exact scores; "query_centroids" keeps the
     # top-k keys of the nearest fixed query centroid (k-means on calibration queries).
     support_routing: str = "topk"
@@ -79,6 +84,8 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
         "Compute omitted-tail mass at runtime from dense softmax via the centroid partition trick "
         "(N * mean(exp)) instead of using the calibrated/fixed gibbs_tail_prob_eps scalar."
     ),
+    "strict_unary": "Strict unary set: 'sigmoid_rsqrt' (default; squares, sigmoid, rsqrt) or deprecated 'log_exp'.",
+    "gelu": "MLP activation: 'exact' GELU or 'sigmoid' x*sigmoid(1.702x) (a model change).",
     "support_routing": (
         "Sparse support selection: 'topk' (top-k exact scores) or 'query_centroids' "
         "(top-k keys of the nearest fixed query centroid; no activation-activation products)."

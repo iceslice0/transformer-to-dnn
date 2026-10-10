@@ -44,62 +44,65 @@ strict DeiT-Tiny count is 368,904,761 per image = 12 x 30,719,983 (paper Table 2
 
 ## DeiT-Tiny / Pet
 
-Reference 91.52%. Pre-finetune validation accuracy; top-k columns are the existing `make a`, `make e`
+Reference 91.52%, reference LayerNorm eps 1e-6 (rerun 2026-10-09). Pre-finetune validation accuracy; top-k columns are the existing `make a`, `make e`
 and `make b` runs (`topk{k}_fast`, `_tailmass_exact`, `_tailmass0`).
 
 | k | mass top-k | mass routed | ratio | recall | top-k cal / exact / drop | routed cal / exact / drop |
 |---:|---:|---:|---:|---:|---|---|
-| 8 | 0.469 | 0.391 | 0.833 | 0.589 | 79.29 / 81.38 / 5.45 | 61.19 / 48.51 / 16.60 |
-| 16 | 0.587 | 0.515 | 0.878 | 0.647 | 85.45 / 88.83 / 39.19 | 80.76 / 78.52 / 66.97 |
-| 32 | 0.716 | 0.656 | 0.915 | 0.716 | 88.85 / 90.90 / 82.23 | 87.54 / 89.10 / 82.67 |
-| 64 | 0.848 | 0.807 | 0.951 | 0.795 | 90.84 / 91.44 / 89.10 | 89.97 / 91.11 / 88.91 |
+| 8 | 0.470 | 0.392 | 0.834 | 0.590 | 79.99 / 81.33 / 5.18 | 60.83 / 50.89 / 42.44 |
+| 16 | 0.587 | 0.515 | 0.877 | 0.645 | 85.75 / 88.99 / 38.62 | 80.81 / 80.51 / 59.01 |
+| 32 | 0.717 | 0.656 | 0.915 | 0.715 | 88.99 / 90.90 / 82.12 | 86.94 / 88.36 / 81.08 |
+| 64 | 0.849 | 0.807 | 0.951 | 0.795 | 90.81 / 91.55 / 89.13 | 89.81 / 90.87 / 89.13 |
 
 Centroid count at k=16, calibrated mode:
 
 | clusters | mass routed | ratio | recall | routed cal acc |
 |---:|---:|---:|---:|---:|
-| 8 | 0.448 | 0.763 | 0.560 | 56.17 |
-| 32 | 0.515 | 0.878 | 0.647 | 80.76 |
-| 128 | 0.538 | 0.917 | 0.702 | 82.94 |
+| 8 | 0.448 | 0.763 | 0.559 | 56.45 |
+| 32 | 0.515 | 0.877 | 0.645 | 80.81 |
+| 128 | 0.539 | 0.917 | 0.702 | 83.40 |
 
 Per block, k=16, 32 centroids:
 
 | block | ratio | worst head ratio | recall | relative inertia |
 |---:|---:|---:|---:|---:|
-| 0 | 0.798 | 0.720 | 0.589 | 0.271 |
-| 1 | 0.815 | 0.706 | 0.541 | 0.347 |
-| 2 | 0.908 | 0.783 | 0.589 | 0.353 |
-| 3 | 0.817 | 0.665 | 0.579 | 0.525 |
-| 4 | 0.755 | 0.693 | 0.528 | 0.537 |
-| 5 | 0.901 | 0.860 | 0.609 | 0.451 |
-| 6 | 0.852 | 0.813 | 0.612 | 0.456 |
-| 7 | 0.882 | 0.870 | 0.629 | 0.435 |
-| 8 | 0.914 | 0.888 | 0.672 | 0.404 |
-| 9 | 0.940 | 0.915 | 0.704 | 0.356 |
-| 10 | 0.971 | 0.965 | 0.809 | 0.256 |
-| 11 | 0.992 | 0.989 | 0.899 | 0.192 |
+| 0 | 0.794 | 0.711 | 0.586 | 0.267 |
+| 1 | 0.815 | 0.705 | 0.538 | 0.345 |
+| 2 | 0.905 | 0.780 | 0.586 | 0.355 |
+| 3 | 0.817 | 0.662 | 0.579 | 0.526 |
+| 4 | 0.749 | 0.683 | 0.522 | 0.540 |
+| 5 | 0.902 | 0.861 | 0.611 | 0.452 |
+| 6 | 0.852 | 0.812 | 0.612 | 0.458 |
+| 7 | 0.881 | 0.870 | 0.627 | 0.439 |
+| 8 | 0.914 | 0.887 | 0.673 | 0.410 |
+| 9 | 0.939 | 0.914 | 0.702 | 0.360 |
+| 10 | 0.971 | 0.965 | 0.809 | 0.259 |
+| 11 | 0.992 | 0.989 | 0.900 | 0.195 |
 
 ## Strict graph with routed support (DeiT-Tiny / Pet, calibrated mode, 32 centroids)
 
-Pipeline runs (`make routing-strict`), each timed against the bf16 reference in its own run; strict top-k
-rows are the existing `make c` runs. Unary evaluations per image from the hook count.
+Strict graph without exp and log (`strict_unary=sigmoid_rsqrt`, configs `topk{k}_strict_sr_qc32.json`, `make
+strict-sr`), each timed against the bf16 reference in its own run; strict top-k rows are the
+`topk{k}_strict_sr` runs of the same target. Unary evaluations per image from the hook count.
 
 | k | top-k acc | routed acc | top-k latency | routed latency | top-k memory | routed memory | top-k unary/img | routed unary/img |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 85.09 | 78.30 | 3.01x | 0.99x | 2805 MiB | 327 MiB | 2.02e8 | 3.77e7 |
-| 32 | 88.63 | 85.88 | 3.20x | 1.35x | 2805 MiB | 591 MiB | 2.17e8 | 6.70e7 |
-| 64 | 90.27 | 89.23 | 3.58x | 2.21x | 2805 MiB | 1121 MiB | 2.46e8 | 1.26e8 |
+| 16 | 86.02 | 79.12 | 3.29x | 1.23x | 2805 MiB | 326 MiB | 1.99e+08 | 3.46e+07 |
+| 32 | 88.88 | 86.56 | 3.55x | 1.41x | 2805 MiB | 591 MiB | 2.14e+08 | 6.46e+07 |
+| 64 | 90.32 | 89.48 | 3.86x | 2.46x | 2805 MiB | 1119 MiB | 2.45e+08 | 1.24e+08 |
 
-The routed squares per image equal `12 (4hNkd + 2N d_model) + N d_model` exactly at every k (score and
-mixing polarization plus LayerNorm second moments).
+The routed unary count per image equals `12 (4hNkd + 2(3N d_model + N) + 8hNk + 2hN + 4N d_model) + 3N d_model + N`
+exactly at every k (paper Table 1 and Proposition 4): 34,628,069 / 64,584,677 / 124,497,893 at k = 16 / 32 / 64.
+With the sigmoid GELU (`*_strict_sr_gs_qc32`) the routed graph reaches 77.02 / 85.64 / 88.72%.
 
 Same-session bench (`make routing-strict-bench`, `scripts/bench_strict_routing.py`, one warm-up pass per
-graph, bf16 reference): strict top-k 3.19x / 3.50x / 4.04x, strict routed 1.12x / 1.33x / 2.29x at
-k = 16 / 32 / 64 (`artifacts/metadata/routing_strict_bench.json`). Fast (extended) graph: top-k 1.03x /
-1.05x / 1.04x, routed 1.03x / 1.06x / 1.07x, peak memory 96 / 137 / 219 MiB against 92 / 135 / 222 MiB,
-same unary work (`artifacts/metadata/routing_fast_bench.json`). The extended graph keeps scores on the
-MAC array; at N=197 the score contractions are a small part of a block, so routing changes neither
-latency nor memory there.
+graph, bf16 reference; log `artifacts/logs/routing_2026-10-10/bench_routing_strict.log`): strict top-k 3.35x /
+3.62x / 4.15x, strict routed 1.25x / 1.36x / 2.39x at k = 16 / 32 / 64
+(`artifacts/metadata/routing_strict_sr_bench.json`). Fast (extended) graph: top-k 1.02x / 1.06x / 1.02x, routed
+1.05x / 1.03x / 1.03x, peak memory 96 / 137 / 219 MB against 92 / 135 / 222 MB, same unary work
+(`artifacts/metadata/routing_fast_bench.json`). The extended graph keeps scores on the MAC array; at N=197 the
+score contractions are a small part of a block, so routing changes neither latency nor memory there.
+Per-module profile with the routed checkpoints: `docs/profile.md`.
 
 ## Pythia-70M / WikiText-2
 
@@ -135,25 +138,27 @@ Per block, k=16, 32 centroids:
 
 - The routed support holds 83 to 96% of the exact top-k mass on both models, and the share grows with k
   and with the number of centroids.
-- DeiT-Tiny: at k=64 routing is within 0.9 points of exact top-k in every tail mode, at k=32 within
-  1.8 points. Routed support with the tail-mass term beats exact top-k with tail drop for every k >= 16.
+- DeiT-Tiny: at k=64 routing is within 1.0 point of exact top-k in every tail mode, at k=32 within
+  2.6 points. Routed support with the tail-mass term beats exact top-k with tail drop for every k >= 16.
 - DeiT-Tiny depth: the last blocks route almost exactly (ratio 0.97 and 0.99, recall 0.81 and 0.90),
-  where queries are most clustered (relative inertia 0.26 and 0.19).
+  where queries are most clustered (relative inertia 0.26 and 0.20).
 - Pythia-70M: perplexity rises 7% at k=32 and 23% at k=16 against exact top-k. Its last two blocks have
   near-collapsed queries (relative inertia 0.005) and still lose 12% of the mass, so position (rotary,
   causal mask) separates keys that one centroid per query cannot.
-- With tail drop, DeiT routed support beats exact top-k at k=8 and k=16 (16.60 vs 5.45, 66.97 vs 39.19).
+- With tail drop, DeiT routed support beats exact top-k at k=8 and k=16 (42.44 vs 5.18, 59.01 vs 38.62).
 
 ## Reproduce
 
 ```bash
 make routing          # 14 DeiT runs (k=8..64 x cal/exact/drop at 32 centroids, k=16 at 8 and 128)
 make pythia-routing   # 8 Pythia runs (k=8..32 x exact/drop at 32 centroids, k=16 at 8 and 128)
-make routing-strict  # 3 strict DeiT runs with routed support (k=16, 32, 64)
+make strict-sr       # strict graph without exp/log: top-k and routed (k=16, 32, 64), exact and sigmoid GELU
+make routing-strict  # superseded log-domain strict runs with routed support (old eps)
 make routing-strict-bench  # same-session cost bench, strict and fast graphs
 python scripts/summarize_routing.py   # tables above; writes artifacts/metadata/routing_*_by_k.json
 ```
 
 Configs: `configs/surgery/topk{k}_fast_qc{C}[_tailmass_exact|_tailmass0].json` and
 `configs/surgery/pythia_70m_topk{k}_fast_qc{C}_tailmass{_exact,0}.json`.
-Logs: `artifacts/logs/routing_2026-10-09/` (one log per config, `run_all.sh`, `run_all.out`).
+Logs: `artifacts/logs/routing_2026-10-09/` (first runs, old eps) and `artifacts/logs/eps_rerun_2026-10-09/`
+(DeiT reruns with the reference LayerNorm eps; Pythia runs are unaffected).

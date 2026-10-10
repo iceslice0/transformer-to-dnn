@@ -156,6 +156,38 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.all(km["relative_inertia"] < 1e-3))
         self.assertTrue(torch.all(km["empty_clusters"] == 0))
 
+    def test_strict_sigmoid_rsqrt_matches_reference(self) -> None:
+        import torch
+
+        from transformer_surgery.internal.util import set_surgery_dtype
+        from transformer_surgery.ops import GibbsTopKSoftmax, RewrittenLayerNorm, SigmoidGELU, SurgeryAttention
+
+        set_surgery_dtype(torch.float64)
+        try:
+            torch.manual_seed(0)
+            x = torch.randn(2, 7, 12, dtype=torch.float64) * 3 + 1
+            ref = torch.nn.LayerNorm(12, eps=1e-3).double()
+            ln = RewrittenLayerNorm(12, eps=1e-3, allow_matmul=False, strict_unary="sigmoid_rsqrt").double()
+            self.assertTrue(torch.allclose(ln(x), ref(x), atol=1e-10))
+            scores = torch.randn(1, 2, 5, 9, dtype=torch.float64) * 4
+            for exact in (False, True):
+                kw = dict(seq_len=9, top_k=4, eps=0.0, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
+                fast = GibbsTopKSoftmax(allow_matmul=True, **kw).double()
+                strict = GibbsTopKSoftmax(allow_matmul=False, strict_unary="sigmoid_rsqrt", **kw).double()
+                for a, b in zip(fast(scores), strict(scores)):
+                    self.assertTrue(torch.allclose(a.double(), b.double(), atol=1e-10))
+            g = SigmoidGELU(allow_matmul=False).double()
+            self.assertTrue(torch.allclose(g(x), x * torch.sigmoid(1.702 * x), atol=1e-10))
+            for exact in (False, True):
+                torch.manual_seed(1)
+                kw = dict(dim=12, num_heads=2, seq_len=7, top_k=3, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                fast = SurgeryAttention(allow_matmul=True, **kw).double()
+                strict = SurgeryAttention(allow_matmul=False, strict_unary="sigmoid_rsqrt", **kw).double()
+                strict.load_state_dict(fast.state_dict(), strict=False)
+                self.assertTrue(torch.allclose(fast(x), strict(x), atol=1e-9))
+        finally:
+            set_surgery_dtype(torch.bfloat16)
+
     def test_gibbs_exact_tail_mass_matches_dense_omitted(self) -> None:
         import torch
 
@@ -186,6 +218,56 @@ class PackageSmokeTests(unittest.TestCase):
             )
             kept = dense.gather(1, idx.reshape(-1, 2)).reshape_as(probs)
             self.assertTrue(torch.allclose(probs, kept, atol=1e-5))
+
+    def test_strict_unary_default_and_log_exp_deprecation(self) -> None:
+        import warnings
+
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
+        from transformer_surgery.models.deit_tiny.surgery_model import DeiTTinySurgeryModel
+        from transformer_surgery.ops import RewrittenLayerNorm
+
+        self.assertEqual(SurgeryConfig().strict_unary, "sigmoid_rsqrt")
+        self.assertEqual(RewrittenLayerNorm(8, eps=1e-6).strict_unary, "sigmoid_rsqrt")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            RewrittenLayerNorm(8, eps=1e-6, strict_unary="log_exp")
+            RewrittenLayerNorm(8, eps=1e-6, allow_matmul=True, strict_unary="log_exp")
+        self.assertEqual(sum(issubclass(w.category, FutureWarning) for w in caught), 1)
+        # Checkpoints written before ``strict_unary`` existed are log-domain.
+        extra = {
+            "top_k": 4, "eps_ln": 1e-6, "gibbs_tail_prob_eps": 0.1, "disable_layernorm_replacement": False,
+            "disable_attention_surgery": False, "disable_softmax_replacement": False, "allow_matmul": False,
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            model = DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=2)
+        self.assertEqual(model.fc_norm.strict_unary, "log_exp")
+
+    def test_integer_polarization_is_exact_for_int8(self) -> None:
+        import torch
+
+        a, b = torch.meshgrid(torch.arange(-128, 128), torch.arange(-128, 128), indexing="ij")
+        plus, minus = (a + b) ** 2, (a - b) ** 2
+        self.assertTrue(torch.equal((plus - minus) // 4, a * b))
+        self.assertLess(int(torch.maximum(plus, minus).max()), 2**17)
+        self.assertLess(int((plus - minus).abs().max()), 2**17)
+        self.assertEqual(int((a * b).abs().max()), 2**14)
+        self.assertLessEqual((2**17 - 1) * 2**14, 2**31 - 1)
+
+    def test_sparse_mix_full_support_matches_gather(self) -> None:
+        import torch
+
+        from transformer_surgery.ops import SparseWeightedSumBySquare
+
+        torch.manual_seed(0)
+        v = torch.randn(2, 3, 6, 4, dtype=torch.float64)
+        probs = torch.softmax(torch.randn(2, 3, 5, 6, dtype=torch.float64), dim=-1)
+        idx = torch.argsort(torch.rand(2, 3, 5, 6), dim=-1)
+        expected = torch.einsum("bhqk,bhqkd->bhqd", probs, v.unsqueeze(2).expand(-1, -1, 5, -1, -1).gather(
+            3, idx.unsqueeze(-1).expand(-1, -1, -1, -1, 4)))
+        for allow_matmul in (False, True):
+            out = SparseWeightedSumBySquare(allow_matmul=allow_matmul)(probs, idx, v)
+            self.assertTrue(torch.allclose(out, expected, atol=1e-10))
 
     def test_ptq_per_tensor_weights_keep_per_channel_bias(self) -> None:
         import torch

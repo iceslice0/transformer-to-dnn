@@ -1,18 +1,22 @@
 # Exact Tail-Mass vs Calibrated (Pet Fast)
 
-Pre-finetune val accuracy and omitted-tail mass after surgery (`make a` calibrated fast vs `make e` exact).
+Pre-finetune val accuracy and omitted-tail mass after surgery (`make a` calibrated fast vs `make e` exact), reference
+LayerNorm eps 1e-6 (rerun 2026-10-09, logs in `artifacts/logs/eps_rerun_2026-10-09/`).
 Accuracies are `student_pre_ft_val_acc`. Calibrated mean \(q\) is `gibbs_tail_prob_eps_calibrated_mean`.
-Exact \(q\) stats are pooled over train calibration rows (`gibbs_tail_prob_eps_exact_*`).
+Exact \(q\) stats come from the exact runs: the mean, the within-block std averaged over blocks
+(`gibbs_tail_prob_eps_exact_std_by_block`, the paper's Table S2), min and max. The last column is the std pooled
+over all blocks (`gibbs_tail_prob_eps_exact_std`; since commit 1c48bf1 this field is pooled, earlier runs stored
+the within-block average under the same name).
 
-| k | calib acc | exact acc | calib mean q | exact mean q ± std (min, max) |
-|---:|---:|---:|---:|---|
-| 1 | 14.94% | 7.88% | 0.7823 | 0.7825 ± 0.1658 (0.000401, 0.9937) |
-| 2 | 39.36% | 19.90% | 0.7230 | 0.7137 ± 0.1794 (0.0002192, 0.9877) |
-| 4 | 64.73% | 56.83% | 0.6349 | 0.6292 ± 0.1899 (0.0002283, 0.9745) |
-| 8 | 79.29% | 81.38% | 0.5302 | 0.5276 ± 0.1923 (8.035e-05, 0.9503) |
-| 16 | 85.45% | 88.83% | 0.4125 | 0.4118 ± 0.1799 (7.153e-06, 0.9025) |
-| 32 | 88.85% | 90.90% | 0.2832 | 0.2829 ± 0.1493 (0, 0.8071) |
-| 64 | 90.84% | 91.44% | 0.1508 | 0.1511 ± 0.0983 (0, 0.6411) |
-| 96 | 91.09% | 91.69% | 0.0812 | 0.0811 ± 0.0606 (0, 0.4729) |
-| 128 | 91.31% | 91.61% | 0.0398 | 0.0394 ± 0.0327 (0, 0.3097) |
-| 197 | 91.63% | 91.63% | 0.0000 | 0.0000 ± 0.0000 (0, 0.0000) |
+| k | calib acc | exact acc | calib mean q | exact mean q ± within-block std (min, max) | pooled std |
+|---:|---:|---:|---:|---|---:|
+| 1 | 14.75% | 7.77% | 0.7823 | 0.7824 ± 0.1660 (0.0005316, 0.9938) | 0.1969 |
+| 2 | 42.16% | 20.09% | 0.7138 | 0.7137 ± 0.1795 (9.227e-05, 0.9869) | 0.2175 |
+| 4 | 66.61% | 57.35% | 0.6294 | 0.6302 ± 0.1896 (0.0001156, 0.9749) | 0.2320 |
+| 8 | 79.99% | 81.33% | 0.5282 | 0.5274 ± 0.1924 (0.0001246, 0.9507) | 0.2332 |
+| 16 | 85.75% | 88.99% | 0.4118 | 0.4116 ± 0.1796 (3.815e-06, 0.9019) | 0.2133 |
+| 32 | 88.99% | 90.90% | 0.2828 | 0.2826 ± 0.1493 (0, 0.8089) | 0.1740 |
+| 64 | 90.81% | 91.55% | 0.1513 | 0.1510 ± 0.0982 (0, 0.6369) | 0.1139 |
+| 96 | 90.95% | 91.66% | 0.0810 | 0.0813 ± 0.0606 (0, 0.4695) | 0.0705 |
+| 128 | 91.41% | 91.66% | 0.0394 | 0.0395 ± 0.0328 (0, 0.3170) | 0.0385 |
+| 197 | 91.74% | 91.74% | 0.0000 | 0.0000 ± 0.0000 (0, 0.0000) | 0.0000 |

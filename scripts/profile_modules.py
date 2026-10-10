@@ -2,7 +2,9 @@
 
 Times the top-level attention, LayerNorm and MLP submodules of every block with CUDA events and
 records the extra peak memory each one allocates. Used to check where the strict path spends the
-time and memory it adds over the fast path.
+time and memory it adds over the fast path. Routed checkpoints (support_routing=query_centroids) call
+``dot.selected``, ``gibbs.forward_selected`` and ``router.support`` as methods, which forward hooks
+do not see; these methods are wrapped and timed under the same groups.
 
 Example:
     python scripts/profile_modules.py \
@@ -30,11 +32,19 @@ from transformer_surgery.internal.util import (
 )
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
 
+# Methods called outside ``forward`` on the routed sparse path, per group module.
+METHODS = {
+    ".attn.dot": ("selected",),
+    ".attn.gibbs": ("forward_selected",),
+    ".attn.router": ("support",),
+}
+
 # Module-name suffix -> reported group. Suffixes are matched against direct children of each block.
 GROUPS = {
     ".attn.dot": "Score (QK^T)",
     ".attn.sparse_mix": "Mix (PV)",
     ".attn.gibbs": "Softmax (top-k Gibbs)",
+    ".attn.router": "Routing (centroid select)",
     ".norm1": "LayerNorm",
     ".norm2": "LayerNorm",
     ".attn.qkv": "Linear (qkv, proj)",
@@ -48,6 +58,13 @@ def _group_of(name: str) -> str | None:
         if name.endswith(suffix) and name.startswith("blocks."):
             return group
     return None
+
+
+def _methods_of(name: str) -> tuple:
+    for suffix, methods in METHODS.items():
+        if name.endswith(suffix) and name.startswith("blocks."):
+            return methods
+    return ()
 
 
 def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object]:
@@ -92,12 +109,28 @@ def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object
 
         return fn
 
+    def timed_method(name: str, group: str, fn):
+        start_fn, end_fn = pre_hook(name), post_hook(name, group)
+
+        def wrapped(*args, **kwargs):
+            start_fn(None, args)
+            out = fn(*args, **kwargs)
+            end_fn(None, args, out)
+            return out
+
+        return wrapped
+
     handles = []
+    wrapped_methods = []
     for name, module in model.named_modules():
         group = _group_of(name)
         if group is not None:
             handles.append(module.register_forward_pre_hook(pre_hook(name)))
             handles.append(module.register_forward_hook(post_hook(name, group)))
+            for meth in _methods_of(name):
+                if hasattr(module, meth):
+                    setattr(module, meth, timed_method(f"{name}.{meth}", group, getattr(module, meth)))
+                    wrapped_methods.append((module, meth))
 
     total_ms: List[float] = []
     with torch.no_grad():
@@ -118,6 +151,8 @@ def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object
                 total_ms.append(start.elapsed_time(end))
     for h in handles:
         h.remove()
+    for module, meth in wrapped_methods:
+        delattr(module, meth)
 
     n = max(len(total_ms), 1)
     groups = {
@@ -130,6 +165,8 @@ def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object
     return {
         "checkpoint": os.path.abspath(path),
         "top_k": extra.get("top_k"),
+        "support_routing": extra.get("support_routing", "topk"),
+        "strict_unary": extra.get("strict_unary"),
         "allow_matmul": extra.get("allow_matmul"),
         "surgery_dtype": extra.get("surgery_dtype"),
         "batches": len(total_ms),

@@ -156,24 +156,32 @@ installs skeleton `CalibratedAffinePTQWrapper` modules from `ptq_wrappers`, and 
 checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
 are checked through the same path downstream code uses.
 
-## Results (Pet, 2026-10-03)
+## Results (Pet, 2026-10-10)
 
 Weights W8; every node input A8, except `affine_activation_bits=12` on the compiled affine nodes of the strict graph
-(`configs/ptq/*_strict_*.json`). Strict rows quantize the surgery graph before distillation; extended (fast) rows the
-Jeffreys-distilled graph. Per-tensor rows use the bias-fit fix in `internal/calibration.py` (the output bias stays per
-channel when the weight scale is a scalar, as in standard per-tensor PTQ). Logs: `artifacts/logs/ptq_pertensor_fix_2026-10-03/`
-(per-tensor runs and all fast runs) and `artifacts/logs/ptq_rerun/` (strict per-channel). Earlier per-tensor and fast
-per-channel metadata are kept in `artifacts/metadata/ptq_pertensor_backup_2026-10-03/` and
-`artifacts/metadata/ptq_fast_channel_backup_2026-10-03/`.
+(`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (`strict_unary=sigmoid_rsqrt`, no exp and no
+log) before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
+sigmoid and rsqrt that a CNN-class NPU runs (paper Table 3). Extended (fast) rows quantize the Jeffreys-distilled graph.
+Per-tensor rows keep the output bias per channel when the weight scale is a scalar, as in standard per-tensor PTQ.
+Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_2026-10-09/`. Results of the
+log-domain strict graph with the old eps are in git history and in `artifacts/backup_eps_2026-10-09/`.
 
 | k | graph | nodes | bf16 | PTQ per-channel | Δ | PTQ per-tensor | Δ |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 16 | strict | 283 | 85.09 | 84.30 | -0.79 | 84.57 | -0.52 |
-| 32 | strict | 283 | 88.63 | 88.47 | -0.16 | 88.06 | -0.57 |
-| 64 | strict | 283 | 90.27 | 89.86 | -0.41 | 89.78 | -0.49 |
-| 197 | strict | 271 | 90.24 | 90.08 | -0.16 | 90.16 | -0.08 |
-| 16 | extended | 246 | 88.12 | 85.55 | -2.56 | 85.53 | -2.59 |
-| 32 | extended | 246 | 90.22 | 87.03 | -3.19 | 86.56 | -3.65 |
-| 64 | extended | 246 | 91.11 | 87.52 | -3.60 | 87.30 | -3.82 |
-| 197 | extended | 234 | 91.66 | 88.91 | -2.75 | 89.29 | -2.37 |
+| 16 | strict | 331 | 86.02 | 84.85 | -1.17 | 85.17 | -0.85 |
+| 32 | strict | 331 | 88.88 | 88.83 | -0.05 | 88.53 | -0.35 |
+| 64 | strict | 331 | 90.32 | 90.16 | -0.16 | 90.27 | -0.05 |
+| 197 | strict | 319 | 90.19 | 90.22 | +0.03 | 89.72 | -0.47 |
+| 16 | strict, sigmoid GELU | 367 | 83.97 | 82.94 | -1.03 | 83.27 | -0.70 |
+| 32 | strict, sigmoid GELU | 367 | 87.57 | 87.16 | -0.41 | 88.17 | +0.60 |
+| 64 | strict, sigmoid GELU | 367 | 89.72 | 89.51 | -0.21 | 88.99 | -0.73 |
+| 197 | strict, sigmoid GELU | 355 | 88.80 | 89.42 | +0.62 | 89.04 | +0.24 |
+| 16 | extended | 246 | 88.58 | 85.50 | -3.08 | 84.57 | -4.01 |
+| 32 | extended | 246 | 90.19 | 86.73 | -3.46 | 87.19 | -3.00 |
+| 64 | extended | 246 | 91.17 | 87.52 | -3.65 | 88.14 | -3.03 |
+| 197 | extended | 234 | 91.74 | 88.83 | -2.91 | 88.20 | -3.54 |
 
+Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
+forward hooks on the `NL*` nodes (plus two ReLUs per entry for the log-domain strict LayerNorm). At full support the
+`sigmoid_rsqrt` strict DeiT-Tiny count is 373,512,197 per image = 12 x 31,116,544 (paper Table 1 block total) + 113,669
+(final LayerNorm).

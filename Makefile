@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -7,11 +7,11 @@ MAIN_KS := 1 2 4 8 16 32 64 96 128 197
 TAIL_KS := 1 2 4 8 16 32 64
 STRICT_KS := 16 32 64
 PTQ_KS := 16 32 64 197
-IMAGENET_MAIN_KS := 1 4 32 64 197
+IMAGENET_MAIN_KS := 1 2 4 8 16 32 64 96 128 197
 
 # MambaIRv2 Light SR sweep. k=0 is uniform attention (affine key-mean, not Gibbs);
 # k=256 is full window support (window_size=16 -> seq_len=256).
-MAMBAIR_KS := 0 1 2 4 16 64
+MAMBAIR_KS := 0 1 2 4 16 64 256
 MAMBAIR_SCALES := 2 4
 
 SURGERY_MAIN_TARGETS := $(foreach k,$(MAIN_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
@@ -69,6 +69,14 @@ PYTHIA_ROUTING_TARGETS := $(foreach k,$(PYTHIA_ROUTING_KS),$(foreach m,_qc32_tai
 
 STRICT_ROUTING_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_qc32.pt)
 
+# Strict graph without exp and log (strict_unary=sigmoid_rsqrt: squares, sigmoid, inverse square root),
+# with exact GELU (_sr) or GELU ~ x*sigmoid(1.702x) (_sr_gs), routed strict variants, and PTQ of the
+# new strict graphs. The extended graph keeps exact GELU: NPUs with the extended basis implement it.
+SR_KS := 16 32 64 197
+STRICT_SR_TARGETS := $(foreach k,$(SR_KS),$(foreach m,_strict_sr _strict_sr_gs,artifacts/checkpoints/ts_surgery_topk$(k)$(m).pt)) \
+	$(foreach k,$(STRICT_KS),$(foreach m,_strict_sr_qc32 _strict_sr_gs_qc32,artifacts/checkpoints/ts_surgery_topk$(k)$(m).pt))
+PTQ_STRICT_SR_TARGETS := $(foreach k,$(SR_KS),$(foreach m,strict_sr strict_sr_pertensor strict_sr_gs strict_sr_gs_pertensor,artifacts/checkpoints/ts_ptq_$(k)_$(m)_8bit.pt))
+
 all: a b c d e a_imagenet mambair
 
 # A. Main Fast-Path Top-k Results
@@ -114,16 +122,24 @@ pythia-routing: $(PYTHIA_ROUTING_TARGETS)
 # Strict graph with routed support (scores formed only on the support), and a same-session cost bench
 # against strict top-k (accuracy, latency, peak memory, unary evaluations per image).
 routing-strict: $(STRICT_ROUTING_TARGETS)
-routing-strict-bench: $(STRICT_ROUTING_TARGETS) $(STRICT_STRICT_TARGETS) $(STRICT_FAST_TARGETS) $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_qc32.pt)
-	$(PYTHON) scripts/bench_strict_routing.py strict $(STRICT_KS)
+strict-sr: $(STRICT_SR_TARGETS)
+ptq-strict-sr: $(PTQ_STRICT_SR_TARGETS)
+routing-strict-bench: $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr.pt artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_qc32.pt) $(STRICT_FAST_TARGETS) $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast_qc32.pt)
+	$(PYTHON) scripts/bench_strict_routing.py strict_sr $(STRICT_KS)
 	$(PYTHON) scripts/bench_strict_routing.py fast $(STRICT_KS)
+
+# Float64 end-to-end check of exact compilation (all keys, extended and strict graphs vs the reference).
+EXACT_FP64_LOG := artifacts/logs/exact_fp64_2026-10-10
+exact-fp64: artifacts/checkpoints/ts_surgery_topk197_fast.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
+	mkdir -p $(EXACT_FP64_LOG)
+	$(PYTHON) scripts/check_exact_fp64.py --checkpoints $^ --batches 2 | tee $(EXACT_FP64_LOG)/check.log
 
 help:
 	@echo "Targets:"
 	@echo "  make a      # Main fast-path top-k sweep"
 	@echo "  make b      # Tail-mass ablation"
-	@echo "  make c      # Strict vs fast surgery"
-	@echo "  make d      # PTQ granularity ablation"
+	@echo "  make c      # Strict (log-domain, superseded by strict-sr) vs fast surgery"
+	@echo "  make d      # PTQ granularity ablation (fast rows used; log-domain strict rows superseded by ptq-strict-sr)"
 	@echo "  make e      # Exact runtime tail-mass pet-fast sweep"
 	@echo "  make a_imagenet  # ImageNet fast-path surgery sweep"
 	@echo "  make mambair-data # Download DIV2K + Set5 (x2 and x4 LR) into ./data"
@@ -137,8 +153,11 @@ help:
 	@echo "  make pythia-tailmass0 # Pythia-70M zero fixed-tail (no exact mass) sweep (k=1..128)"
 	@echo "  make routing      # DeiT Pet query-centroid support routing (k=8..64, calibrated/exact/tail-drop)"
 	@echo "  make pythia-routing # Pythia-70M query-centroid support routing (k=8..32, exact/tail-drop)"
-	@echo "  make routing-strict # DeiT strict graph with routed support (k=16,32,64)"
-	@echo "  make routing-strict-bench # same-session cost: strict top-k vs strict routed"
+	@echo "  make routing-strict # log-domain strict graph with routed support (superseded by strict-sr)"
+	@echo "  make routing-strict-bench # same-session cost: strict_sr and fast, top-k vs routed"
+	@echo "  make exact-fp64   # float64 end-to-end check of exact compilation (k=197)"
+	@echo "  make strict-sr    # strict graph without exp/log (+GELU approx) and routed strict"
+	@echo "  make ptq-strict-sr # 8-bit PTQ of the new strict graphs"
 	@echo "  make all    # Run all sections"
 
 # Surgery checkpoints rebuild when surgery JSON changes.
@@ -197,3 +216,7 @@ $(foreach k,$(PTQ_KS),$(eval $(call PTQ_RULE,$(k)_fast_jeffreys_8bit,ts_distill_
 $(foreach k,$(PTQ_KS),$(eval $(call PTQ_RULE,$(k)_fast_jeffreys_pertensor_8bit,ts_distill_$(k)_fast_jeffreys)))
 $(foreach k,$(PTQ_KS),$(eval $(call PTQ_RULE,$(k)_strict_8bit,ts_surgery_topk$(k)_strict)))
 $(foreach k,$(PTQ_KS),$(eval $(call PTQ_RULE,$(k)_strict_pertensor_8bit,ts_surgery_topk$(k)_strict)))
+$(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_8bit,ts_surgery_topk$(k)_strict_sr)))
+$(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_pertensor_8bit,ts_surgery_topk$(k)_strict_sr)))
+$(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_8bit,ts_surgery_topk$(k)_strict_sr_gs)))
+$(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_pertensor_8bit,ts_surgery_topk$(k)_strict_sr_gs)))

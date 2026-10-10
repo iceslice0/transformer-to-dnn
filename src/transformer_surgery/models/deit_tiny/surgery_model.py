@@ -14,6 +14,7 @@ from transformer_surgery.ops import (
     GibbsTopKSoftmax,
     NLGELU,
     RewrittenLayerNorm,
+    SigmoidGELU,
     RoutingBroadcastTensors,
     RoutingCat,
     RoutingDropPath,
@@ -38,10 +39,15 @@ class PatchEmbed(nn.Module):
 
 
 class SurgeryMlp(nn.Module):
-    def __init__(self, in_features: int, hidden_features: int, drop: float = 0.0) -> None:
+    def __init__(
+        self, in_features: int, hidden_features: int, drop: float = 0.0, *, gelu: str = "exact", allow_matmul: bool = False
+    ) -> None:
         super().__init__()
+        if gelu not in ("exact", "sigmoid"):
+            raise ValueError(f"gelu must be 'exact' or 'sigmoid', got {gelu!r}")
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = NLGELU()
+        # "sigmoid": x * sigmoid(1.702 x), a model change used for NPUs without a GELU unit.
+        self.act = NLGELU() if gelu == "exact" else SigmoidGELU(allow_matmul=allow_matmul)
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(drop)
 
@@ -72,11 +78,13 @@ class SurgeryBlock(nn.Module):
         allow_matmul: bool = False,
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
+        strict_unary: str = "sigmoid_rsqrt",
+        gelu: str = "exact",
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
-            self.norm1 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul)
-            self.norm2 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.norm1 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
+            self.norm2 = RewrittenLayerNorm(dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
         else:
             self.norm1 = nn.LayerNorm(dim, eps=eps_ln)
             self.norm2 = nn.LayerNorm(dim, eps=eps_ln)
@@ -93,9 +101,10 @@ class SurgeryBlock(nn.Module):
             eps_ln=eps_ln,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             use_exact_tail_mass=use_exact_tail_mass,
+            strict_unary=strict_unary,
         )
         mlp_hidden = int(dim * mlp_ratio)
-        self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop)
+        self.mlp = SurgeryMlp(in_features=dim, hidden_features=mlp_hidden, drop=drop, gelu=gelu, allow_matmul=allow_matmul)
         self.drop_path = RoutingDropPath(drop_path)
         self.residual_contract = AffineContract(
             "i,...i->...",
@@ -135,9 +144,13 @@ class DeiTTinySurgeryModel(nn.Module):
         allow_matmul: bool = False,
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
+        strict_unary: str = "sigmoid_rsqrt",
+        gelu: str = "exact",
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
+        self.strict_unary = str(strict_unary)
+        self.gelu = str(gelu)
         self.embed_dim = embed_dim
         self.use_surgery_layernorm = use_surgery_layernorm
         self.use_attention_surgery = use_attention_surgery
@@ -173,12 +186,14 @@ class DeiTTinySurgeryModel(nn.Module):
                     allow_matmul=allow_matmul,
                     gibbs_tail_prob_eps=gibbs_tail_prob_eps,
                     use_exact_tail_mass=use_exact_tail_mass,
+                    strict_unary=strict_unary,
+                    gelu=gelu,
                 )
                 for i in range(depth)
             ]
         )
         if use_surgery_layernorm:
-            self.fc_norm = RewrittenLayerNorm(embed_dim, eps=eps_ln, allow_matmul=allow_matmul)
+            self.fc_norm = RewrittenLayerNorm(embed_dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary)
         else:
             self.fc_norm = nn.LayerNorm(embed_dim, eps=eps_ln)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -201,6 +216,8 @@ class DeiTTinySurgeryModel(nn.Module):
             use_surgery_softmax=not bool(cfg.disable_softmax_replacement),
             allow_matmul=bool(cfg.allow_matmul),
             use_exact_tail_mass=bool(getattr(cfg, "use_exact_tail_mass", False)),
+            strict_unary=str(getattr(cfg, "strict_unary", "sigmoid_rsqrt")),
+            gelu=str(getattr(cfg, "gelu", "exact")),
         )
 
     @classmethod
@@ -217,6 +234,9 @@ class DeiTTinySurgeryModel(nn.Module):
             use_surgery_softmax=not bool(d["disable_softmax_replacement"]),
             allow_matmul=bool(d["allow_matmul"]),
             use_exact_tail_mass=bool(d.get("use_exact_tail_mass", False)),
+            # Checkpoints written before ``strict_unary`` existed are log-domain.
+            strict_unary=str(d.get("strict_unary", "log_exp")),
+            gelu=str(d.get("gelu", "exact")),
         )
 
     def _init_weights(self) -> None:
@@ -273,21 +293,10 @@ class DeiTTinySurgeryModel(nn.Module):
 
 
 def freeze_eps_parameters(model: DeiTTinySurgeryModel) -> None:
+    """Freeze every unary-node ``eps`` and, in exact mode, the unused calibrated tail mass."""
     for m in model.modules():
-        if isinstance(m, RewrittenLayerNorm):
-            if m.allow_matmul:
-                m.inv_sqrt_var.eps.requires_grad = False
-            else:
-                m.log_eps.eps.requires_grad = False
-        if isinstance(m, GibbsTopKSoftmax):
-            if m.allow_matmul:
-                m.inv_z.eps.requires_grad = False
-            else:
-                m.log_z.eps.requires_grad = False
-            if m.use_exact_tail_mass:
-                m.gibbs_tail_prob_eps.requires_grad = False
-                if m.allow_matmul:
-                    m.inv_z_all.eps.requires_grad = False
-                else:
-                    m.log_z_all.eps.requires_grad = False
-                    m.log_z_top.eps.requires_grad = False
+        eps = getattr(m, "eps", None)
+        if isinstance(eps, torch.Tensor):
+            eps.requires_grad = False
+        if isinstance(m, GibbsTopKSoftmax) and m.use_exact_tail_mass:
+            m.gibbs_tail_prob_eps.requires_grad = False

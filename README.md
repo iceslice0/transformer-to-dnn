@@ -7,12 +7,12 @@ A transformer is just a DNN. This repo demonstrates that operationally: it compi
 There is no architectural magic in attention, LayerNorm, or softmax. Each is a particular composition of three op classes:
 
 - **affine** - `nn.Linear`, `nn.Conv2d`, fixed-coefficient contractions, scale/bias, mean/sum reductions.
-- **nonlinear unary** - pointwise scalar maps: `exp`, `log(x+eps)`, `sqrt(exp(x))`, `1/(x+eps)`, `1/sqrt(x+eps)`, `square`, GELU.
+- **nonlinear unary** - pointwise scalar maps: `square`, `sigmoid`, `1/sqrt(x+eps)` and GELU (the paper's strict set), plus `exp`, `1/(x+eps)` (fast path) and `log(x+eps)`, `sqrt(exp(x))` (superseded log-domain strict form).
 - **routing** - pure tensor wiring and discrete selection: `reshape`, `transpose`, `cat`, `stack`, `expand`, `broadcast_tensors`, `topk`, `gather`, `relu`.
 
 A transformer block is then a wiring diagram over this vocabulary. The repo produces two compilations:
 
-- **strict** (`allow_matmul=False`): no variable matrix multiplication anywhere. QK^T scores, sparse value mixing, and the LayerNorm scale-and-shift all expand into the three classes above using the algebraic identity `a*b = ((a+b)^2 - (a-b)^2)/4` and an exact log-domain rewrite of LayerNorm. The compiled model contains only fixed-coefficient affine ops plus the listed nonlinearities and routing. This mode is inherently inefficient: replacing each variable product with complex computation path creates more intermediate tensors, memory traffic, and elementwise work than native matmul/Hadamard kernels. It is the proof-oriented compile target, not the practical runtime path.
+- **strict** (`allow_matmul=False`): no variable matrix multiplication anywhere. QK^T scores, sparse value mixing, and the LayerNorm scale-and-shift all expand into the three classes above using the algebraic identity `a*b = ((a+b)^2 - (a-b)^2)/4`. With `strict_unary="sigmoid_rsqrt"` (the paper's strict graph) the only unary maps besides GELU are the square, the sigmoid and the inverse square root: `exp(t) = sigmoid(t)/sigmoid(-t)` and `1/x = (x^{-1/2})^2`; `gelu="sigmoid"` replaces GELU by `x*sigmoid(1.702x)`. `strict_unary="sigmoid_rsqrt"` is the default; the earlier exact log-domain rewrite of LayerNorm and softmax (`strict_unary="log_exp"`) is deprecated and kept to reproduce the superseded runs. The compiled model contains only fixed-coefficient affine ops plus the listed nonlinearities and routing. This mode is inherently inefficient: replacing each variable product with complex computation path creates more intermediate tensors, memory traffic, and elementwise work than native matmul/Hadamard kernels. It is the proof-oriented compile target, not the practical runtime path.
 - **fast** (`allow_matmul=True`): the same vocabulary plus variable `matmul` / Hadamard. This mode exists because the strict expansion is expensive; it keeps the surgery structure and Gibbs top-k behavior while using efficient tensor kernels for variable bilinear work. It is the practical baseline for calibration, distillation, and PTQ runs.
 
 Dense softmax is replaced everywhere with a **top-k Gibbs softmax** - sparse normalization over the top-k scores plus a calibrated tail-mass parameter to reduce memory access.
@@ -133,9 +133,12 @@ Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64
 
 - [docs/surgery.md](docs/surgery.md) - the strict / fast op vocabulary, LayerNorm rewrite, attention rewrite, Gibbs top-k softmax, calibration, and metadata schema.
 - [docs/exact_tail_mass.md](docs/exact_tail_mass.md) - exact runtime omitted-tail mass.
-- [docs/cluster_routing.md](docs/cluster_routing.md) - query-centroid support routing (fixed k-means centroids select the sparse support before the scores; `make routing`, `make pythia-routing`, `make routing-strict`, `make routing-strict-bench`).
+- [docs/cluster_routing.md](docs/cluster_routing.md) - query-centroid support routing (fixed k-means centroids select the sparse support before the scores; `make routing`, `make pythia-routing`, `make strict-sr`, `make routing-strict-bench`; PTQ of the strict graph: `make ptq-strict-sr`).
 - [docs/pythia_results.md](docs/pythia_results.md) - Pythia-70M WikiText-2 surgery sweep (exact vs tail0).
 - [docs/profile.md](docs/profile.md) - per-module GPU time and memory, strict vs fast.
+- [docs/npu/README.md](docs/npu/README.md) - NPU survey behind paper Table S5: per-accelerator operator placement, strict and extended verdicts, pinned sources (`docs/npu/fetch_sources.sh`).
 - [docs/mambair_results.md](docs/mambair_results.md) - MambaIRv2-Light Set5 sweeps (tail drop, calibrated, exact).
+- `make exact-fp64` (`scripts/check_exact_fp64.py`) - float64 end-to-end check that the compiled DeiT-Tiny graphs with all keys reproduce the reference logits (log in `artifacts/logs/exact_fp64_2026-10-10/`).
+- `scripts/check_paper_numbers.py --sections <paper>/sections` - checks every table cell, Figure 2 point and numeric claim of the paper against `artifacts/metadata` (exit 1 on any mismatch).
 - [docs/distill.md](docs/distill.md) - CE + Jeffreys distillation loop and metric definitions.
 - [docs/ptq.md](docs/ptq.md) - single-pass calibration-driven post-training quantization.

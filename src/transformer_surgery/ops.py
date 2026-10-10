@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -27,6 +28,7 @@ RoutingUnsqueeze = torch.unsqueeze
 RoutingBroadcastTensors = torch.broadcast_tensors
 RoutingTopK = torch.topk
 RoutingGather = torch.gather
+RoutingScatter = torch.scatter
 RoutingFullLike = torch.full_like
 RoutingReLU = F.relu
 RoutingDropPath = _TimmDropPath
@@ -186,6 +188,26 @@ class NLReciprocalPlusEps(nn.Module):
         return torch.reciprocal(x + e)
 
 
+class NLSigmoid(nn.Module):
+    """Logistic sigmoid ``1/(1+exp(-x))`` as a unary basis op."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(x)
+
+
+# "sigmoid_rsqrt": squares, sigmoid, inverse square root (the paper's strict graph, default).
+# "log_exp": deprecated log-domain LayerNorm and softmax, kept to reload and reproduce earlier runs.
+STRICT_UNARY_SETS = ("sigmoid_rsqrt", "log_exp")
+GELU_MODES = ("exact", "sigmoid")
+
+
+def check_strict_unary(strict_unary: str) -> str:
+    value = str(strict_unary)
+    if value not in STRICT_UNARY_SETS:
+        raise ValueError(f"strict_unary must be one of {STRICT_UNARY_SETS}, got {value!r}")
+    return value
+
+
 class AffineSum(nn.Module):
     """Sum reduction (unlike :class:`AffineMean`, no ``1/n`` scaling)."""
 
@@ -278,6 +300,73 @@ class SquareIdentityOperandChain(nn.Module):
         return self.out_contract(sq)
 
 
+class ElementwiseProduct(nn.Module):
+    """
+    Product of two activations ``a * b`` (broadcast). Strict: polarization ``((a+b)^2-(a-b)^2)/4``,
+    two squares per entry. ``allow_matmul=True``: one :class:`AffineHadamard` node.
+    """
+
+    def __init__(self, *, allow_matmul: bool = False) -> None:
+        super().__init__()
+        self.allow_matmul = bool(allow_matmul)
+        if self.allow_matmul:
+            self.hadamard = AffineHadamard()
+        else:
+            self.square_chain = SquareIdentityOperandChain(
+                "pq,...qd->...pd",
+                "p,...pd->...d",
+                torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()),
+            )
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a, b = RoutingBroadcastTensors(a, b)
+        if self.allow_matmul:
+            return self.hadamard(a, b)
+        return self.square_chain(a, b)
+
+
+class ReciprocalByRsqrt(nn.Module):
+    """``1/x = (x^{-1/2})^2`` for ``x > 0``: one inverse square root and one square."""
+
+    def __init__(self, eps: float = 0.0) -> None:
+        super().__init__()
+        self.rsqrt = NLRsqrtPlusEps(eps)
+        self.square = NLSquare()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.square(self.rsqrt(x))
+
+
+class ExpBySigmoid(nn.Module):
+    """
+    ``exp(t) = sigmoid(t) / sigmoid(-t)`` with the reciprocal as :class:`ReciprocalByRsqrt` and the product
+    by polarization: two sigmoids, one inverse square root and three squares per entry, no exp and no log.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sigmoid = NLSigmoid()
+        self.negate = AffineScale(-1.0)
+        self.reciprocal = ReciprocalByRsqrt(0.0)
+        self.product = ElementwiseProduct(allow_matmul=False)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.product(self.sigmoid(t), self.reciprocal(self.sigmoid(self.negate(t))))
+
+
+class SigmoidGELU(nn.Module):
+    """GELU approximation ``x * sigmoid(1.702 x)`` (Hendrycks and Gimpel); product by polarization if strict."""
+
+    def __init__(self, *, allow_matmul: bool = False) -> None:
+        super().__init__()
+        self.scale = AffineScale(1.702)
+        self.sigmoid = NLSigmoid()
+        self.product = ElementwiseProduct(allow_matmul=allow_matmul)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.product(x, self.sigmoid(self.scale(x)))
+
+
 class AffineMean(nn.Module):
     """Mean as sum followed by fixed scalar ``1/n``."""
 
@@ -293,7 +382,7 @@ class AffineMean(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: relu+/- stack + affine reductions + NLSqrtExp
+# LayerNorm rewrite: polarization with the inverse square root (strict), Hadamard (fast)
 # ---------------------------------------------------------------------------
 
 
@@ -301,10 +390,13 @@ class RewrittenLayerNorm(nn.Module):
     """
     mu = mean(x); u = x - mu; r2 = mean(u*u).
 
-    **``allow_matmul=False`` (default, strict):** ``au = stack(relu(u),relu(-u))`` (dim ``-2``);
-    ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
-    ``t = AffineContract([2,-1])(stack(log_num, log_den))``.
-    ``a_mag = NLSqrtExp(t)``.
+    **``allow_matmul=False``, ``strict_unary="sigmoid_rsqrt"`` (default, strict):** ``inv_std = 1/sqrt(r2+eps)``
+    via :class:`NLRsqrtPlusEps`, and ``z = u * inv_std`` by polarization (:class:`ElementwiseProduct`):
+    no log, no exp and no sign split.
+
+    **``allow_matmul=False``, ``strict_unary="log_exp"`` (deprecated):** ``au = stack(relu(u),relu(-u))``
+    (dim ``-2``); ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
+    ``t = AffineContract([2,-1])(stack(log_num, log_den))``; ``a_mag = NLSqrtExp(t)``;
     ``z = out_contract(a_mag)``.
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
@@ -312,11 +404,14 @@ class RewrittenLayerNorm(nn.Module):
     log-domain path.
     """
 
-    def __init__(self, normalized_shape: int, eps: float, *, allow_matmul: bool = False) -> None:
+    def __init__(
+        self, normalized_shape: int, eps: float, *, allow_matmul: bool = False, strict_unary: str = "sigmoid_rsqrt"
+    ) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
         e = float(eps)
         self.allow_matmul = allow_matmul
+        self.strict_unary = check_strict_unary(strict_unary)
         self.mean_u = AffineMean(-1, keepdim=True)
         self.mean_r2 = AffineMean(-1, keepdim=True)
         self.square = NLSquare()
@@ -328,7 +423,15 @@ class RewrittenLayerNorm(nn.Module):
         if allow_matmul:
             self.inv_sqrt_var = NLRsqrtPlusEps(e)
             self.u_mul_invstd = AffineHadamard()
+        elif self.strict_unary == "sigmoid_rsqrt":
+            self.inv_sqrt_var = NLRsqrtPlusEps(e)
+            self.u_mul_invstd = ElementwiseProduct(allow_matmul=False)
         else:
+            warnings.warn(
+                "strict_unary='log_exp' (log-domain strict graph) is deprecated; use 'sigmoid_rsqrt'",
+                FutureWarning,
+                stacklevel=2,
+            )
             self.out_contract = AffineContract("p,...pc->...c", torch.tensor([1.0, -1.0]))
             self.log_a_contract = AffineContract("q,...qpc->...pc", torch.tensor([2.0, -1.0]))
             self.log_eps = NLLogPlusEps(e)
@@ -340,7 +443,7 @@ class RewrittenLayerNorm(nn.Module):
         u = self.u_center_contract(RoutingStack((_x, _m), dim=-1))
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
-        if self.allow_matmul:
+        if self.allow_matmul or self.strict_unary == "sigmoid_rsqrt":
             inv_std = self.inv_sqrt_var(r2)
             z = self.u_mul_invstd(u, inv_std)
         else:
@@ -422,8 +525,9 @@ class GibbsTopKSoftmax(nn.Module):
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
-    :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; with
-    ``allow_matmul=False`` use ``exp(vals - log(sum_exp + eps))`` (same math, no division).
+    :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; strict ``strict_unary="sigmoid_rsqrt"`` uses
+    :class:`ExpBySigmoid` and ``1/(Z+eps) = ((Z+eps)^{-1/2})^2`` (:class:`ReciprocalByRsqrt`) with products by
+    polarization (no exp, no log); the deprecated strict ``"log_exp"`` uses ``exp(vals - log(sum_exp + eps))``.
 
     By default ``gibbs_tail_prob_eps`` reserves probability mass for all omitted entries and scales
     the top-k probabilities by ``1 - gibbs_tail_prob_eps``. The value is an ``nn.Parameter``
@@ -450,11 +554,15 @@ class GibbsTopKSoftmax(nn.Module):
         gibbs_tail_prob_eps: float,
         allow_matmul: bool = False,
         use_exact_tail_mass: bool = False,
+        strict_unary: str = "sigmoid_rsqrt",
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
         self.top_k = top_k
         self.use_exact_tail_mass = bool(use_exact_tail_mass)
+        self.strict_unary = check_strict_unary(strict_unary)
+        # Strict graph without exp and log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2.
+        self.sigmoid_rsqrt = (not allow_matmul) and self.strict_unary == "sigmoid_rsqrt"
         tail_prob = float(gibbs_tail_prob_eps)
         if not 0.0 <= tail_prob < 1.0:
             raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
@@ -473,6 +581,10 @@ class GibbsTopKSoftmax(nn.Module):
         if allow_matmul:
             self.inv_z = NLReciprocalPlusEps(e)
             self.mul_by_inv_z = AffineHadamard()
+        elif self.sigmoid_rsqrt:
+            self.exp = ExpBySigmoid()
+            self.inv_z = ReciprocalByRsqrt(e)
+            self.mul_by_inv_z = ElementwiseProduct(allow_matmul=False)
         else:
             self.log_z = NLLogPlusEps(e)
             self.logit_logz_contract = AffineContract(
@@ -493,6 +605,10 @@ class GibbsTopKSoftmax(nn.Module):
             if allow_matmul:
                 self.inv_z_all = NLReciprocalPlusEps(e)
                 self.mul_ztop_inv_zall = AffineHadamard()
+            elif self.sigmoid_rsqrt:
+                self.inv_z_all = ReciprocalByRsqrt(e)
+                self.mul_ztop_inv_zall = ElementwiseProduct(allow_matmul=False)
+                self.scale_top_probs_by_tail = ElementwiseProduct(allow_matmul=False)
             else:
                 self.log_z_all = NLLogPlusEps(e)
                 self.log_z_top = NLLogPlusEps(e)
@@ -550,7 +666,7 @@ class GibbsTopKSoftmax(nn.Module):
         exp_vals = self.exp(vals)
         normalizer = self.sum_exp_vals(exp_vals)
 
-        if self.allow_matmul:
+        if self.allow_matmul or self.sigmoid_rsqrt:
             inv_z = self.inv_z(normalizer)
             top_probs = self.mul_by_inv_z(exp_vals, inv_z)
         else:
@@ -566,7 +682,7 @@ class GibbsTopKSoftmax(nn.Module):
                 scores_stable = self.all_vals_stable_contract(RoutingStack((_s, _rm), dim=-1))
                 exp_all = self.exp(scores_stable)
                 z_all = self.scale_z_all(self.mean_exp_all(exp_all))
-                if self.allow_matmul:
+                if self.allow_matmul or self.sigmoid_rsqrt:
                     top_mass = self.mul_ztop_inv_zall(normalizer, self.inv_z_all(z_all))
                 else:
                     log_z_top = self.log_z_top(normalizer)
@@ -648,7 +764,9 @@ class SparseWeightedSumBySquare(nn.Module):
     contract ``p,...kpd->...d``. Operands are expanded prob and gathered
     value per top-k slot. No dense ``matmul`` for attention-value mixing.
 
-    ``allow_matmul=True`` uses ``p * v`` then sum (faster; invalid for strict demo).
+    ``allow_matmul=True`` uses ``p * v`` then sum (faster; invalid for strict demo). At full support
+    (``K == Nk``) ``idx`` is a permutation of the keys: the weights are scattered back to key order and
+    mixed by one dense ``[Nq,Nk] @ [Nk,D]`` product, the same sum without a gathered ``[Nq,K,D]`` tensor.
     """
 
     def __init__(self, *, allow_matmul: bool = False) -> None:
@@ -675,8 +793,10 @@ class SparseWeightedSumBySquare(nn.Module):
         v: [B,H,Nk,D]
         returns [B,H,Nq,D]
         """
-        _, _, nq, _ = probs.shape
+        _, _, nq, kk = probs.shape
         _, _, nk, d = v.shape
+        if self.allow_matmul and kk == nk:
+            return self.pv_matmul(RoutingScatter(RoutingFullLike(probs, 0.0), -1, idx, probs), v)
         idx_e = RoutingExpand(RoutingUnsqueeze(idx, -1), -1, -1, -1, -1, d)
         v_h = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, -1, -1)
         v_g = RoutingGather(v_h, 3, idx_e)
@@ -710,10 +830,12 @@ class SurgeryAttention(nn.Module):
         eps_ln: float = 1e-5,
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
+        strict_unary: str = "sigmoid_rsqrt",
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.strict_unary = check_strict_unary(strict_unary)
         self.use_attention_surgery = use_attention_surgery
         self.use_surgery_softmax = use_surgery_softmax
         self.allow_matmul = allow_matmul
@@ -734,6 +856,7 @@ class SurgeryAttention(nn.Module):
                     gibbs_tail_prob_eps=gibbs_tail_prob_eps,
                     allow_matmul=allow_matmul,
                     use_exact_tail_mass=use_exact_tail_mass,
+                    strict_unary=self.strict_unary,
                 )
                 self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
                 k_eff = min(int(top_k), int(seq_len))
@@ -741,7 +864,10 @@ class SurgeryAttention(nn.Module):
                 inv_dropped = 1.0 / n_dropped
                 n_over_dropped = float(seq_len) / n_dropped
                 self.mean_v = AffineMean(dim=-2, keepdim=True)
-                self.scale_mean_v_by_tail = AffineHadamard()
+                if use_exact_tail_mass and not allow_matmul and self.strict_unary == "sigmoid_rsqrt":
+                    self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False)
+                else:
+                    self.scale_mean_v_by_tail = AffineHadamard()
                 self.adj_probs_contract = AffineContract(
                     "i,...i->...",
                     torch.tensor([1.0, -inv_dropped], dtype=get_surgery_dtype()),
