@@ -60,7 +60,11 @@ def kmeans_per_head(
     cents = [x[heads, first].unsqueeze(1)]
     d2 = (x - cents[0]).pow(2).sum(-1)
     for _ in range(1, c_count):
-        weights = d2 / d2.sum(-1, keepdim=True).clamp_min(1e-30)
+        total = d2.sum(-1, keepdim=True)
+        weights = d2 / total.clamp_min(1e-30)
+        # A head can have fewer distinct queries than requested centroids. Once all
+        # remaining distances are zero, any sample is a valid next centroid.
+        weights = torch.where(total > 0, weights, torch.full_like(weights, 1.0 / n))
         nxt = torch.multinomial(weights, 1, generator=generator).squeeze(-1)
         c_new = x[heads, nxt].unsqueeze(1)
         cents.append(c_new)

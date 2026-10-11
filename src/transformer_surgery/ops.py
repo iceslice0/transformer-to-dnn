@@ -557,7 +557,8 @@ class RewrittenLayerNorm(nn.Module):
 
     **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
     ``inv_std = 1/sqrt(r2+eps)`` via :class:`NLRsqrtPlusEps` and :class:`AffineHadamard`, not the
-    log-domain path.
+    log-domain path. The shared ``NLSquare`` module computes ``u * u`` exactly like
+    :class:`AffineSelfHadamard`; extended-basis accounting classifies it as that Hadamard product.
 
     **``hadamard=True`` (Hadamard graph):** ``u*u`` and ``u * inv_std`` are elementwise products; the inverse
     square root is the only unary map.
@@ -763,7 +764,8 @@ class GibbsTopKSoftmax(nn.Module):
 
     Only normalization subgraphs for the chosen ``allow_matmul`` / exact-tail mode are registered.
 
-    ``eps`` is the same floor as LayerNorm / run config for log/reciprocal normalizers.
+    ``eps`` is an optional offset retained for compatibility with older runs. Current model
+    constructions pass zero; it is independent of the positive epsilon used by LayerNorm.
     """
 
     def __init__(
@@ -780,7 +782,9 @@ class GibbsTopKSoftmax(nn.Module):
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
-        self.top_k = top_k
+        self.top_k = int(top_k)
+        if self.top_k < 1:
+            raise ValueError("GibbsTopKSoftmax requires top_k >= 1")
         self.use_exact_tail_mass = bool(use_exact_tail_mass)
         self.strict_unary = check_strict_unary(strict_unary)
         h = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
@@ -839,6 +843,14 @@ class GibbsTopKSoftmax(nn.Module):
                     "i,...i->...",
                     torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
                 )
+
+    def set_normalizer_epsilon(self, value: float = 0.0) -> None:
+        """Set every registered softmax-normalizer offset in this module."""
+        with torch.no_grad():
+            for module in self.modules():
+                eps = getattr(module, "eps", None)
+                if isinstance(eps, torch.Tensor):
+                    eps.fill_(float(value))
 
     def forward(
         self, scores: torch.Tensor, selection_scores: Optional[torch.Tensor] = None
@@ -1081,7 +1093,6 @@ class SurgeryAttention(nn.Module):
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
-        eps_ln: float = 1e-5,
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
@@ -1112,7 +1123,7 @@ class SurgeryAttention(nn.Module):
                 self.gibbs = GibbsTopKSoftmax(
                     seq_len,
                     top_k,
-                    eps=eps_ln,
+                    eps=0.0,
                     gibbs_tail_prob_eps=gibbs_tail_prob_eps,
                     allow_matmul=allow_matmul,
                     use_exact_tail_mass=use_exact_tail_mass,
@@ -1220,7 +1231,6 @@ class SurgeryCausalAttention(nn.Module):
         use_attention_surgery: bool = True,
         use_surgery_softmax: bool = True,
         allow_matmul: bool = False,
-        eps_ln: float = 1e-5,
         gibbs_tail_prob_eps: float = 1e-5,
         use_exact_tail_mass: bool = False,
     ) -> None:
@@ -1454,6 +1464,12 @@ def ptq_quantize_proxy(x: torch.Tensor, scale: torch.Tensor, bits: int) -> torch
 
 
 class PTQInputQuantizer(nn.Module):
+    """Apply the consuming node's interface grid, including to preceding node outputs.
+
+    ``activation_bits`` is already resolved for this node's group. A preceding
+    node's width is not inherited: this node quantizes each input on its own grid.
+    """
+
     def __init__(self, activation_bits: int, input_scale: torch.Tensor) -> None:
         super().__init__()
         self.activation_bits = int(activation_bits)
@@ -1469,7 +1485,14 @@ class PTQInputQuantizer(nn.Module):
 
 
 class CalibratedAffinePTQWrapper(nn.Module):
-    """Forward-only PTQ proxy: quantize, accumulate, dequantize."""
+    """Forward-only PTQ proxy: quantize inputs, accumulate, dequantize outputs.
+
+    A producer's output is its consumer's input. Quantize each boundary once,
+    at the selected consumer, using its resolved width and input scale. The
+    accumulator result is dequantized; the next selected consumer applies the
+    next boundary's grid, after any intervening unary/routing nodes. Integer
+    codes are stored in float32 tensors.
+    """
 
     def __init__(
         self,

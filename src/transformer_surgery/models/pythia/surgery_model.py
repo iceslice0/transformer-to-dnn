@@ -114,7 +114,6 @@ class SurgeryPythiaBlock(nn.Module):
             use_attention_surgery=use_attention_surgery,
             use_surgery_softmax=use_surgery_softmax,
             allow_matmul=allow_matmul,
-            eps_ln=layer_norm_eps,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             use_exact_tail_mass=use_exact_tail_mass,
         )

@@ -155,6 +155,12 @@ class PackageSmokeTests(unittest.TestCase):
         km = kmeans_per_head(x, 2, 10, torch.Generator().manual_seed(0))
         self.assertTrue(torch.all(km["relative_inertia"] < 1e-3))
         self.assertTrue(torch.all(km["empty_clusters"] == 0))
+        identical = torch.ones(2, 12, 3)
+        km_identical = kmeans_per_head(identical, 4, 10, torch.Generator().manual_seed(0))
+        self.assertTrue(torch.isfinite(km_identical["centroids"]).all())
+        self.assertTrue(torch.equal(km_identical["relative_inertia"], torch.zeros(2)))
+        with self.assertRaisesRegex(ValueError, "top_k >= 1"):
+            GibbsTopKSoftmax(seq_len=6, top_k=0, eps=0.0, gibbs_tail_prob_eps=0.0)
 
     def test_strict_sigmoid_rsqrt_matches_reference(self) -> None:
         import torch

@@ -27,15 +27,20 @@ class PTQSurgeryConfig:
     include_names: List[str] = field(default_factory=list)
     exclude_names: List[str] = field(default_factory=list)
     weight_bits: int = 8
-    # Bit widths of the integer codes that enter each quantized node, by node group:
+    # The paper describes node input/output precision with a single bit width.
+    # A producer's output is its consumer's input: quantize that boundary once,
+    # at the selected consumer, using the consumer's own width and scale.
+    # The wrapper quantizes, accumulates, and dequantizes; the next selected
+    # consumer applies the next boundary's grid, after any unary/routing nodes.
+    # The input-code width is selected independently for each node group:
     # - activation_bits: Linear / Conv2d inherited from the source model.
     # - compiled_accumulator_bits: the fixed affine nodes that compilation introduces when it splits the
     #   Transformer-specific layers (LayerNorm, softmax, attention): AffineScale / AffineScaleBias /
     #   AffineFixedMix / AffineContract, i.e. the accumulators of the compiled subgraphs. In the strict graph they hold
-    #   squares and sums of squares, whose range exceeds 8 bits, so strict configs set 12; it only has an effect when
-    #   wrap_affine is on and it differs from activation_bits (falls back to activation_bits when unset).
+    #   squares and sums of squares, so the paper's strict configs use 12 for their wider range.
+    #   Applies only to selected fixed-affine nodes; falls back to activation_bits when unset.
+    #   Does not change weight_bits or the Linear/Conv and MatMul/Hadamard input widths.
     # - matmul_activation_bits: AffineMatMul / AffineHadamard (falls back to activation_bits).
-    # The proxy accumulates every node exactly (fp32 on integer codes); none of these is an accumulator width limit.
     activation_bits: int = 8
     compiled_accumulator_bits: Optional[int] = None
     matmul_activation_bits: Optional[int] = None
@@ -90,9 +95,10 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "brent_sites": "Product sites folded by brent_scaling: any of 'mix' and 'layernorm'.",
     "calibration_seed": "Seed set before the loaders are built, so PTQ calibration repeats; JSON null leaves it unseeded.",
     "compiled_accumulator_bits": (
-        "Bit width of the integer codes entering the compiled accumulators (fixed affine nodes introduced by splitting "
-        "LayerNorm, softmax and attention). Strict graph: 12, for its squares and sums of squares; elsewhere it equals "
-        "activation_bits. Not the Linear/Conv layers of the source model."
+        "Input-code width of selected compiled fixed-affine nodes (paper strict configs: 12 bits). "
+        "Falls back to activation_bits. Weights and Linear/Conv and MatMul/Hadamard input widths have separate "
+        "settings. Each boundary is quantized once at the selected consumer's input, using that consumer's "
+        "width and scale."
     ),
     "dequant_var_eps": (
         "OLS affine-dequant variance threshold for Affine/MatMul kinds. Channels with "

@@ -46,10 +46,11 @@ fields are:
   accumulators, the fixed affine nodes (`AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` and its
   subclasses) that compilation introduces when it splits LayerNorm, softmax and attention; and
   `matmul_activation_bits` for `AffineMatMul`/`AffineHadamard`. The last two fall back to `activation_bits` when
-  unset. In the strict graph the compiled accumulators hold squares and sums of squares, whose range exceeds 8 bits,
-  so the strict configs (`configs/ptq/*_strict*.json`) set `compiled_accumulator_bits=12`; every other config sets 8,
-  where it equals `activation_bits` and has no effect. The proxy accumulates every node exactly (fp32 on integer
-  codes), so none of these fields limits an accumulator's width. `affine_activation_bits` is the deprecated name and
+  unset. The paper's strict configs use `compiled_accumulator_bits=12` for the wider range of squares and sums
+  of squares; bit-width sweep configs also test other widths. This override affects only selected compiled
+  fixed-affine nodes. It does not change weight precision or the Linear/Conv and MatMul/Hadamard input widths.
+  Quantization is applied once per boundary, at the consuming node's input.
+  `affine_activation_bits` is the deprecated name and
   is still accepted. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
   its own multiplier before the sum, as in an integer Add with per-input multipliers. The strict baseline coefficients
   ([1, 1], [1, -1], [0.5, 0.5], [0.5, -0.5, -0.5]) were exact on the one-scale 8-bit grid before as well.
@@ -117,6 +118,27 @@ global scale. `AffineMatMul` and `AffineHadamard` have no stored weight tensor.
 
 The wrapper forward path quantizes inputs with proxy integer tensors, runs its explicit accumulator
 submodule, then dequantizes back to the incoming float dtype.
+
+### Meaning of "12-bit compiled accumulators"
+
+The paper uses this phrase as shorthand for the compiled accumulator nodes' input/output precision.
+The implementation places quantization at each selected node's input:
+
+```text
+input -> quantize on this node's grid -> accumulator -> affine dequantization
+      -> optional unary/routing nodes -> quantize on the next selected node's grid
+```
+
+For the paper's strict settings, selected compiled fixed-affine nodes use 12-bit input codes;
+Linear/Conv and MatMul/Hadamard nodes use their separately configured widths, normally 8 bits.
+Weights keep `weight_bits`, normally 8. A consumer's width is not inherited from its producer.
+At a boundary between quantized nodes, the producer's output is the consumer's input. The consumer
+quantizes that boundary once, on its own grid; a second quantizer at the producer's output would
+duplicate the boundary operation. When unary or routing nodes intervene, the next selected node's
+input quantizer follows those operations, as described in the paper's Methods. Integer codes are
+stored in float32 tensors; the storage dtype alone does not change an integer-code mapping.
+See `ptq_activation_bits_for_kind` for group selection and `CalibratedAffinePTQWrapper.forward`
+for quantizer placement.
 
 ## Dequant Fit
 

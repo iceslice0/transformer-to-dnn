@@ -108,7 +108,6 @@ class SurgeryBlock(nn.Module):
             use_attention_surgery=use_attention_surgery,
             use_surgery_softmax=use_surgery_softmax,
             allow_matmul=allow_matmul,
-            eps_ln=eps_ln,
             gibbs_tail_prob_eps=gibbs_tail_prob_eps,
             use_exact_tail_mass=use_exact_tail_mass,
             strict_unary=strict_unary,

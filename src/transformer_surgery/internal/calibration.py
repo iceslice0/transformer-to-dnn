@@ -865,7 +865,12 @@ def ptq_activation_bits_for_kind(
     compiled_accumulator_bits: Optional[int] = None,
     matmul_activation_bits: Optional[int] = None,
 ) -> int:
-    """Resolve activation bit-width for a PTQ node kind.
+    """Resolve the input-code width for a PTQ node kind.
+
+    The paper uses one width as shorthand for node input/output precision.
+    A producer's output is its consumer's input, so each boundary is quantized
+    once, at the selected consumer using its own width and scale. Weight precision
+    and the Linear/Conv and MatMul/Hadamard groups have separate settings.
 
     Three groups:
     - ``linear`` / ``conv2d`` → ``activation_bits``

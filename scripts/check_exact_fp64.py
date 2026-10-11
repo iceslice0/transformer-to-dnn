@@ -1,9 +1,9 @@
 """Float64 end-to-end check of exact compilation: compiled DeiT-Tiny vs its reference on Pet validation images.
 
 Surgery checkpoints store weights in the surgery dtype (bf16), so the reference is compared with its weights rounded
-to bf16 the same way; otherwise the weight rounding (about 0.07 in the logits) hides the compilation error. Each
-compiled graph is run twice: as configured, and with the softmax-normalizer eps set to zero (the LayerNorm keeps the
-reference eps), which isolates the compilation itself.
+to bf16 the same way; otherwise the weight rounding (about 0.07 in the logits) hides the compilation error. The check
+sets the compatibility softmax-normalizer epsilon to zero, as in the reported runs; LayerNorm keeps its reference
+epsilon.
 
 Example:
     python scripts/check_exact_fp64.py \\
@@ -23,15 +23,7 @@ import torch
 from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
 from transformer_surgery.internal.util import set_default_device, set_surgery_dtype
 from transformer_surgery.models.adapters import get_model_adapter, load_surgery_student_checkpoint
-from transformer_surgery.ops import GibbsTopKSoftmax, NLReciprocalPlusEps, NLRsqrtPlusEps
-
-
-def zero_softmax_eps(model: torch.nn.Module) -> None:
-    for m in model.modules():
-        if isinstance(m, GibbsTopKSoftmax):
-            for sub in m.modules():
-                if isinstance(sub, (NLReciprocalPlusEps, NLRsqrtPlusEps)):
-                    sub.eps.zero_()
+from transformer_surgery.ops import GibbsTopKSoftmax
 
 
 def main() -> None:
@@ -68,15 +60,17 @@ def main() -> None:
         set_surgery_dtype(torch.float64)
         model, extra = load_surgery_student_checkpoint(os.path.abspath(path), cfg, surgery_dtype=torch.float64)
         model = model.to(device, torch.float64).eval()
+        for module in model.modules():
+            if isinstance(module, GibbsTopKSoftmax):
+                module.set_normalizer_epsilon(0.0)
         with torch.no_grad():
             y = model(x)
-            zero_softmax_eps(model)
-            y0 = model(x)
         name = os.path.basename(path)
         print(
             f"{name}: top_k={extra.get('top_k')} allow_matmul={extra.get('allow_matmul')} "
-            f"strict_unary={extra.get('strict_unary')} eps={extra.get('eps_ln')}; max|dlogit| {(y - r).abs().max().item():.2e}, "
-            f"softmax eps 0: {(y0 - r).abs().max().item():.2e}; argmax agreement {(y.argmax(-1) == r.argmax(-1)).float().mean().item():.3f}"
+            f"strict_unary={extra.get('strict_unary')} LayerNorm eps={extra.get('eps_ln')} softmax eps=0; "
+            f"max|dlogit| {(y - r).abs().max().item():.2e}; "
+            f"argmax agreement {(y.argmax(-1) == r.argmax(-1)).float().mean().item():.3f}"
         )
 
 

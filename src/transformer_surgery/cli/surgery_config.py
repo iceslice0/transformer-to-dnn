@@ -36,6 +36,7 @@ class SurgeryConfig:
     max_train_tokens: Optional[int] = None
     max_val_tokens: Optional[int] = None
     top_k: int = 32
+    # LayerNorm epsilon. Softmax normalization uses no additive epsilon.
     eps: float = 1e-5
     gibbs_tail_prob_eps: float = 1e-5
     gibbs_tail_calibration_batches: Optional[int] = 10
@@ -88,6 +89,7 @@ class SurgeryConfig:
 FIELD_HELP_SURGERY: Dict[str, str] = {
     "model_key": "Model adapter key. Default: deit_tiny_pet.",
     "reference_checkpoint": "Reference/teacher checkpoint path.",
+    "eps": "LayerNorm epsilon; softmax normalization always uses zero additive epsilon.",
     "gibbs_tail_prob_eps": "Initial omitted-tail probability mass; calibration overwrites per-block values.",
     "gibbs_tail_calibration_batches": "Training batches for Gibbs tail mass; JSON null uses the full train loader.",
     "disable_calib_gibbs_tail_prob": "Disable calibration/application of per-block Gibbs omitted-tail probability.",

@@ -1,9 +1,14 @@
 """Count unary (pointwise) evaluations of a surgery graph in one forward pass.
 
-Every ``NL*`` op module contributes the number of entries it outputs. The strict
+Every ``NL*`` op module contributes the number of entries it outputs. This is
+the raw module-label count. A basis-level count may classify the same kernel by
+the operation available in that basis: extended LayerNorm's ``NLSquare`` executes
+``x * x``, identical to ``AffineSelfHadamard``, and therefore counts as the
+Hadamard product ``x ⊙ x`` rather than as a unary evaluation in the extended
+basis. The strict
 :class:`~transformer_surgery.ops.RewrittenLayerNorm` splits signs with two ReLU evaluations per entry
 (``relu(u)``, ``relu(-u)``) in its deprecated log-domain form, which run through the routing alias and are added here. This is the
-pointwise work ``PW`` of the paper (Definition of pointwise work), measured on real inputs.
+raw pointwise count, measured on real inputs.
 """
 
 from __future__ import annotations

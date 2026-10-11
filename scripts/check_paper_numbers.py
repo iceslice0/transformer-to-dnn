@@ -45,9 +45,19 @@ def check_tables(PAPER: str, REPO: str, M: str) -> int:
             bad += 1; print(f"MISMATCH {where}: paper {got} expected {exp}")
     r2 = lambda x: round(x, 2)
     # Table 2
+    support = "topk"
     for cells in table_rows("tab:strict-fast"):
+        if cells[0].startswith("\\multicolumn"):
+            support = "routed" if "Routed" in cells[0] else "topk"
+            continue
         k = int(cells[0])
-        for off, n in ((1, f"topk{k}_fast"), (4, f"topk{k}_strict_sr"), (7, f"topk{k}_strict_sr_qc32")):
+        suffixes = (
+            ("fast", "hadamard_sr_gs", "strict_sr_gs", "strict_sr_gs_pol")
+            if support == "topk"
+            else ("fast_qc32", "hadamard_sr_gs_qc32", "strict_sr_gs_qc32", "strict_sr_gs_pol_qc32")
+        )
+        for off, suffix in zip((1, 4, 7, 10), suffixes):
+            n = f"topk{k}_{suffix}"
             if cells[off] == "--": cmp(f"T2 k={k} {n}", None, None if not os.path.exists(f"{M}/ts_surgery_{n}.json") else 1, 0); continue
             s = S(n)
             cmp(f"T2 k={k} {n} acc", num(cells[off])[0], 100*s["student_pre_ft_val_acc"], 0.005)
@@ -60,11 +70,12 @@ def check_tables(PAPER: str, REPO: str, M: str) -> int:
         c = J(f"ts_ptq_{k}_{mc}_8bit"); t = J(f"ts_ptq_{k}_{mt}_8bit")
         cmp(f"T3 k={k} {g} nodes", float(cells[3]), len(c["ptq_nodes"]), 0)
         cmp(f"T3 k={k} {g} PV", float(cells[1]), round(k/197, 2), 0.005)
-        a = r2(100*c["metrics"]["fp_val_acc"]); cmp(f"T3 k={k} {g} bf16", float(cells[4]), a, 0.005)
+        a_raw = 100*c["metrics"]["fp_val_acc"]; a = r2(a_raw); cmp(f"T3 k={k} {g} bf16", float(cells[4]), a, 0.005)
         cmp(f"T3 k={k} {g} bf16 = pertensor bf16", r2(100*t["metrics"]["fp_val_acc"]), a, 0.005)
-        b = r2(100*c["metrics"]["ptq_val_acc"]); bt = r2(100*t["metrics"]["ptq_val_acc"])
-        cmp(f"T3 k={k} {g} ptq", float(cells[5]), b, 0.005); cmp(f"T3 k={k} {g} d", num(cells[6])[0], r2(b-a), 0.005)
-        cmp(f"T3 k={k} {g} ptq-t", float(cells[7]), bt, 0.005); cmp(f"T3 k={k} {g} d-t", num(cells[8])[0], r2(bt-a), 0.005)
+        b_raw = 100*c["metrics"]["ptq_val_acc"]; bt_raw = 100*t["metrics"]["ptq_val_acc"]
+        b = r2(b_raw); bt = r2(bt_raw)
+        cmp(f"T3 k={k} {g} ptq", float(cells[5]), b, 0.005); cmp(f"T3 k={k} {g} d", num(cells[6])[0], r2(b_raw-a_raw), 0.005)
+        cmp(f"T3 k={k} {g} ptq-t", float(cells[7]), bt, 0.005); cmp(f"T3 k={k} {g} d-t", num(cells[8])[0], r2(bt_raw-a_raw), 0.005)
         if g == "strict": cmp(f"T3 k={k} bf16 = surgery gs acc", a, r2(100*S(f"topk{k}_strict_sr_gs")["student_pre_ft_val_acc"]), 0.005)
         else:
             d = D(k, "jeffreys"); cmp(f"T3 k={k} bf16 = best Jeffreys", a, r2(100*max(r['val_acc'] for r in d['student_post_distill_runs'])), 0.005)
@@ -119,15 +130,15 @@ def check_tables(PAPER: str, REPO: str, M: str) -> int:
             d = D(k, l); cmp(f"S3 k={k} {l} best", float(cells[off]), 100*max(r["val_acc"] for r in d["student_post_distill_runs"]), 0.005)
             mean, sd = num(cells[off+1]); cmp(f"S3 k={k} {l} mean", mean, 100*d["student_post_distill_val_acc_mean"], 0.005); cmp(f"S3 k={k} {l} sd", sd, 100*d["student_post_distill_val_acc_std"], 0.005)
     # S4 profile
-    R = json.load(open(f"{REPO}/artifacts/logs/profile_2026-10-10/profile_topk16_32_64.json"))
+    R = json.load(open(f"{REPO}/artifacts/logs/profile_gs_2026-10-10/profile.json"))
     by = {os.path.basename(r["checkpoint"]).replace("ts_surgery_", "").replace(".pt", ""): r["groups"] for r in R}
     gm = {"$\\mathrm{Score}$ ($QK^\\top$)": "Score (QK^T)", "$\\mathrm{Mix}$ ($PV$)": "Mix (PV)", "LayerNorm": "LayerNorm", "Top-$k$ softmax": "Softmax (top-k Gibbs)", "Centroid selection": "Routing (centroid select)", "Linear (qkv, proj)": "Linear (qkv, proj)", "MLP": "MLP"}
     for cells in table_rows("tab:s-profile"):
         g = gm[cells[0]]
-        for i, m in enumerate(("strict_sr", "strict_sr_qc32", "fast")):
+        for i, m in enumerate(("strict_sr_gs", "strict_sr_gs_qc32", "hadamard_sr_gs", "hadamard_sr_gs_qc32", "fast")):
             v = by[f"topk16_{m}"].get(g)
             cmp(f"S4 {g} {m} ms", None if cells[1+i] == "--" else float(cells[1+i]), v["ms_per_batch"] if v else None, 0.05)
-            cmp(f"S4 {g} {m} MiB", None if cells[4+i] == "--" else float(cells[4+i]), v["peak_extra_mib"] if v else None, 0.5)
+            cmp(f"S4 {g} {m} MiB", None if cells[6+i] == "--" else float(cells[6+i]), v["peak_extra_mib"] if v else None, 0.5)
     print(f"tables: checked {checked} cells, {bad} mismatches")
     return bad
 
@@ -179,13 +190,13 @@ def check_text(P: str, M: str) -> int:
     py = S("pythia_70m_topk128_fast_tailmass_exact"); claim("Pythia NLL 4.5496 vs 4.5496", f"{py['student_pre_ft_val_loss']:.4f}" == "4.5496" and f"{py['ref_val_loss']:.4f}" == "4.5496")
     gap = max(abs(acc(f"topk{k}_strict_sr") - acc(f"topk{k}_fast")) for k in (16, 32, 64, 197)); claim("strict within 1.6 of extended (Table 2)", gap <= 1.6, f"{gap:.2f}")
     le = [lat(f"topk{k}_fast") for k in KS]; claim("extended latency 0.94..1.01", f"{min(le):.2f}" == "0.94" and f"{max(le):.2f}" == "1.01", f"{min(le):.3f}..{max(le):.3f}")
-    ls = [lat(f"topk{k}_strict_sr") for k in (16, 32, 64, 197)]; claim("strict 3.3..6.3x", f"{min(ls):.1f}" == "3.3" and f"{max(ls):.1f}" == "6.3", f"{min(ls):.3f}..{max(ls):.3f}")
-    claim("12.2x memory at k=64", f"{mem('topk64_strict_sr')/mem('topk64_fast'):.1f}" == "12.2")
-    claim("strict 90.19 / ext 91.74 all keys", f"{acc('topk197_strict_sr'):.2f}" == "90.19")
-    g = [acc(f"topk{k}_strict_sr") - acc(f"topk{k}_strict_sr_gs") for k in (16, 32, 64, 197)]; claim("GELU 0.6..2.0 below", f"{min(g):.1f}" == "0.6" and f"{max(g):.1f}" == "2.0" and has("$2.0$ points below exact GELU"), ", ".join(f"{x:.2f}" for x in g))
+    ls = [lat(f"topk{k}_strict_sr_gs") for k in (16, 32, 64, 197)]; claim("strict 1.1..2.8x", f"{min(ls):.1f}" == "1.1" and f"{max(ls):.1f}" == "2.8", f"{min(ls):.3f}..{max(ls):.3f}")
+    claim("2.3x memory at k=64", f"{mem('topk64_strict_sr_gs')/mem('topk64_fast'):.1f}" == "2.3")
+    claim("strict 90.54 / ext 91.74 all keys", f"{acc('topk197_strict_sr_gs'):.2f}" == "90.54")
+    g = [acc(f"topk{k}_strict_sr") - acc(f"topk{k}_strict_sr_gs") for k in (16, 32, 64, 197)]; claim("GELU costs strict 0.7..2.0", f"{min(g):.1f}" == "0.7" and f"{max(g):.1f}" == "2.0" and has("strict graph $0.7$ to $2.0$ points"), ", ".join(f"{x:.2f}" for x in g))
     # PTQ ranges
-    def pt(k, m): x = json.load(open(f"{M}/ts_ptq_{k}_{m}_8bit.json"))["metrics"]; return round(100*x["ptq_val_acc"], 2) - round(100*x["fp_val_acc"], 2)
-    for m, lo, hi in (("strict_sr_gs", "-1.03", "+0.62"), ("strict_sr_gs_pertensor", "-0.73", "+0.60"), ("strict_sr", "-1.17", "+0.03"), ("strict_sr_pertensor", "-0.85", "-0.05")):
+    def pt(k, m): x = json.load(open(f"{M}/ts_ptq_{k}_{m}_8bit.json"))["metrics"]; return 100*(x["ptq_val_acc"] - x["fp_val_acc"])
+    for m, lo, hi in (("strict_sr_gs", "-0.68", "-0.03"), ("strict_sr_gs_pertensor", "-1.88", "+0.03"), ("strict_sr", "-0.84", "-0.41"), ("strict_sr_pertensor", "-0.84", "+0.03")):
         d = [pt(k, m) for k in (16, 32, 64, 197)]; claim(f"PTQ {m} {lo}..{hi}", f"{min(d):+.2f}" == lo and f"{max(d):+.2f}" == hi, ", ".join(f"{x:+.2f}" for x in d))
     d = [pt(k, m) for k in (16, 32, 64, 197) for m in ("fast_jeffreys", "fast_jeffreys_pertensor")]; claim("PTQ extended -2.9..-4.0", f"{max(d):.1f}" == "-2.9" and f"{min(d):.1f}" == "-4.0", f"{min(d):.2f}..{max(d):.2f}")
     # tail mass text
@@ -216,9 +227,9 @@ def check_text(P: str, M: str) -> int:
     claim("Pythia k=16,32 exact within 0.002 of drop at 2k", all(abs(pn(k, "tailmass_exact") - pn(2*k, "tailmass0")) <= 0.002 for k in (16, 32)), ", ".join(f"{pn(k,'tailmass_exact') - pn(2*k,'tailmass0'):+.4f}" for k in (16, 32)))
     # clustered
     pw = lambda n: S(n)["student_pointwise_per_input"]
-    claim("routed 1.23 vs 3.29, 341 vs 2941, 79.12 vs 86.02", f"{lat('topk16_strict_sr_qc32'):.2f}" == "1.23" and f"{lat('topk16_strict_sr'):.2f}" == "3.29" and f"{mem('topk16_strict_sr_qc32'):.0f}" == "341" and f"{acc('topk16_strict_sr_qc32'):.2f}" == "79.12")
-    claim("unary 3.5e7 vs 2.0e8", f"{pw('topk16_strict_sr_qc32'):.1e}" == "3.5e+07" and f"{pw('topk16_strict_sr'):.1e}" == "2.0e+08")
-    claim("k=32 routed 86.56 >= exact top-16 86.02; ~1/3 unary; ~1/5 memory", acc("topk32_strict_sr_qc32") >= acc("topk16_strict_sr"), f"unary ratio {pw('topk32_strict_sr_qc32')/pw('topk16_strict_sr'):.3f} mem ratio {mem('topk32_strict_sr_qc32')/mem('topk16_strict_sr'):.3f}")
+    claim("routed k=16: 148 vs 548 MB, 78.47 vs 83.97, latency 1.2x", f"{lat('topk16_strict_sr_gs_qc32'):.1f}" == "1.2" and f"{mem('topk16_strict_sr_gs_qc32'):.0f}" == "148" and f"{mem('topk16_strict_sr_gs'):.0f}" == "548" and f"{acc('topk16_strict_sr_gs_qc32'):.2f}" == "78.47" and f"{acc('topk16_strict_sr_gs'):.2f}" == "83.97")
+    claim("unary 2.4e7 vs 1.1e8", f"{pw('topk16_strict_sr_gs_qc32'):.1e}" == "2.4e+07" and f"{pw('topk16_strict_sr_gs'):.1e}" == "1.1e+08")
+    claim("k=32 routed 86.18 >= exact top-16 83.97; 37% unary; 42% memory", acc("topk32_strict_sr_gs_qc32") >= acc("topk16_strict_sr_gs") and round(pw("topk32_strict_sr_gs_qc32")/pw("topk16_strict_sr_gs"), 2) == 0.37 and round(mem("topk32_strict_sr_gs_qc32")/mem("topk16_strict_sr_gs"), 2) == 0.42, f"unary ratio {pw('topk32_strict_sr_gs_qc32')/pw('topk16_strict_sr_gs'):.3f} mem ratio {mem('topk32_strict_sr_gs_qc32')/mem('topk16_strict_sr_gs'):.3f}")
     print(f"text: {bad} claims failed")
     return bad
 

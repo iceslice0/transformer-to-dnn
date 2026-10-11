@@ -204,8 +204,8 @@ forcing distillation to absorb the bias into trainable parameters elsewhere.
 
 ## Transform 3: Softmax Replacement
 
-`GibbsTopKSoftmax(seq_len, top_k, eps, gibbs_tail_prob_eps, allow_matmul)` replaces dense softmax. It
-returns sparse probabilities on the top-k indices, the index tensor, and a tail-mass scalar
+`GibbsTopKSoftmax(seq_len, top_k, eps=0, gibbs_tail_prob_eps, allow_matmul)` replaces dense softmax.
+It returns sparse probabilities on the top-k indices, the index tensor, and a tail-mass scalar
 `q_tail`.
 
 Top-k selection, score stabilization, tail-sum aggregation, and logit normalization are exposed as
@@ -243,7 +243,10 @@ Normalization:
 - Fast: `top_probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(eps)(sum_exp))`, then
   `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`.
 
-`eps` is the normalizer floor used in `log(sum_exp + eps)` / `1/(sum_exp + eps)`.
+Every current model construction sets the softmax-normalizer `eps` to zero. The positive `eps`
+field in run configuration and checkpoint metadata belongs only to LayerNorm. The explicit
+`GibbsTopKSoftmax` argument and its stored buffers remain for compatibility with older nonzero-eps
+runs; those compatibility runs are not reported in the paper.
 `gibbs_tail_prob_eps` is an `nn.Parameter` initialized from config, saved in the checkpoint state
 dict, overwritten by calibration, and clamped to `[0, 1]` in `forward` before applying it as
 probability mass.
@@ -393,8 +396,8 @@ The surgery stage is expected to satisfy:
    `AffineContract` after `stack`, not inside opaque add modules.
 4. Calibration reports LN MSE, calibrated `gibbs_tail_prob_eps` values, and Gibbs-vs-naive Jeffreys
    metrics for the fixed probability tail behavior.
-5. `eps` is a fixed normalizer floor from config. `gibbs_tail_prob_eps` is a scalar module
-   parameter and does not multiply `exp(s_K)`.
+5. The run-config `eps` is the LayerNorm epsilon; the softmax-normalizer epsilon is zero.
+   `gibbs_tail_prob_eps` is a scalar module parameter and does not multiply `exp(s_K)`.
 6. The post-transform student validates reasonably close to the reference under the chosen
    flags.
 7. The CLI writes the checkpoint, metadata JSON, and before/after structure logs for the run
