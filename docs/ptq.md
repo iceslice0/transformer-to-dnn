@@ -39,12 +39,18 @@ fields are:
 - calibration uses the full training loader (aggregated streaming statistics; no sampled-batch cache).
 - selection fields: `wrap_linear_conv`, `wrap_affine`, `wrap_matmul`, `include_names`,
   `exclude_names`.
-- quantization fields: `weight_bits`, `activation_bits`, `affine_activation_bits`,
+- quantization fields: `weight_bits`, `activation_bits`, `compiled_accumulator_bits`,
   `matmul_activation_bits`, `per_output_channel`, `dequant_var_eps`.
-  Activation bit-widths split into three groups: `activation_bits` for
-  `Linear`/`Conv2d`, `affine_activation_bits` for surgery affine nodes (falls
-  back to `activation_bits` when unset), and `matmul_activation_bits` for
-  `AffineMatMul`/`AffineHadamard` (same fallback).
+  Bit widths of the integer codes entering each quantized node, in three groups: `activation_bits` for the
+  `Linear`/`Conv2d` layers inherited from the source model; `compiled_accumulator_bits` for the compiled
+  accumulators, the fixed affine nodes (`AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` and its
+  subclasses) that compilation introduces when it splits LayerNorm, softmax and attention; and
+  `matmul_activation_bits` for `AffineMatMul`/`AffineHadamard`. The last two fall back to `activation_bits` when
+  unset. In the strict graph the compiled accumulators hold squares and sums of squares, whose range exceeds 8 bits,
+  so the strict configs (`configs/ptq/*_strict*.json`) set `compiled_accumulator_bits=12`; every other config sets 8,
+  where it equals `activation_bits` and has no effect. The proxy accumulates every node exactly (fp32 on integer
+  codes), so none of these fields limits an accumulator's width. `affine_activation_bits` is the deprecated name and
+  is still accepted.
 - optional architecture overrides: `top_k`, `eps`.
 - `output`: desired checkpoint directory/name. The final filename is normalized from the tool and
   config name.
@@ -158,9 +164,10 @@ are checked through the same path downstream code uses.
 
 ## Results (Pet, 2026-10-10)
 
-Weights W8; every node input A8, except `affine_activation_bits=12` on the compiled affine nodes of the strict graph
+Weights W8; activations A8, except `compiled_accumulator_bits=12` on the compiled accumulators of the strict graph
 (`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (`strict_unary=sigmoid_rsqrt`, no exp and no
-log) before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
+log, norm expansion `strict_product="norm"`; final run 2026-10-11, `artifacts/logs/norm_construction_2026-10-10/run_final.log`)
+before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
 sigmoid and rsqrt that a CNN-class NPU runs (paper Table 3). Extended (fast) rows quantize the Jeffreys-distilled graph.
 Per-tensor rows keep the output bias per channel when the weight scale is a scalar, as in standard per-tensor PTQ.
 Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_2026-10-09/`. Results of the
@@ -168,14 +175,14 @@ log-domain strict graph with the old eps are in git history and in `artifacts/ba
 
 | k | graph | nodes | bf16 | PTQ per-channel | Δ | PTQ per-tensor | Δ |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 16 | strict | 331 | 86.02 | 84.85 | -1.17 | 85.17 | -0.85 |
-| 32 | strict | 331 | 88.88 | 88.83 | -0.05 | 88.53 | -0.35 |
-| 64 | strict | 331 | 90.32 | 90.16 | -0.16 | 90.27 | -0.05 |
-| 197 | strict | 319 | 90.19 | 90.22 | +0.03 | 89.72 | -0.47 |
-| 16 | strict, sigmoid GELU | 367 | 83.97 | 82.94 | -1.03 | 83.27 | -0.70 |
-| 32 | strict, sigmoid GELU | 367 | 87.57 | 87.16 | -0.41 | 88.17 | +0.60 |
-| 64 | strict, sigmoid GELU | 367 | 89.72 | 89.51 | -0.21 | 88.99 | -0.73 |
-| 197 | strict, sigmoid GELU | 355 | 88.80 | 89.42 | +0.62 | 89.04 | +0.24 |
+| 16 | strict | 343 | 85.96 | 85.12 | -0.84 | 85.12 | -0.84 |
+| 32 | strict | 343 | 89.13 | 88.69 | -0.44 | 88.66 | -0.46 |
+| 64 | strict | 343 | 90.68 | 90.27 | -0.41 | 90.32 | -0.35 |
+| 197 | strict | 331 | 91.25 | 90.76 | -0.49 | 91.28 | +0.03 |
+| 16 | strict, sigmoid GELU | 379 | 83.97 | 83.35 | -0.63 | 82.09 | -1.88 |
+| 32 | strict, sigmoid GELU | 379 | 87.60 | 87.57 | -0.03 | 87.63 | +0.03 |
+| 64 | strict, sigmoid GELU | 379 | 89.62 | 88.99 | -0.63 | 89.59 | -0.03 |
+| 197 | strict, sigmoid GELU | 367 | 90.54 | 89.86 | -0.68 | 90.13 | -0.41 |
 | 16 | extended | 246 | 88.58 | 85.50 | -3.08 | 84.57 | -4.01 |
 | 32 | extended | 246 | 90.19 | 86.73 | -3.46 | 87.19 | -3.00 |
 | 64 | extended | 246 | 91.17 | 87.52 | -3.65 | 88.14 | -3.03 |
@@ -183,5 +190,6 @@ log-domain strict graph with the old eps are in git history and in `artifacts/ba
 
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
 forward hooks on the `NL*` nodes (plus two ReLUs per entry for the log-domain strict LayerNorm). At full support the
-`sigmoid_rsqrt` strict DeiT-Tiny count is 373,512,197 per image = 12 x 31,116,544 (paper Table 1 block total) + 113,669
-(final LayerNorm).
+`sigmoid_rsqrt` strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (paper Table 1
+block total) + 76,042 (final LayerNorm). Surgery calibration (tail mass, centroids) uses unseeded augmented train batches,
+so two surgery runs of one config differ by up to 0.5 points (top-k) and 1.5 points (routed).

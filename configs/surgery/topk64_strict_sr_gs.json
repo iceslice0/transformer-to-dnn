@@ -17,6 +17,7 @@
   "allow_matmul": false,
   "strict_unary": "sigmoid_rsqrt",
   "gelu": "sigmoid",
+  "strict_product": "norm",
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk64_strict_sr_gs.pt",
   "log_dir": "artifacts/logs"
 }

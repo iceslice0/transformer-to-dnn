@@ -16,6 +16,7 @@
   "disable_softmax_replacement": false,
   "allow_matmul": false,
   "strict_unary": "log_exp",
+  "strict_product": "polarization",
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk1_strict.pt",
   "log_dir": "artifacts/logs"
 }

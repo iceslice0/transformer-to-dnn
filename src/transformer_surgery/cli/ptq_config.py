@@ -27,13 +27,20 @@ class PTQSurgeryConfig:
     include_names: List[str] = field(default_factory=list)
     exclude_names: List[str] = field(default_factory=list)
     weight_bits: int = 8
-    # Activation bit-widths by node group:
-    # - activation_bits: Linear / Conv2d
-    # - affine_activation_bits: surgery affine ops (falls back to activation_bits)
-    # - matmul_activation_bits: AffineMatMul / AffineHadamard (falls back to activation_bits)
+    # Bit widths of the integer codes that enter each quantized node, by node group:
+    # - activation_bits: Linear / Conv2d inherited from the source model.
+    # - compiled_accumulator_bits: the fixed affine nodes that compilation introduces when it splits the
+    #   Transformer-specific layers (LayerNorm, softmax, attention): AffineScale / AffineScaleBias /
+    #   AffineFixedMix / AffineContract, i.e. the accumulators of the compiled subgraphs. In the strict graph they hold
+    #   squares and sums of squares, whose range exceeds 8 bits, so strict configs set 12; it only has an effect when
+    #   wrap_affine is on and it differs from activation_bits (falls back to activation_bits when unset).
+    # - matmul_activation_bits: AffineMatMul / AffineHadamard (falls back to activation_bits).
+    # The proxy accumulates every node exactly (fp32 on integer codes); none of these is an accumulator width limit.
     activation_bits: int = 8
-    affine_activation_bits: Optional[int] = None
+    compiled_accumulator_bits: Optional[int] = None
     matmul_activation_bits: Optional[int] = None
+    # Deprecated name of compiled_accumulator_bits, still accepted from older configs.
+    affine_activation_bits: Optional[int] = None
     # For ``Linear``/``Conv2d``: **True** = per-output-channel symmetric weight scales (axis 0);
     # **False** = one global scale over the whole weight tensor (often destroys accuracy). Ignored for
     # affine/coeff (always one global weight scale) and for ``AffineMatMul``/``AffineHadamard`` (no weights). Output
@@ -50,6 +57,13 @@ class PTQSurgeryConfig:
     log_dir: str = "artifacts/logs"
     config_json_path: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.affine_activation_bits is not None:
+            if self.compiled_accumulator_bits is not None and self.compiled_accumulator_bits != self.affine_activation_bits:
+                raise ValueError("compiled_accumulator_bits and its deprecated alias affine_activation_bits disagree")
+            self.compiled_accumulator_bits = self.affine_activation_bits
+            self.affine_activation_bits = None
+
     @classmethod
     def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "PTQSurgeryConfig":
         return load_dataclass_from_json(cls, json_path, overrides)
@@ -62,6 +76,11 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",
     "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",
+    "compiled_accumulator_bits": (
+        "Bit width of the integer codes entering the compiled accumulators (fixed affine nodes introduced by splitting "
+        "LayerNorm, softmax and attention). Strict graph: 12, for its squares and sums of squares; elsewhere it equals "
+        "activation_bits. Not the Linear/Conv layers of the source model."
+    ),
     "dequant_var_eps": (
         "OLS affine-dequant variance threshold for Affine/MatMul kinds. Channels with "
         "var(acc) below this collapse to slope=0 (output equals the channel mean). "

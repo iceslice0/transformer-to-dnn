@@ -31,6 +31,7 @@ from transformer_surgery.internal.util import (
     namespace_from_mapping,
     namespace_to_mapping,
     save_model_checkpoint,
+    set_seed,
 )
 
 if TYPE_CHECKING:
@@ -102,6 +103,10 @@ def surgery(cfg: "SurgeryConfig") -> None:
     if cfg.config_json_path:
         log_line(f"config_json={cfg.config_json_path}")
 
+    calibration_seed = getattr(cfg, "calibration_seed", None)
+    if calibration_seed is not None:
+        set_seed(int(calibration_seed))
+    log_line(f"Calibration seed: {calibration_seed}")
     train_loader, val_loader = adapter.build_loaders(cfg)
 
     reference_path = adapter.reference_checkpoint_path(cfg)
@@ -141,6 +146,9 @@ def surgery(cfg: "SurgeryConfig") -> None:
     model = adapter.build_surgery_model(cfg).to(device=device, dtype=dtype)
     if bool(getattr(cfg, "hadamard", False)) and not bool(getattr(model, "hadamard", False)):
         raise ValueError(f"hadamard=True is implemented for DeiT-Tiny only, not {adapter.key}")
+    strict_graph = not bool(cfg.allow_matmul) and not bool(getattr(cfg, "hadamard", False))
+    if strict_graph and str(getattr(cfg, "strict_product", "norm")) != "polarization" and not hasattr(model, "strict_product"):
+        raise ValueError(f"strict_product={cfg.strict_product!r} is implemented for DeiT-Tiny only, not {adapter.key}")
     mapping = adapter.copy_reference_weights(model, ref)
     adapter.freeze_surgery_parameters(model)
 

@@ -1,10 +1,11 @@
 # Query-Centroid Support Routing (Pet DeiT-Tiny, Pythia-70M)
 
 Exact top-k needs all \(N^2\) scores before it selects \(k\) keys per query, so a strict graph pays
-polarization on the full score matrix even when it mixes only \(k\) values. Query-centroid routing
+squares on the full score matrix even when it mixes only \(k\) values. Query-centroid routing
 selects the support before any score is formed:
 
-- per block and head, k-means (k-means++ then 30 Lloyd iterations) fits \(C\) query centroids
+- per block and head, k-means (k-means++ then 30 Lloyd iterations; since 2026-10-11 the centroid update is a one-hot
+  contraction, not CUDA `scatter_add_`, so a run with `calibration_seed` repeats bitwise) fits \(C\) query centroids
   \(c_m\) on calibration queries (train split, `routing_calibration_batches` batches, at most
   `routing_max_samples` queries per head; after rotary for Pythia);
 - query \(i\) goes to its nearest centroid \(m(i)=\arg\max_m (q_i\cdot c_m-\|c_m\|^2/2)\);
@@ -13,8 +14,9 @@ selects the support before any score is formed:
 
 With fixed centroids both contractions are fixed affine maps (`AffineContract`) and the assignment and
 selection are routing (`RoutingTopK`, `RoutingGather`), so the router adds no unary evaluation and no
-activation-activation product (`QueryCentroidRouter` in `ops.py`). The strict cost of the score and
-mixing transforms becomes \(2hNkd\) each instead of \(2hN^2d\) and \(2hNkd\).
+activation-activation product (`QueryCentroidRouter` in `ops.py`). With the norm expansion (default
+`strict_product="norm"`) the strict cost of the score and mixing transforms becomes \(h(2Nkd+Nk+3Nd)\)
+unary evaluations instead of \(h(N^2d+Nkd+Nk+3Nd)\) with exact top-k (paper Proposition `prop:routed`).
 
 Calibrated mode uses the mean routed tail mass \(1-\sum_{j\in S}\pi_{ij}\) of the dense student on the
 same train batches as the top-k calibration (`gibbs_tail_calibration_batches`). Support statistics are
@@ -27,8 +29,8 @@ validation numbers on the dense student (all validation batches):
 
 With a calibrated or zero tail mass the routed graph forms only the selected scores
 (`QueryCentroidRouter.support` + `PairwiseDotBySquare.selected` + `GibbsTopKSoftmax.forward_selected`):
-each centroid keeps its top-k keys, each query gathers the list of its centroid, and polarization (strict)
-or a batched product (fast) runs on the gathered keys only. No `N x N` matrix is formed for ViT-style
+each centroid keeps its top-k keys, each query gathers the list of its centroid, and the norm expansion
+(strict) or a batched product (fast) runs on the gathered keys only. No `N x N` matrix is formed for ViT-style
 attention; under a causal mask the selection is taken per row from the masked `N x N` centroid scores
 (affine + routing, no products). Exact tail mass needs the dense normalizer and keeps dense scores.
 The sparse path equals the dense routed path exactly in the strict graph and to 1e-16 in the fast graph
@@ -38,9 +40,9 @@ Routed checkpoints reload: `load_surgery_student_checkpoint` re-creates the rout
 buffers (`install_routers_from_state_dict`).
 
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
-forward hooks on the `NL*` nodes plus the two ReLUs per entry of the strict LayerNorm. At full support the
-strict DeiT-Tiny count is 368,904,761 per image = 12 x 30,719,983 (paper Table 2 block total) + 264,965
-(final LayerNorm).
+forward hooks on the `NL*` nodes (plus two ReLUs per entry in the deprecated log-domain LayerNorm). At full
+support the strict DeiT-Tiny count with exact GELU is 196,498,438 per image (`topk197_strict_sr`, norm
+expansion) = 12 x 16,368,533 (paper Table 1 block total) + 76,042 (final LayerNorm).
 
 ## DeiT-Tiny / Pet
 
@@ -82,24 +84,26 @@ Per block, k=16, 32 centroids:
 ## Strict graph with routed support (DeiT-Tiny / Pet, calibrated mode, 32 centroids)
 
 Strict graph without exp and log (`strict_unary=sigmoid_rsqrt`, configs `topk{k}_strict_sr_qc32.json`, `make
-strict-sr`), each timed against the bf16 reference in its own run; strict top-k rows are the
-`topk{k}_strict_sr` runs of the same target. Unary evaluations per image from the hook count.
+strict-sr`), with the norm expansion (`strict_product="norm"`, final rerun 2026-10-10 23:07, `run_final.sh`; the polarization runs are in
+`artifacts/backup_polarization_2026-10-10/`), each timed against the bf16 reference in its own run; strict top-k rows
+are the `topk{k}_strict_sr` runs of the same target. Unary evaluations per image from the hook count.
 
 | k | top-k acc | routed acc | top-k latency | routed latency | top-k memory | routed memory | top-k unary/img | routed unary/img |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 86.02 | 79.12 | 3.29x | 1.23x | 2805 MiB | 326 MiB | 1.99e+08 | 3.46e+07 |
-| 32 | 88.88 | 86.56 | 3.55x | 1.41x | 2805 MiB | 591 MiB | 2.14e+08 | 6.46e+07 |
-| 64 | 90.32 | 89.48 | 3.86x | 2.46x | 2805 MiB | 1119 MiB | 2.45e+08 | 1.24e+08 |
+| 16 | 85.96 | 79.12 | 1.03x | 1.21x | 523 MiB | 141 MiB | 1.03e+08 | 2.06e+07 |
+| 32 | 89.13 | 86.29 | 1.12x | 1.14x | 523 MiB | 221 MiB | 1.11e+08 | 3.62e+07 |
+| 64 | 90.68 | 89.42 | 1.34x | 1.16x | 523 MiB | 380 MiB | 1.28e+08 | 6.73e+07 |
 
-The routed unary count per image equals `12 (4hNkd + 2(3N d_model + N) + 8hNk + 2hN + 4N d_model) + 3N d_model + N`
-exactly at every k (paper Table 1 and Proposition 4): 34,628,069 / 64,584,677 / 124,497,893 at k = 16 / 32 / 64.
-With the sigmoid GELU (`*_strict_sr_gs_qc32`) the routed graph reaches 77.02 / 85.64 / 88.72%.
+The routed unary count per image equals `12 (h(2Nkd + 9Nk + 3Nd + 2N) + 8N d_model + 4N) + 2N d_model + 2N`
+exactly at every k (paper Table 1 and Proposition `prop:routed`): 20,638,114 / 36,183,778 / 67,275,106 at
+k = 16 / 32 / 64. With the sigmoid GELU (`*_strict_sr_gs_qc32`) the routed graph reaches 78.47 / 86.18 / 88.96%. Two runs of one config differ by up
+to 0.5 points with top-k and 1.5 points routed: q and the centroids are calibrated on unseeded augmented train batches.
 
 Same-session bench (`make routing-strict-bench`, `scripts/bench_strict_routing.py`, one warm-up pass per
-graph, bf16 reference; log `artifacts/logs/routing_2026-10-10/bench_routing_strict.log`): strict top-k 3.35x /
-3.62x / 4.15x, strict routed 1.25x / 1.36x / 2.39x at k = 16 / 32 / 64
-(`artifacts/metadata/routing_strict_sr_bench.json`). Fast (extended) graph: top-k 1.02x / 1.06x / 1.02x, routed
-1.05x / 1.03x / 1.03x, peak memory 96 / 137 / 219 MB against 92 / 135 / 222 MB, same unary work
+graph, bf16 reference; log `artifacts/logs/norm_construction_2026-10-10/run_final.log`, 2026-10-11 01:49): strict
+top-k 1.17x / 1.34x / 1.67x, strict routed 1.21x / 1.21x / 1.29x at k = 16 / 32 / 64
+(`artifacts/metadata/routing_strict_sr_bench.json`). Fast (extended) graph: top-k 1.00x / 1.03x / 1.01x, routed
+1.01x / 1.02x / 1.00x, peak memory 101 / 144 / 230 MB against 97 / 142 / 233 MB, same unary work
 (`artifacts/metadata/routing_fast_bench.json`). The extended graph keeps scores on the MAC array; at N=197 the
 score contractions are a small part of a block, so routing changes neither latency nor memory there.
 Per-module profile with the routed checkpoints: `docs/profile.md`.

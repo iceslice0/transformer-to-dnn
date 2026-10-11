@@ -247,6 +247,119 @@ class PackageSmokeTests(unittest.TestCase):
         finally:
             set_surgery_dtype(torch.bfloat16)
 
+    def test_norm_expansion_strict_products_match_reference(self) -> None:
+        import torch
+
+        from transformer_surgery.internal.util import set_surgery_dtype
+        from transformer_surgery.ops import (
+            AffineCombine,
+            NormExpansionProduct,
+            PairwiseDotBySquare,
+            RewrittenLayerNorm,
+            SparseWeightedSumBySquare,
+            SurgeryAttention,
+            check_strict_product,
+            set_inplace_eval,
+        )
+
+        def squares(mod, *args):
+            n = [0]
+            hs = [m.register_forward_hook(lambda _m, _i, out: n.__setitem__(0, n[0] + out.numel()))
+                  for m in mod.modules() if type(m).__name__ == "NLSquare"]
+            mod(*args)
+            for hk in hs:
+                hk.remove()
+            return n[0]
+
+        set_surgery_dtype(torch.float64)
+        try:
+            torch.manual_seed(0)
+            b, h, nq, nk, d, kk = 2, 2, 5, 7, 6, 3
+            q, k = torch.randn(b, h, nq, d, dtype=torch.float64), torch.randn(b, h, nk, d, dtype=torch.float64)
+            idx = torch.randint(0, nk, (b, h, nq, kk))
+            probs = torch.rand(b, h, nq, kk, dtype=torch.float64)
+            v = torch.randn(b, h, nk, d, dtype=torch.float64)
+            x = torch.randn(2, 7, 12, dtype=torch.float64) * 3 + 1
+            dot_f, dot_n = PairwiseDotBySquare(d, allow_matmul=True), PairwiseDotBySquare(d)
+            mix_f, mix_n = SparseWeightedSumBySquare(allow_matmul=True), SparseWeightedSumBySquare()
+            ln_ref, ln_n = torch.nn.LayerNorm(12, eps=1e-3).double(), RewrittenLayerNorm(12, eps=1e-3).double()
+            prod = NormExpansionProduct()
+            a_, b_ = torch.randn(b, h, 1, d, dtype=torch.float64), torch.rand(b, h, nq, 1, dtype=torch.float64)
+            for inplace in (True, False):  # in-place evaluation (default) and the PTQ setting
+                set_inplace_eval(inplace)
+                for grad in (True, False):
+                    with torch.set_grad_enabled(grad):
+                        self.assertTrue(torch.allclose(dot_f(q, k), dot_n(q, k), atol=1e-10))
+                        self.assertTrue(torch.allclose(dot_f.selected(q, k, idx), dot_n.selected(q, k, idx), atol=1e-10))
+                        self.assertTrue(torch.allclose(mix_f(probs, idx, v), mix_n(probs, idx, v), atol=1e-10))
+                        self.assertTrue(torch.allclose(ln_ref(x), ln_n(x), atol=1e-10))
+                        self.assertTrue(torch.allclose(prod(a_, b_), a_ * b_, atol=1e-10))
+            set_inplace_eval(True)
+            # Squares of the construction: N_q N_k d + (N_q + N_k) d for the scores, N_q k d + N_q k + N_k d for the
+            # mix, 2 n D + n for a LayerNorm of n tokens of width D, and N D + N + D for the broadcast product.
+            self.assertEqual(squares(dot_n, q, k) // (b * h), nq * nk * d + (nq + nk) * d)
+            self.assertEqual(squares(mix_n, probs, idx, v) // (b * h), nq * kk * d + nq * kk + nk * d)
+            self.assertEqual(squares(ln_n, x), 2 * x.numel() + x.numel() // 12)
+            self.assertEqual(squares(prod, a_, b_) // (b * h), nq * d + nq + d)
+            # PTQ swaps quantized coefficients into ``coeff``; the cached copies must follow.
+            comb = AffineCombine([1.0, -1.0])
+            y = torch.randn(4, dtype=torch.float64)
+            self.assertTrue(torch.allclose(comb(y, y), torch.zeros(4, dtype=torch.float64)))
+            comb.coeff = torch.tensor([2.0, -1.0])
+            self.assertTrue(torch.allclose(comb(y, y), y))
+            for exact in (False, True):
+                for top_k in (3, 7):
+                    torch.manual_seed(1)
+                    kw = dict(dim=12, num_heads=2, seq_len=7, top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                    fast = SurgeryAttention(allow_matmul=True, **kw).double()
+                    for product in ("norm", "polarization"):
+                        strict = SurgeryAttention(strict_product=product, **kw).double()
+                        strict.load_state_dict(fast.state_dict(), strict=False)
+                        with torch.no_grad():
+                            self.assertTrue(torch.allclose(fast(x), strict(x), atol=1e-9))
+            self.assertEqual(check_strict_product("norm", allow_matmul=True), "polarization")
+            with self.assertRaises(ValueError):
+                check_strict_product("norm_term", allow_matmul=False)
+        finally:
+            set_inplace_eval(True)
+            set_surgery_dtype(torch.bfloat16)
+
+    def test_kmeans_repeats_bitwise_under_one_seed(self) -> None:
+        # The centroid update must not use float atomics (CUDA scatter_add_), so a seeded routed run repeats.
+        import torch
+
+        from transformer_surgery.internal.routing import kmeans_per_head
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x = torch.randn(2, 4096, 16, device=dev)
+        cents = []
+        for _ in range(2):
+            g = torch.Generator(device=dev)
+            g.manual_seed(0)
+            cents.append(kmeans_per_head(x, 8, 10, g)["centroids"])
+        self.assertTrue(torch.equal(cents[0], cents[1]))
+
+    def test_affine_combine_keeps_dtype_of_first_input(self) -> None:
+        # Under autocast a mean or sum is fp32 while its sibling input is bf16; the fused first add must store the
+        # result like the in-place sum, in the dtype of x_0, bitwise (strict LayerNorm add_u_invstd, Score sum_qk).
+        import torch
+
+        from transformer_surgery.ops import AffineCombine, set_inplace_eval
+
+        u = torch.randn(2, 5, 8).to(torch.bfloat16)
+        s = torch.rand(2, 5, 1, dtype=torch.float32) + 0.5
+        ref = u * 1.0
+        ref.add_(s, alpha=-0.75)
+        try:
+            for inplace in (True, False):
+                set_inplace_eval(inplace)
+                with torch.no_grad():
+                    y = AffineCombine([1.0, -0.75])(u.clone(), s)
+                self.assertEqual(y.dtype, torch.bfloat16)
+                self.assertTrue(torch.equal(y, ref))
+        finally:
+            set_inplace_eval(True)
+
     def test_gibbs_exact_tail_mass_matches_dense_omitted(self) -> None:
         import torch
 
@@ -361,7 +474,7 @@ class PackageSmokeTests(unittest.TestCase):
                 stats["0"],
                 weight_bits=8,
                 activation_bits=8,
-                affine_activation_bits=None,
+                compiled_accumulator_bits=None,
                 matmul_activation_bits=None,
                 per_output_channel=False,
             )
@@ -411,7 +524,7 @@ class PackageSmokeTests(unittest.TestCase):
         cfg = SimpleNamespace(
             weight_bits=8,
             activation_bits=8,
-            affine_activation_bits=None,
+            compiled_accumulator_bits=None,
             matmul_activation_bits=None,
             per_output_channel=True,
             dequant_var_eps=1e-8,
@@ -422,7 +535,7 @@ class PackageSmokeTests(unittest.TestCase):
             data,
             weight_bits=cfg.weight_bits,
             activation_bits=cfg.activation_bits,
-            affine_activation_bits=cfg.affine_activation_bits,
+            compiled_accumulator_bits=cfg.compiled_accumulator_bits,
             matmul_activation_bits=cfg.matmul_activation_bits,
             per_output_channel=cfg.per_output_channel,
         )
@@ -457,31 +570,31 @@ class PackageSmokeTests(unittest.TestCase):
         # Linear/Conv keep activation_bits even when affine override is set.
         self.assertEqual(
             ptq_activation_bits_for_kind(
-                "linear", 8, affine_activation_bits=12, matmul_activation_bits=8
+                "linear", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
             ),
             8,
         )
         self.assertEqual(
             ptq_activation_bits_for_kind(
-                "conv2d", 8, affine_activation_bits=12, matmul_activation_bits=8
+                "conv2d", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
             ),
             8,
         )
         self.assertEqual(
             ptq_activation_bits_for_kind(
-                "affine_scale", 8, affine_activation_bits=12, matmul_activation_bits=8
+                "affine_scale", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
             ),
             12,
         )
         self.assertEqual(
             ptq_activation_bits_for_kind(
-                "matmul", 8, affine_activation_bits=12, matmul_activation_bits=8
+                "matmul", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
             ),
             8,
         )
         self.assertEqual(
             ptq_activation_bits_for_kind(
-                "affine_scale", 8, affine_activation_bits=None, matmul_activation_bits=None
+                "affine_scale", 8, compiled_accumulator_bits=None, matmul_activation_bits=None
             ),
             8,
         )

@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -69,7 +69,9 @@ PYTHIA_ROUTING_TARGETS := $(foreach k,$(PYTHIA_ROUTING_KS),$(foreach m,_qc32_tai
 
 STRICT_ROUTING_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_qc32.pt)
 
-# Strict graph without exp and log (strict_unary=sigmoid_rsqrt: squares, sigmoid, inverse square root),
+# Strict graph without exp and log (strict_unary=sigmoid_rsqrt: squares, sigmoid, inverse square root) and with the
+# default strict products (strict_product=norm: norm expansion where a square is shared, polarization elsewhere; the
+# polarization-only runs are in artifacts/backup_polarization_2026-10-10/),
 # with exact GELU (_sr) or GELU ~ x*sigmoid(1.702x) (_sr_gs), routed strict variants, and PTQ of the
 # new strict graphs. The extended graph keeps exact GELU: NPUs with the extended basis implement it.
 SR_KS := 16 32 64 197
@@ -138,16 +140,30 @@ hadamard-sr: $(HADAMARD_SR_TARGETS)
 PROFILE_HADAMARD_LOG := artifacts/logs/profile_hadamard_gs_2026-10-10
 PROFILE_HADAMARD_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_hadamard_sr_gs.pt) \
 	artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk16_fast.pt
-# Paper Table S4 in one profiling session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), the
-# routed strict graph, and the extended graph with exact GELU (k=16,32,64 for the strict and extended shares).
+# Paper Table S4 in one profiling session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), top-k and
+# routed, and the extended graph with exact GELU (k=16,32,64 for the strict and extended shares).
 PROFILE_GS_LOG := artifacts/logs/profile_gs_2026-10-10
 PROFILE_GS_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs.pt) \
 	artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs_qc32.pt artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs.pt \
+	artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs_qc32.pt \
 	$(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
 profile-gs: $(PROFILE_GS_CKPTS)
 	mkdir -p $(PROFILE_GS_LOG)
 	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json" > $(PROFILE_GS_LOG)/command.txt
 	$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json | tee $(PROFILE_GS_LOG)/profile.log
+
+# Polarization baseline of Table 2: the strict graph with polarization for every product (strict_product=polarization,
+# per-term mix), GELU ~ x*sigmoid(1.702x), top-k and routed support.
+STRICT_POL_TARGETS := $(foreach k,$(SR_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs_pol.pt) \
+	$(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs_pol_qc32.pt)
+strict-pol: $(STRICT_POL_TARGETS)
+
+# bf16 error of the strict value mix on real inputs: polarization, norm expansion with partial sums, the default
+# per-term construction, and the per-term construction with a balanced operand scale (paper Supplementary).
+MIX_PRECISION_LOG := artifacts/logs/mix_precision_2026-10-10
+mix-precision: artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
+	mkdir -p $(MIX_PRECISION_LOG)
+	$(PYTHON) scripts/mix_precision.py 16 197 | tee $(MIX_PRECISION_LOG)/mix_precision.log
 
 profile-hadamard: $(PROFILE_HADAMARD_CKPTS)
 	mkdir -p $(PROFILE_HADAMARD_LOG)
@@ -198,6 +214,8 @@ help:
 	@echo "  make exact-fp64-hadamard # float64 check of the Hadamard graph (k=197)"
 	@echo "  make profile-hadamard # per-module GPU profile of the Hadamard graph (k=16,32,64)"
 	@echo "  make profile-gs   # Table S4 profile: strict/Hadamard with GELU approx, routed strict, extended"
+	@echo "  make mix-precision # bf16 error of the strict value mix: polarization vs squares (paper Supplementary)"
+	@echo "  make strict-pol   # Table 2 polarization baseline (strict_product=polarization), top-k and routed"
 	@echo "  make all    # Run all sections"
 
 # Surgery checkpoints rebuild when surgery JSON changes.

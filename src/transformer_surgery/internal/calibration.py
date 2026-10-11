@@ -862,7 +862,7 @@ def ptq_activation_bits_for_kind(
     kind: str,
     activation_bits: int,
     *,
-    affine_activation_bits: Optional[int] = None,
+    compiled_accumulator_bits: Optional[int] = None,
     matmul_activation_bits: Optional[int] = None,
 ) -> int:
     """Resolve activation bit-width for a PTQ node kind.
@@ -870,14 +870,15 @@ def ptq_activation_bits_for_kind(
     Three groups:
     - ``linear`` / ``conv2d`` → ``activation_bits``
     - matmul kinds → ``matmul_activation_bits`` if set, else ``activation_bits``
-    - surgery affine kinds → ``affine_activation_bits`` if set, else ``activation_bits``
+    - compiled accumulators (the fixed affine kinds introduced by compilation) → ``compiled_accumulator_bits`` if set,
+      else ``activation_bits``
     """
     default_bits = int(activation_bits)
     if kind in PTQ_LINEAR_KINDS:
         return default_bits
     if kind in PTQ_MATMUL_KINDS:
         return int(matmul_activation_bits) if matmul_activation_bits is not None else default_bits
-    return int(affine_activation_bits) if affine_activation_bits is not None else default_bits
+    return int(compiled_accumulator_bits) if compiled_accumulator_bits is not None else default_bits
 
 
 @dataclass
@@ -1058,6 +1059,9 @@ def observe_ptq_dequant(
     batch_idx: int,
 ) -> None:
     q_inputs = [ptq_quantize_proxy(inp, setup.input_scale[i], setup.activation_bits) for i, inp in enumerate(inputs)]
+    if getattr(module, "ptq_dequantized_inputs", False):
+        # Several inputs on different grids (AffineCombine): rescale each code by its own input scale before the sum.
+        q_inputs = [q * setup.input_scale[i].to(device=q.device) for i, q in enumerate(q_inputs)]
     acc = _accumulator_forward(
         module,
         setup.kind,
@@ -1200,7 +1204,7 @@ def build_ptq_node_setup(
     *,
     weight_bits: int,
     activation_bits: int,
-    affine_activation_bits: Optional[int] = None,
+    compiled_accumulator_bits: Optional[int] = None,
     matmul_activation_bits: Optional[int] = None,
     per_output_channel: bool = True,
 ) -> PTQNodeSetup:
@@ -1210,7 +1214,7 @@ def build_ptq_node_setup(
     act_bits = ptq_activation_bits_for_kind(
         kind,
         activation_bits,
-        affine_activation_bits=affine_activation_bits,
+        compiled_accumulator_bits=compiled_accumulator_bits,
         matmul_activation_bits=matmul_activation_bits,
     )
     weight_axis_used: Optional[int] = None

@@ -53,7 +53,7 @@ def kmeans_per_head(
     x: torch.Tensor, clusters: int, iters: int, generator: torch.Generator
 ) -> Dict[str, torch.Tensor]:
     """k-means++ then Lloyd iterations, batched over heads. ``x``: [H, n, D] float32."""
-    h, n, d = x.shape
+    h, n, _ = x.shape
     c_count = min(int(clusters), n)
     heads = torch.arange(h, device=x.device)
     first = torch.randint(n, (h,), device=x.device, generator=generator)
@@ -67,16 +67,16 @@ def kmeans_per_head(
         d2 = torch.minimum(d2, (x - c_new).pow(2).sum(-1))
     cent = torch.cat(cents, dim=1)
     x_sq = x.pow(2).sum(-1, keepdim=True)
-    ones = torch.ones((h, n), device=x.device, dtype=x.dtype)
     for _ in range(int(iters)):
         dist = x_sq - 2.0 * torch.einsum("hnd,hcd->hnc", x, cent) + cent.pow(2).sum(-1).unsqueeze(1)
-        assign = dist.argmin(-1)
-        sums = torch.zeros_like(cent).scatter_add_(1, assign.unsqueeze(-1).expand(-1, -1, d), x)
-        counts = torch.zeros((h, c_count), device=x.device, dtype=x.dtype).scatter_add_(1, assign, ones)
+        # One-hot contraction instead of scatter_add_: CUDA scatter_add_ sums with atomics in no fixed order, so
+        # the centroids, and the routed runs, would change from run to run under the same seed.
+        onehot = torch.nn.functional.one_hot(dist.argmin(-1), c_count).to(x.dtype)
+        sums = torch.einsum("hnc,hnd->hcd", onehot, x)
+        counts = onehot.sum(1)
         cent = torch.where(counts.unsqueeze(-1) > 0, sums / counts.clamp_min(1.0).unsqueeze(-1), cent)
     dist = x_sq - 2.0 * torch.einsum("hnd,hcd->hnc", x, cent) + cent.pow(2).sum(-1).unsqueeze(1)
-    assign = dist.argmin(-1)
-    counts = torch.zeros((h, c_count), device=x.device, dtype=x.dtype).scatter_add_(1, assign, ones)
+    counts = torch.nn.functional.one_hot(dist.argmin(-1), c_count).to(x.dtype).sum(1)
     q_sq = x_sq.squeeze(-1).mean(-1)
     inertia = dist.min(-1).values.clamp_min(0.0).mean(-1)
     return {

@@ -22,6 +22,7 @@ from transformer_surgery.models.adapters import (
     surgery_dtype_from_extra,
 )
 from transformer_surgery.ops import (
+    set_inplace_eval,
     AffineContract,
     AffineFixedMix,
     AffineHadamard,
@@ -133,7 +134,7 @@ def _build_ptq_setup(name: str, module: nn.Module, stats: PTQNodeStats, cfg: Any
         stats,
         weight_bits=int(cfg.weight_bits),
         activation_bits=int(cfg.activation_bits),
-        affine_activation_bits=cfg.affine_activation_bits,
+        compiled_accumulator_bits=cfg.compiled_accumulator_bits,
         matmul_activation_bits=cfg.matmul_activation_bits,
         per_output_channel=bool(cfg.per_output_channel),
     )
@@ -188,6 +189,7 @@ def _build_ptq_model(
 
 def load_ptq_checkpoint(path: str, cfg: Any) -> Tuple[nn.Module, Dict[str, Any]]:
     """Load a PTQ checkpoint: rebuild the surgery template, install skeleton PTQ modules, then load_state_dict."""
+    set_inplace_eval(False)
     device = get_device()
     payload = torch.load(path, map_location=device, weights_only=False)
     extra_ns = namespace_from_mapping(dict(payload["extra"]))
@@ -237,15 +239,15 @@ def _ptq_summary(
                 ptq_activation_bits_for_kind(
                     "linear",
                     cfg.activation_bits,
-                    affine_activation_bits=cfg.affine_activation_bits,
+                    compiled_accumulator_bits=cfg.compiled_accumulator_bits,
                     matmul_activation_bits=cfg.matmul_activation_bits,
                 )
             ),
-            "affine_activation_bits": int(
+            "compiled_accumulator_bits": int(
                 ptq_activation_bits_for_kind(
                     "affine_scale",
                     cfg.activation_bits,
-                    affine_activation_bits=cfg.affine_activation_bits,
+                    compiled_accumulator_bits=cfg.compiled_accumulator_bits,
                     matmul_activation_bits=cfg.matmul_activation_bits,
                 )
             ),
@@ -253,7 +255,7 @@ def _ptq_summary(
                 ptq_activation_bits_for_kind(
                     "matmul",
                     cfg.activation_bits,
-                    affine_activation_bits=cfg.affine_activation_bits,
+                    compiled_accumulator_bits=cfg.compiled_accumulator_bits,
                     matmul_activation_bits=cfg.matmul_activation_bits,
                 )
             ),
@@ -282,6 +284,8 @@ def run_ptq(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> None:
+    # PTQ calibration reads node inputs in forward hooks after the node has run, so no node may overwrite them.
+    set_inplace_eval(False)
     device = get_device() if device is None else device
     out_abs = traceable_artifact_path(cfg.output, cfg, "ts-ptq", "", ".pt")
     meta_abs = metadata_path_for_checkpoint(out_abs)

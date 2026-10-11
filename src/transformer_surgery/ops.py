@@ -165,10 +165,29 @@ class NLLogPlusEps(nn.Module):
         return torch.log(x + e)
 
 
+# In-place evaluation of full-size intermediates (strict graph): on by default, used only when gradients are off.
+# PTQ turns it off, since its calibration reads node inputs in forward hooks after the node has run.
+_INPLACE_EVAL = [True]
+
+
+def set_inplace_eval(enabled: bool) -> None:
+    _INPLACE_EVAL[0] = bool(enabled)
+
+
+def _inplace_ok(flag: bool) -> bool:
+    return bool(flag) and _INPLACE_EVAL[0] and not torch.is_grad_enabled()
+
+
 class NLSquare(nn.Module):
-    """Unary square ``x * x``."""
+    """Unary square ``x * x``; ``inplace=True`` squares a fresh tensor in place during evaluation."""
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = bool(inplace)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _inplace_ok(self.inplace):
+            return x.square_()
         return x * x
 
 
@@ -214,6 +233,24 @@ def check_strict_unary(strict_unary: str) -> str:
     if value not in STRICT_UNARY_SETS:
         raise ValueError(f"strict_unary must be one of {STRICT_UNARY_SETS}, got {value!r}")
     return value
+
+
+# Products of two activations in the strict graph.
+# "norm" (default, the paper's strict construction): ab = ((a+b)^2 - a^2 - b^2)/2 wherever a^2 or b^2 is shared, so
+# it costs one new square per product: the scores ( sum_l (q+k)^2 - |q|^2 - |k|^2 ) / (2 sqrt d), the mix
+# ( sum_k (v^2 - (v-p)^2) + sum_k p^2 ) / 2 with the two close squares subtracted per term before the sum over keys,
+# LayerNorm ((u+a)^2 - u^2 - a^2)/2 with u^2 from the variance, and the exact tail term. Polarization stays where it
+# is cheaper (isolated products: softmax, the GELU approximation).
+# "polarization": every product as ((a+b)^2-(a-b)^2)/4, kept to reload and reproduce earlier runs.
+STRICT_PRODUCTS = ("norm", "polarization")
+
+
+def check_strict_product(strict_product: str, *, allow_matmul: bool, hadamard: bool = False) -> str:
+    """The product rule of the strict graph; graphs with activation-activation products ignore it."""
+    value = str(strict_product)
+    if value not in STRICT_PRODUCTS:
+        raise ValueError(f"strict_product must be one of {STRICT_PRODUCTS}, got {value!r}")
+    return "polarization" if (allow_matmul or hadamard) else value
 
 
 def check_hadamard(hadamard: bool, *, allow_matmul: bool, strict_unary: str = "sigmoid_rsqrt") -> bool:
@@ -290,6 +327,89 @@ class AffineContract(nn.Module):
         return torch.einsum(self.einsum_equation, c, x)
 
 
+class AffineCombine(AffineContract):
+    """
+    Fixed affine combination ``sum_i c_i x_i`` of several inputs, evaluated in input order and broadcast to the
+    shape of ``x_0``, with an optional sum of ``x_0`` over ``reduce_first`` before combining and of the result over
+    ``reduce_out`` after. It is an :class:`AffineContract` (coefficients in ``coeff``), so PTQ quantizes every input
+    and accumulates the combination in one node. ``inplace=True`` writes into a fresh ``x_0`` during evaluation.
+
+    The inputs differ in scale (for example ``v`` and ``p``, or ``u^2`` and ``inv_std^2``), so under PTQ each input is
+    quantized on its own grid and rescaled before the sum, as an integer Add with per-input multipliers does
+    (``ptq_dequantized_inputs``): the accumulator receives code times scale, not the bare codes.
+    """
+
+    ptq_dequantized_inputs = True
+
+    def __init__(
+        self,
+        coeffs,
+        *,
+        reduce_first: Optional[int] = None,
+        reduce_out: Optional[int] = None,
+        inplace: bool = False,
+    ) -> None:
+        super().__init__("combine", torch.tensor(coeffs, dtype=torch.float32))
+        self.reduce_first = reduce_first
+        self.reduce_out = reduce_out
+        self.inplace = bool(inplace)
+        self._coeff_key: Optional[Tuple[int, int]] = None
+        self._coeff_vals: list = []
+
+    def _coefficients(self) -> list:
+        # Python copies of ``coeff``, refreshed when PTQ swaps in quantized coefficients or the buffer moves.
+        c = self.coeff
+        key = (c.data_ptr(), c._version)
+        if key != self._coeff_key:
+            self._coeff_vals = [float(v) for v in c.detach().float().cpu().tolist()]
+            self._coeff_key = key
+        return self._coeff_vals
+
+    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+        c = self._coefficients()
+        x0 = xs[0] if self.reduce_first is None else xs[0].sum(dim=self.reduce_first)
+        if torch.is_grad_enabled():
+            y = x0 * c[0]
+            for x, ci in zip(xs[1:], c[1:]):
+                y = torch.add(y, x, alpha=ci)
+        else:
+            start = 1
+            if _inplace_ok(self.inplace or self.reduce_first is not None):
+                y = x0 if c[0] == 1.0 else x0.mul_(c[0])
+            elif c[0] == 1.0 and len(xs) > 1:
+                # One fused pass for the first two inputs, stored in the dtype of x_0 like the in-place sum: under
+                # autocast a plain torch.add would promote a bf16 x_0 plus an fp32 x_1 (a mean or sum) to fp32.
+                y = torch.empty(torch.broadcast_shapes(x0.shape, xs[1].shape), dtype=x0.dtype, device=x0.device)
+                torch.add(x0, xs[1], alpha=c[1], out=y)
+                start = 2
+            else:
+                y = x0 * c[0]
+            for x, ci in zip(xs[start:], c[start:]):
+                y.add_(x, alpha=ci)  # y is this node's own tensor, so accumulating in place is safe
+        return y if self.reduce_out is None else y.sum(dim=self.reduce_out)
+
+
+class NormExpansionProduct(nn.Module):
+    """
+    Product of two broadcast activations ``a * b = ((a+b)^2 - a^2 - b^2) / 2``: the squares of the small operands
+    are formed once, so a product of shapes ``[.., 1, D]`` and ``[.., N, 1]`` costs ``N D + N + D`` squares against
+    ``2 N D`` by polarization.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.add = AffineCombine([1.0, 1.0])
+        self.square = NLSquare(inplace=True)
+        self.square_a = NLSquare()
+        self.square_b = NLSquare()
+        self.combine = AffineCombine([0.5, -0.5, -0.5], inplace=True)
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a_full, b_full = RoutingBroadcastTensors(a, b)
+        s = self.square(self.add(a_full, b_full))
+        return self.combine(s, self.square_a(a), self.square_b(b))
+
+
 class SquareIdentityOperandChain(nn.Module):
     """
     ``((a+b)^2-(a-b)^2)/4`` as operand stack, fixed 2x2 mix, square, coeff contraction.
@@ -316,6 +436,22 @@ class SquareIdentityOperandChain(nn.Module):
         pm = pm.to(torch.result_type(a, b))
         sq = self.square(pm)
         return self.out_contract(sq)
+
+
+class AffineContractPerTerm(AffineContract):
+    """
+    :class:`AffineContract` that combines the operand channel per term and then sums over ``sum_dim``: the einsum
+    ``p,...kpd->...kd`` followed by a sum over the keys. Polarization in a contraction then subtracts its two squares
+    per term before the sum, so no large partial sum of squares is rounded; PTQ still quantizes the stacked squares on
+    one grid and accumulates the whole node.
+    """
+
+    def __init__(self, einsum_equation: str, coeffs: torch.Tensor, sum_dim: int) -> None:
+        super().__init__(einsum_equation, coeffs)
+        self.sum_dim = int(sum_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x).sum(dim=self.sum_dim)
 
 
 class ElementwiseProduct(nn.Module):
@@ -435,6 +571,7 @@ class RewrittenLayerNorm(nn.Module):
         allow_matmul: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
         hadamard: bool = False,
+        strict_product: str = "norm",
     ) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
@@ -442,6 +579,9 @@ class RewrittenLayerNorm(nn.Module):
         self.allow_matmul = allow_matmul
         self.strict_unary = check_strict_unary(strict_unary)
         self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
+        self.strict_product = check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard)
+        # Norm expansion of u * inv_std: u^2 is already formed for the variance, inv_std^2 is one square per token.
+        self.norm_ln = self.strict_product == "norm" and self.strict_unary == "sigmoid_rsqrt"
         self.mean_u = AffineMean(-1, keepdim=True)
         self.mean_r2 = AffineMean(-1, keepdim=True)
         self.square = AffineSelfHadamard() if self.hadamard else NLSquare()
@@ -453,6 +593,12 @@ class RewrittenLayerNorm(nn.Module):
         if allow_matmul:
             self.inv_sqrt_var = NLRsqrtPlusEps(e)
             self.u_mul_invstd = AffineHadamard()
+        elif self.norm_ln:
+            self.inv_sqrt_var = NLRsqrtPlusEps(e)
+            self.add_u_invstd = AffineCombine([1.0, 1.0])
+            self.square_sum = NLSquare(inplace=True)
+            self.square_invstd = NLSquare()
+            self.combine_z = AffineCombine([0.5, -0.5, -0.5], inplace=True)
         elif self.strict_unary == "sigmoid_rsqrt":
             self.inv_sqrt_var = NLRsqrtPlusEps(e)
             self.u_mul_invstd = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
@@ -473,7 +619,12 @@ class RewrittenLayerNorm(nn.Module):
         u = self.u_center_contract(RoutingStack((_x, _m), dim=-1))
         u2 = self.square(u)
         r2 = self.mean_r2(u2)
-        if self.allow_matmul or self.strict_unary == "sigmoid_rsqrt":
+        if self.norm_ln:
+            inv_std = self.inv_sqrt_var(r2)
+            _u, _a = RoutingBroadcastTensors(u, inv_std)
+            s = self.square_sum(self.add_u_invstd(_u, _a))
+            z = self.combine_z(s, u2, self.square_invstd(inv_std))
+        elif self.allow_matmul or self.strict_unary == "sigmoid_rsqrt":
             inv_std = self.inv_sqrt_var(r2)
             z = self.u_mul_invstd(u, inv_std)
         else:
@@ -506,12 +657,27 @@ class PairwiseDotBySquare(nn.Module):
     per term, then a fixed sum over the head dimension. No matmul and no unary map.
     """
 
-    def __init__(self, head_dim: int, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
+    def __init__(
+        self, head_dim: int, *, allow_matmul: bool = False, hadamard: bool = False, strict_product: str = "norm"
+    ) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.allow_matmul = allow_matmul
         self.hadamard = bool(hadamard) and not allow_matmul
-        if allow_matmul:
+        self.norm_expansion = (
+            check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard) == "norm"
+        )
+        if self.norm_expansion:
+            # S = ( sum_l (q+k)^2 - |q|^2 - |k|^2 ) / (2 sqrt(d)): one square per term, norms once per row.
+            w = 0.5 / math.sqrt(float(head_dim))
+            self.sum_qk = AffineCombine([1.0, 1.0])
+            self.square = NLSquare(inplace=True)
+            self.square_q = NLSquare()
+            self.square_k = NLSquare()
+            self.norm_q = AffineSum(-1, keepdim=True)
+            self.norm_k = AffineSum(-1)
+            self.combine = AffineCombine([w, -w, -w], reduce_first=-1)
+        elif allow_matmul:
             self.q_scale = AffineScale(1.0 / math.sqrt(float(head_dim)))
             self.qk_matmul = AffineMatMul()
         elif self.hadamard:
@@ -537,7 +703,14 @@ class PairwiseDotBySquare(nn.Module):
         qe_b = RoutingExpand(qe, -1, -1, -1, nk, -1)
         ke_b = RoutingExpand(ke, -1, -1, nq, -1, -1)
         if self.hadamard:
-            return self.reduce(self.qk_hadamard(self.q_scale(qe_b), ke_b))
+            # Scale q before the broadcast, so only the product grid is materialized (same values).
+            qs_b = RoutingExpand(RoutingUnsqueeze(self.q_scale(q), 3), -1, -1, -1, nk, -1)
+            return self.reduce(self.qk_hadamard(qs_b, ke_b))
+        if self.norm_expansion:
+            sq = self.square(self.sum_qk(qe_b, ke_b))
+            nq2 = self.norm_q(self.square_q(q))                                   # [B,H,Nq,1]
+            nk2 = RoutingUnsqueeze(self.norm_k(self.square_k(k)), -2)            # [B,H,1,Nk]
+            return self.combine(sq, nq2, nk2)
         return self.square_chain(qe_b, ke_b)
 
     def selected(self, q: torch.Tensor, k: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -552,7 +725,13 @@ class PairwiseDotBySquare(nn.Module):
             return RoutingSqueeze(self.qk_matmul(qs, RoutingTranspose(k_g, -2, -1)), -2)
         q_b = RoutingExpand(RoutingUnsqueeze(q, 3), -1, -1, -1, kk, -1)
         if self.hadamard:
-            return self.reduce(self.qk_hadamard(self.q_scale(q_b), k_g))
+            qs_b = RoutingExpand(RoutingUnsqueeze(self.q_scale(q), 3), -1, -1, -1, kk, -1)
+            return self.reduce(self.qk_hadamard(qs_b, k_g))
+        if self.norm_expansion:
+            sq = self.square(self.sum_qk(k_g, q_b))
+            nq2 = self.norm_q(self.square_q(q))                                   # [B,H,Nq,1]
+            nk2_all = RoutingExpand(RoutingUnsqueeze(self.norm_k(self.square_k(k)), 2), -1, -1, nq, -1)
+            return self.combine(sq, nq2, RoutingGather(nk2_all, 3, idx))
         return self.square_chain(q_b, k_g)
 
 
@@ -813,21 +992,39 @@ class SparseWeightedSumBySquare(nn.Module):
     mixed by one dense ``[Nq,Nk] @ [Nk,D]`` product, the same sum without a gathered ``[Nq,K,D]`` tensor.
     """
 
-    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
+    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False, strict_product: str = "norm") -> None:
         super().__init__()
         self.allow_matmul = allow_matmul
         # Hadamard graph: ``p * v`` as elementwise products, then a fixed sum over the support.
         self.hadamard = bool(hadamard) and not allow_matmul
-        if allow_matmul:
+        self.norm_expansion = (
+            check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard) == "norm"
+        )
+        if self.norm_expansion:
+            # y = ( sum_k (v^2 - (v-p)^2) + sum_k p^2 ) / 2: v^2 once per key and gathered, p^2 per (query, key), one
+            # square of v - p per term. The two close squares are subtracted per term inside the node that sums
+            # over keys, so no large partial sum is rounded; the full-size steps run in place during evaluation.
+            self.sub_vp = AffineCombine([1.0, -1.0], inplace=True)
+            self.square = NLSquare(inplace=True)
+            self.square_v = NLSquare()
+            self.diff_sum = AffineCombine([1.0, -1.0], reduce_out=-2, inplace=True)
+            self.square_p = NLSquare()
+            self.sum_p2 = AffineSum(-1, keepdim=True)
+            self.combine = AffineCombine([0.5, 0.5])
+        elif allow_matmul:
             self.pv_matmul = AffineMatMul()
         elif self.hadamard:
             self.pv_hadamard = AffineHadamard()
             self.reduce = AffineSum(-2)
         else:
+            # Polarization, combined per term: (p+v)^2 - (p-v)^2 for each key, then the sum over keys, in one node.
             self.square_chain = SquareIdentityOperandChain(
                 "pq,...kqd->...kpd",
-                "p,...kpd->...d",
+                "p,...kpd->...kd",
                 torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()),
+            )
+            self.square_chain.out_contract = AffineContractPerTerm(
+                "p,...kpd->...kd", torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()), sum_dim=-2
             )
 
     def forward(
@@ -856,6 +1053,12 @@ class SparseWeightedSumBySquare(nn.Module):
         p_b = RoutingExpand(p, -1, -1, -1, -1, d)
         if self.hadamard:
             return self.reduce(self.pv_hadamard(p_b, v_g))
+        if self.norm_expansion:
+            sq = self.square(self.sub_vp(v_g, p_b))
+            v2_h = RoutingExpand(RoutingUnsqueeze(self.square_v(v), 2), -1, -1, nq, -1, -1)
+            t = self.diff_sum(RoutingGather(v2_h, 3, idx_e), sq)
+            del sq
+            return self.combine(t, self.sum_p2(self.square_p(probs)))
         return self.square_chain(p_b, v_g)
 
 
@@ -883,12 +1086,14 @@ class SurgeryAttention(nn.Module):
         use_exact_tail_mass: bool = False,
         strict_unary: str = "sigmoid_rsqrt",
         hadamard: bool = False,
+        strict_product: str = "norm",
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.strict_unary = check_strict_unary(strict_unary)
         self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
+        self.strict_product = check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard)
         self.use_attention_surgery = use_attention_surgery
         self.use_surgery_softmax = use_surgery_softmax
         self.allow_matmul = allow_matmul
@@ -900,7 +1105,9 @@ class SurgeryAttention(nn.Module):
         # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
         self.router: Optional[nn.Module] = None
         if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul, hadamard=self.hadamard)
+            self.dot = PairwiseDotBySquare(
+                self.head_dim, allow_matmul=allow_matmul, hadamard=self.hadamard, strict_product=self.strict_product
+            )
             if use_surgery_softmax:
                 self.gibbs = GibbsTopKSoftmax(
                     seq_len,
@@ -912,14 +1119,19 @@ class SurgeryAttention(nn.Module):
                     strict_unary=self.strict_unary,
                     hadamard=self.hadamard,
                 )
-                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul, hadamard=self.hadamard)
+                self.sparse_mix = SparseWeightedSumBySquare(
+                    allow_matmul=allow_matmul, hadamard=self.hadamard, strict_product=self.strict_product
+                )
                 k_eff = min(int(top_k), int(seq_len))
                 n_dropped = max(int(seq_len) - k_eff, 1)
                 inv_dropped = 1.0 / n_dropped
                 n_over_dropped = float(seq_len) / n_dropped
                 self.mean_v = AffineMean(dim=-2, keepdim=True)
                 if use_exact_tail_mass and not allow_matmul and self.strict_unary == "sigmoid_rsqrt":
-                    self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
+                    if self.strict_product == "norm":
+                        self.scale_mean_v_by_tail = NormExpansionProduct()
+                    else:
+                        self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
                 else:
                     self.scale_mean_v_by_tail = AffineHadamard()
                 self.adj_probs_contract = AffineContract(
@@ -1284,7 +1496,10 @@ class CalibratedAffinePTQWrapper(nn.Module):
             self.to(device=module_device)
 
     def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
-        acc = self.accumulator(*self.quantizer(*inputs))
+        q = self.quantizer(*inputs)
+        if getattr(self.accumulator, "ptq_dequantized_inputs", False):
+            q = tuple(t * self.quantizer.input_scale[i] for i, t in enumerate(q))
+        acc = self.accumulator(*q)
         if self.out_bcast_shape is not None:
             bias = self.out_bias.view(self.out_bcast_shape)
             out = acc + bias if self.skip_out_scale else self.out_scale.view(self.out_bcast_shape) * acc + bias

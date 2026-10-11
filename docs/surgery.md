@@ -269,12 +269,43 @@ Graph options that change the compiled model (not debug flags):
   checkpoints written before the option existed reload as `"log_exp"`.
 - `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (paper Corollary 1; a model change).
 - `support_routing` - `"topk"` or `"query_centroids"` (see `docs/cluster_routing.md`).
+- `strict_product` - products of two activations in the DeiT-Tiny strict graph. `"norm"` (default, the paper's
+  strict construction since 2026-10-10) uses the norm expansion `ab = ((a+b)^2 - a^2 - b^2)/2` wherever a square of a
+  factor is shared, and polarization `((a+b)^2-(a-b)^2)/4` where it is cheaper (isolated products: the softmax products
+  and the GELU approximation):
+  - scores `( sum_l (q+k)^2 - |q|^2 - |k|^2 ) / (2 sqrt d)`: `N^2 d + 2 N d` squares per head;
+  - mix `( sum_k (v^2 - (v-p)^2) + sum_k p^2 ) / 2`: `N k d + N k + N d` squares, the two close squares subtracted per
+    term inside the node that sums over keys (`AffineCombine(reduce_out=-2)`), so no large partial sum is rounded;
+  - LayerNorm `z = ((u+a)^2 - u^2 - a^2)/2` with `u^2` from the variance: `2 n D + n` squares for `n` tokens of width `D`;
+  - the exact tail term `tau * mean(v)` (`NormExpansionProduct`).
+  Every combination is an `AffineCombine`, an `AffineContract` with several inputs, so PTQ quantizes each input on its
+  own grid and rescales it before the sum (`ptq_dequantized_inputs`). Its output has the dtype of its first input, as
+  in the in-place sum: under the evaluation autocast a mean or sum is fp32 while its sibling input is bf16, and a plain
+  `torch.add` would promote the result to fp32 (LayerNorm `add_u_invstd`; +0.6 points at k=64, exact GELU). Test
+  `test_affine_combine_keeps_dtype_of_first_input`; the PTQ runs made with the promoted add are kept in
+  `artifacts/logs/norm_construction_2026-10-10/obsolete_fp32_promotion/`. During evaluation the full-size steps run in
+  place on fresh tensors; PTQ turns this off (`set_inplace_eval(False)`), since its calibration reads node inputs in
+  forward hooks. `"polarization"` uses polarization for every product; checkpoints written before the option existed
+  reload as `"polarization"`. Since 2026-10-10 its value mix subtracts the two squares per term before the sum over keys
+  (`AffineContractPerTerm`), the optimal order (bf16 mix error 14.1% at k=197 against 31.3% when the squares are summed
+  over keys first; `make mix-precision`). The polarization strict runs with the earlier order are kept in
+  `artifacts/backup_polarization_2026-10-10/` (code at commit 7141fcc); the Table 2 baseline with the per-term order is
+  `make strict-pol` (`*_strict_sr_gs_pol*.json`).
+  Exploratory variants of the same day (partial-sum mix, first per-term mix) are in
+  `artifacts/backup_norm_explore_2026-10-10/`.
 - `hadamard` - DeiT-Tiny only, with `allow_matmul=false` and `strict_unary="sigmoid_rsqrt"`: the Hadamard
   graph. `ElementwiseProduct` becomes one `AffineHadamard` node and every square (`RewrittenLayerNorm`
   second moment, `ReciprocalByRsqrt`) one `AffineSelfHadamard` node, so no `NLSquare` remains;
   `PairwiseDotBySquare` and `SparseWeightedSumBySquare` form `(q/sqrt(d)) * k` and `p * v` on the
   broadcast grid and sum with `AffineSum` (no `matmul`). Unary maps: `NLSigmoid`, `NLRsqrtPlusEps` and
   `NLGELU` (none besides the first two with `gelu="sigmoid"`). Configs `topk{16,32,64,197}_hadamard_sr*.json`.
+  Since 2026-10-11 the score scales `q` before the broadcast, so only the product grid is materialized (one bf16
+  tensor of `N^2 d` per head instead of two; same values). The runs with the earlier order are in
+  `artifacts/backup_hadamard_prescale_2026-10-11/`; rerun log `artifacts/logs/hadamard_prescale_2026-10-11/`.
+- `calibration_seed` - seed of the global RNGs, set before the loaders are built (default 0), so the calibration
+  batches, their order and their augmentation, and with them the tail mass and the centroids, repeat run to run.
+  `null` leaves a run unseeded, as were all runs before 2026-10-11: two unseeded runs of one strict config differ by
+  up to 0.5 points with top-k and 1.5 points with routed support.
 
 `build_module_mapping` records the resulting per-block module choices (`norm1`, `attn`,
 `norm2`, `mlp.act`, `fc_norm`) into the surgery metadata.

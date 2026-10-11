@@ -16,6 +16,7 @@
   "disable_softmax_replacement": false,
   "allow_matmul": false,
   "strict_unary": "sigmoid_rsqrt",
+  "strict_product": "norm",
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk32_strict_sr.pt",
   "log_dir": "artifacts/logs"
 }

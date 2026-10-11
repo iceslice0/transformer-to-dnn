@@ -50,6 +50,10 @@ class SurgeryConfig:
     # elementwise product instead of polarization; QK^T and PV as products plus sums. Needs allow_matmul=False
     # and strict_unary="sigmoid_rsqrt"; the unary maps are then the sigmoid, the inverse square root and GELU.
     hadamard: bool = False
+    # Products of two activations in the DeiT-Tiny strict graph: "norm" (default, the paper's strict construction:
+    # ((a+b)^2 - a^2 - b^2)/2 where a square is shared, i.e. QK^T, PV, LayerNorm and the exact tail term, and
+    # polarization ((a+b)^2-(a-b)^2)/4 elsewhere) or "polarization" everywhere (earlier runs).
+    strict_product: str = "norm"
     # Sparse support selection: "topk" keeps the top-k exact scores; "query_centroids" keeps the
     # top-k keys of the nearest fixed query centroid (k-means on calibration queries).
     support_routing: str = "topk"
@@ -59,6 +63,9 @@ class SurgeryConfig:
     routing_kmeans_iters: int = 30
     routing_seed: int = 0
     routing_eval_batches: Optional[int] = None
+    # Seed of the global RNGs, set before the loaders are built, so the calibration batches (order and augmentation)
+    # and with them the tail mass and the centroids repeat run to run. None: unseeded (runs before 2026-10-11).
+    calibration_seed: Optional[int] = 0
     reference_checkpoint: Optional[str] = None
     device: str = "cuda"
     surgery_dtype: str = "bfloat16"
@@ -90,6 +97,10 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     ),
     "strict_unary": "Strict unary set: 'sigmoid_rsqrt' (default; squares, sigmoid, rsqrt) or deprecated 'log_exp'.",
     "gelu": "MLP activation: 'exact' GELU or 'sigmoid' x*sigmoid(1.702x) (a model change).",
+    "strict_product": (
+        "DeiT-Tiny strict graph products: 'norm' (default; norm expansion where a square is shared, polarization "
+        "elsewhere) or 'polarization' everywhere (earlier runs)."
+    ),
     "hadamard": (
         "DeiT-Tiny Hadamard graph: elementwise products instead of polarization, QK^T and PV as products plus "
         "sums, no matmul; needs allow_matmul=false and strict_unary='sigmoid_rsqrt'."
@@ -104,6 +115,10 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "routing_kmeans_iters": "Lloyd iterations after k-means++ initialization.",
     "routing_seed": "Seed for batch sampling, query subsampling and k-means++.",
     "routing_eval_batches": "Validation batches for support diagnostics (captured mass, recall); JSON null uses all.",
+    "calibration_seed": (
+        "Seed set before the loaders are built, so calibration batches and their augmentation repeat; "
+        "JSON null leaves the run unseeded."
+    ),
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",

@@ -88,15 +88,13 @@ class SurgeryBlock(nn.Module):
         strict_unary: str = "sigmoid_rsqrt",
         gelu: str = "exact",
         hadamard: bool = False,
+        strict_product: str = "norm",
     ) -> None:
         super().__init__()
         if use_surgery_layernorm:
-            self.norm1 = RewrittenLayerNorm(
-                dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
-            )
-            self.norm2 = RewrittenLayerNorm(
-                dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
-            )
+            ln_kw = dict(allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard, strict_product=strict_product)
+            self.norm1 = RewrittenLayerNorm(dim, eps=eps_ln, **ln_kw)
+            self.norm2 = RewrittenLayerNorm(dim, eps=eps_ln, **ln_kw)
         else:
             self.norm1 = nn.LayerNorm(dim, eps=eps_ln)
             self.norm2 = nn.LayerNorm(dim, eps=eps_ln)
@@ -115,6 +113,7 @@ class SurgeryBlock(nn.Module):
             use_exact_tail_mass=use_exact_tail_mass,
             strict_unary=strict_unary,
             hadamard=hadamard,
+            strict_product=strict_product,
         )
         mlp_hidden = int(dim * mlp_ratio)
         self.mlp = SurgeryMlp(
@@ -162,12 +161,14 @@ class DeiTTinySurgeryModel(nn.Module):
         strict_unary: str = "sigmoid_rsqrt",
         gelu: str = "exact",
         hadamard: bool = False,
+        strict_product: str = "norm",
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.strict_unary = str(strict_unary)
         self.gelu = str(gelu)
         self.hadamard = bool(hadamard)
+        self.strict_product = str(strict_product)
         self.embed_dim = embed_dim
         self.use_surgery_layernorm = use_surgery_layernorm
         self.use_attention_surgery = use_attention_surgery
@@ -206,13 +207,19 @@ class DeiTTinySurgeryModel(nn.Module):
                     strict_unary=strict_unary,
                     gelu=gelu,
                     hadamard=hadamard,
+                    strict_product=strict_product,
                 )
                 for i in range(depth)
             ]
         )
         if use_surgery_layernorm:
             self.fc_norm = RewrittenLayerNorm(
-                embed_dim, eps=eps_ln, allow_matmul=allow_matmul, strict_unary=strict_unary, hadamard=hadamard
+                embed_dim,
+                eps=eps_ln,
+                allow_matmul=allow_matmul,
+                strict_unary=strict_unary,
+                hadamard=hadamard,
+                strict_product=strict_product,
             )
         else:
             self.fc_norm = nn.LayerNorm(embed_dim, eps=eps_ln)
@@ -239,6 +246,7 @@ class DeiTTinySurgeryModel(nn.Module):
             strict_unary=str(getattr(cfg, "strict_unary", "sigmoid_rsqrt")),
             gelu=str(getattr(cfg, "gelu", "exact")),
             hadamard=bool(getattr(cfg, "hadamard", False)),
+            strict_product=str(getattr(cfg, "strict_product", "norm")),
         )
 
     @classmethod
@@ -259,6 +267,8 @@ class DeiTTinySurgeryModel(nn.Module):
             strict_unary=str(d.get("strict_unary", "log_exp")),
             gelu=str(d.get("gelu", "exact")),
             hadamard=bool(d.get("hadamard", False)),
+            # Checkpoints written before ``strict_product`` existed use polarization.
+            strict_product=str(d.get("strict_product", "polarization")),
         )
 
     def _init_weights(self) -> None:
