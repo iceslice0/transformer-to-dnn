@@ -43,9 +43,19 @@ class PTQSurgeryConfig:
     affine_activation_bits: Optional[int] = None
     # For ``Linear``/``Conv2d``: **True** = per-output-channel symmetric weight scales (axis 0);
     # **False** = one global scale over the whole weight tensor (often destroys accuracy). Ignored for
-    # affine/coeff (always one global weight scale) and for ``AffineMatMul``/``AffineHadamard`` (no weights). Output
+    # affine/coeff (always one global weight scale; ``AffineCombine`` keeps its coefficients exact, as the per-input
+    # multipliers of an integer Add) and for ``AffineMatMul``/``AffineHadamard`` (no weights). Output
     # ``out_scale``/``out_bias`` for Linear/Conv do not depend on this flag (analytical + residual bias).
     per_output_channel: bool = True
+    # Brent's operand scaling of the norm-expansion products (strict Mix and LayerNorm): a -> lam a, b -> b / lam with
+    # lam^2 = max|b| / max|a| from the first calibration range pass, rounded to a power of two so that the folded
+    # coefficients stay exact in bf16; folded into the AffineCombine coefficients, then the ranges are measured again.
+    brent_scaling: bool = False
+    # Product sites that brent_scaling folds: "mix" (value mix) and "layernorm" (u * inv_std).
+    brent_sites: List[str] = field(default_factory=lambda: ["mix", "layernorm"])
+    # Seed of the global RNGs, set before the loaders are built, so the calibration batches and their augmentation
+    # repeat run to run. None: unseeded (PTQ runs before 2026-10-11).
+    calibration_seed: Optional[int] = 0
     # Variance/eps threshold used by the OLS affine-dequant fit (Affine and MatMul kinds).
     # When per-channel ``var(acc)`` falls below this, that channel's slope collapses to 0
     # (output ≈ channel mean). Also used as the stability ``clamp_min`` for the OLS denominator.
@@ -76,6 +86,9 @@ FIELD_HELP_PTQ: Dict[str, str] = {
     "include_names": "Only wrap nodes whose module name contains one of these substrings.",
     "exclude_names": "Skip nodes whose module name contains one of these substrings.",
     "per_output_channel": "Use per-output-channel weight scales for Linear/Conv2d.",
+    "brent_scaling": "Fold Brent's power-of-two operand scaling into the strict Mix and LayerNorm products before PTQ.",
+    "brent_sites": "Product sites folded by brent_scaling: any of 'mix' and 'layernorm'.",
+    "calibration_seed": "Seed set before the loaders are built, so PTQ calibration repeats; JSON null leaves it unseeded.",
     "compiled_accumulator_bits": (
         "Bit width of the integer codes entering the compiled accumulators (fixed affine nodes introduced by splitting "
         "LayerNorm, softmax and attention). Strict graph: 12, for its squares and sums of squares; elsewhere it equals "

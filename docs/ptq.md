@@ -50,7 +50,15 @@ fields are:
   so the strict configs (`configs/ptq/*_strict*.json`) set `compiled_accumulator_bits=12`; every other config sets 8,
   where it equals `activation_bits` and has no effect. The proxy accumulates every node exactly (fp32 on integer
   codes), so none of these fields limits an accumulator's width. `affine_activation_bits` is the deprecated name and
-  is still accepted.
+  is still accepted. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
+  its own multiplier before the sum, as in an integer Add with per-input multipliers. The strict baseline coefficients
+  ([1, 1], [1, -1], [0.5, 0.5], [0.5, -0.5, -0.5]) were exact on the one-scale 8-bit grid before as well.
+- `calibration_seed` (default 0): seed of the global RNGs before the loaders are built, so the calibration batches
+  and their augmentation repeat; `null` is unseeded, as were all PTQ runs before 2026-10-11.
+- `brent_scaling` (default false): Brent's operand scaling of the strict Mix and LayerNorm products. After the first
+  range pass, `lam^2 = max|v| / max|p|` (inputs of `sub_vp`) and `lam^2 = max|a| / max|u|` (inputs of
+  `add_u_invstd`), rounded to a power of two, are folded into the `AffineCombine` coefficients
+  (`ptq.apply_brent_scaling`); the float graph computes the same function, and the ranges are measured again.
 - optional architecture overrides: `top_k`, `eps`.
 - `output`: desired checkpoint directory/name. The final filename is normalized from the tool and
   config name.
@@ -193,3 +201,52 @@ forward hooks on the `NL*` nodes (plus two ReLUs per entry for the log-domain st
 `sigmoid_rsqrt` strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (paper Table 1
 block total) + 76,042 (final LayerNorm). Surgery calibration (tail mass, centroids) uses unseeded augmented train batches,
 so two surgery runs of one config differ by up to 0.5 points (top-k) and 1.5 points (routed).
+
+## Brent scaling, node-level check (2026-10-11)
+
+`make ptq-balance-check` (`scripts/ptq_balance_check.py`, log `artifacts/logs/ptq_balance_2026-10-11/`, data
+`artifacts/metadata/ptq_balance_check.json`) emulates PTQ on the float64 inputs of the strict Score, Mix and
+LayerNorm of `topk{16,197}_strict_sr_gs` (8 calibration and 16 evaluation Pet images): every input of a compiled
+affine node on its own symmetric max-abs grid of b bits, exact accumulation, exact coefficients, least-squares output
+fit. Brent's scaling a -> lam a, b -> b/lam with lam^2 = max|b|/max|a|, one scalar per site and block. Relative error
+of the site output, mean over blocks:
+
+| site | median lam^2 | 8 bits plain / lam | 10 bits plain / lam | 12 bits plain / lam |
+|---|---:|---:|---:|---:|
+| Score | 0.97 | 4.25% / 4.23% | 1.14% / 1.14% | 0.41% / 0.41% |
+| Mix, k=16 | 8.45 | 43.7% / 11.0% | 14.2% / 3.09% | 3.88% / 0.88% |
+| Mix, k=197 | 5.73 | 72.4% / 37.0% | 27.8% / 9.97% | 8.15% / 2.86% |
+| LayerNorm | 0.20 | 22.4% / 11.0% | 6.87% / 2.90% | 1.81% / 0.73% |
+
+q and k are already balanced, so the Score gains nothing. In Mix and LayerNorm lam cuts the error 2 to 4.5 times at
+every width, worth one to two bits. A model-level PTQ run must keep the combine coefficients exact (per-input
+multipliers): the current PTQ quantizes `affine_contract` coefficients with one 8-bit scale, and [1/lam, -lam] with
+lam^2 = 8.5 would lose about 3% on the smaller coefficient.
+
+## Brent scaling, model level (2026-10-11)
+
+`make ptq-brent` (lam on Mix and LayerNorm) and `make ptq-brent-mix` (`brent_sites=["mix"]`), configs
+`configs/ptq/{16,64,197}_strict_sr_gs_acc{12,10}{,_brent,_brentmix}{,_pertensor}_8bit.json`, logs
+`artifacts/logs/ptq_brent_2026-10-11/`. Strict graph with sigmoid GELU, seeded PTQ calibration (`calibration_seed=0`),
+exact `AffineCombine` coefficients, power-of-two lam from max-abs ranges; one run per cell. PTQ accuracy change
+(points) from the bf16 float model (83.97 / 89.62 / 90.54 at k = 16 / 64 / 197), PTQ loss in parentheses:
+
+| k | weights | bits | no lam | lam: Mix + LayerNorm | lam: Mix only |
+|---:|---|---:|---:|---:|---:|
+| 16 | per-channel | 12 | -1.06 (0.564) | -1.42 (0.566) | -0.68 (0.549) |
+| 64 | per-channel | 12 | -0.65 (0.361) | -0.38 (0.366) | -0.22 (0.365) |
+| 197 | per-channel | 12 | -0.90 (0.336) | +0.05 (0.326) | -0.44 (0.329) |
+| 16 | per-tensor | 12 | -0.76 (0.565) | -0.87 (0.564) | -0.35 (0.546) |
+| 64 | per-tensor | 12 | -0.19 (0.362) | -0.38 (0.364) | -0.16 (0.364) |
+| 197 | per-tensor | 12 | -0.49 (0.337) | +0.16 (0.327) | -0.76 (0.329) |
+| 16 | per-channel | 10 | -4.61 (0.759) | -2.15 (0.631) | -2.15 (0.682) |
+| 64 | per-channel | 10 | -4.39 (0.545) | -1.64 (0.441) | -2.73 (0.509) |
+| 197 | per-channel | 10 | -8.12 (0.632) | -1.55 (0.395) | -3.52 (0.481) |
+| 16 | per-tensor | 10 | -3.90 (0.758) | -1.53 (0.627) | -1.47 (0.680) |
+| 64 | per-tensor | 10 | -5.10 (0.548) | -1.20 (0.443) | -2.67 (0.504) |
+| 197 | per-tensor | 10 | -7.85 (0.617) | -1.80 (0.399) | -3.08 (0.490) |
+
+Folding lam changes the bf16 float model before PTQ: Mix + LayerNorm 83.18 / 89.45 / 90.30, Mix only 83.81 / 89.62 /
+90.46. The bf16 `AffineCombine` rounds each partial sum to bf16, and the LayerNorm lam (0.25 to 0.5) leaves a large
+a^2/lam^2 term in the partial sum. With 10-bit compiled accumulators lam on both sites cuts the PTQ loss from 3.9-8.1
+to 1.2-2.2 points; with 12 bits the means are -0.68 (no lam), -0.47 (both), -0.44 (Mix only).

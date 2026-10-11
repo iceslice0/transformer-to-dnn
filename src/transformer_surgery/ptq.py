@@ -9,6 +9,7 @@ moments -> remove hooks -> install wrappers -> save and validate.
 from __future__ import annotations
 
 import copy
+import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -23,6 +24,8 @@ from transformer_surgery.models.adapters import (
 )
 from transformer_surgery.ops import (
     set_inplace_eval,
+    RewrittenLayerNorm,
+    SparseWeightedSumBySquare,
     AffineContract,
     AffineFixedMix,
     AffineHadamard,
@@ -61,6 +64,7 @@ from transformer_surgery.internal.util import (
     namespace_from_mapping,
     namespace_to_mapping,
     save_model_checkpoint,
+    set_seed,
     set_surgery_dtype,
 )
 
@@ -213,6 +217,49 @@ def load_ptq_checkpoint(path: str, cfg: Any) -> Tuple[nn.Module, Dict[str, Any]]
     return model, ensure_mapping(extra_ns)
 
 
+def _power_of_two(x: float) -> float:
+    return 2.0 ** round(math.log2(x))
+
+
+@torch.no_grad()
+def apply_brent_scaling(
+    model: nn.Module, stats: Dict[str, PTQNodeStats], sites: Sequence[str] = ("mix", "layernorm")
+) -> Dict[str, float]:
+    """Fold Brent's operand scaling into the norm-expansion products of the strict graph, in place.
+
+    Mix ``sum_k p v``: ``v -> v / lam``, ``p -> lam p`` with ``lam^2 = max|v| / max|p|``, so ``sub_vp`` scales its
+    inputs by ``[1/lam, lam]``, ``diff_sum`` its ``v^2`` input by ``1/lam^2`` and ``combine`` its ``sum p^2`` input by
+    ``lam^2``. LayerNorm ``u * a``: ``u -> lam u``, ``a -> a / lam`` with ``lam^2 = max|a| / max|u|``, so
+    ``add_u_invstd`` scales by ``[lam, 1/lam]`` and ``combine_z`` its ``u^2`` and ``a^2`` inputs by ``lam^2`` and
+    ``1/lam^2``. The ranges come from the first calibration pass (inputs of ``sub_vp`` and ``add_u_invstd``); ``lam`` is
+    rounded to a power of two, so every folded coefficient is exact in bf16 and the graph computes the same function.
+    """
+    unknown = set(sites) - {"mix", "layernorm"}
+    if unknown:
+        raise ValueError(f"unknown brent_sites {sorted(unknown)}; use 'mix' and 'layernorm'")
+    lams: Dict[str, float] = {}
+
+    def fold(node: nn.Module, factors: Sequence[float]) -> None:
+        node.coeff.mul_(torch.tensor(factors, dtype=node.coeff.dtype, device=node.coeff.device))
+
+    for name, m in model.named_modules():
+        if isinstance(m, SparseWeightedSumBySquare) and m.norm_expansion and "mix" in sites:
+            mv, mp = (float(t.max()) for t in stats[f"{name}.sub_vp"].input_max_abs[:2])
+            lam = _power_of_two(math.sqrt(mv / mp))
+            fold(m.sub_vp, [1.0 / lam, lam])
+            fold(m.diff_sum, [1.0 / lam**2, 1.0])
+            fold(m.combine, [1.0, lam**2])
+        elif isinstance(m, RewrittenLayerNorm) and m.norm_ln and "layernorm" in sites:
+            mu, ma = (float(t.max()) for t in stats[f"{name}.add_u_invstd"].input_max_abs[:2])
+            lam = _power_of_two(math.sqrt(ma / mu))
+            fold(m.add_u_invstd, [lam, 1.0 / lam])
+            fold(m.combine_z, [1.0, lam**2, 1.0 / lam**2])
+        else:
+            continue
+        lams[name] = lam
+    return lams
+
+
 def _ptq_summary(
     cfg: Any,
     selected: Dict[str, str],
@@ -300,6 +347,10 @@ def run_ptq(
     fp_model, fp_extra = load_surgery_student_checkpoint(os.path.abspath(cfg.fp_checkpoint), cfg, surgery_dtype=dtype)
     log_line(f"Surgery dtype (from checkpoint): {describe_dtype(get_surgery_dtype())}")
     adapter = get_model_adapter(fp_extra["model_key"])
+    calibration_seed = getattr(cfg, "calibration_seed", None)
+    if calibration_seed is not None:
+        set_seed(int(calibration_seed))
+    log_line(f"Calibration seed: {calibration_seed}")
     train_loader, val_loader = adapter.build_loaders(cfg)
     log_line(f"Using model adapter: {adapter.key}")
 
@@ -322,6 +373,19 @@ def run_ptq(
     selected = _filter_unobserved_nodes(selected, stats)
     if not selected:
         raise SystemExit("No PTQ node received calibration statistics on the current run.")
+    brent: Dict[str, Any] = {}
+    if getattr(cfg, "brent_scaling", False):
+        brent_sites = list(getattr(cfg, "brent_sites", ["mix", "layernorm"]))
+        lams = apply_brent_scaling(fp_model, stats, brent_sites)
+        if not lams:
+            raise SystemExit("brent_scaling=true but the model has no norm-expansion Mix or LayerNorm.")
+        log_line("Brent scaling lam by site: " + ", ".join(f"{n}={v:g}" for n, v in lams.items()))
+        folded_acc, folded_loss = validate_model(fp_model, val_loader, criterion)
+        log_line(f"Float model with folded lam val acc={folded_acc:.4f} loss={folded_loss:.4f}")
+        brent = {"brent_sites": brent_sites, "lambda_by_site": lams, "fp_val_acc_folded": float(folded_acc), "fp_val_loss_folded": float(folded_loss)}
+        # The folded coefficients change the ranges of the nodes downstream of a +- b: measure them again.
+        stats = gather_ptq_range_moments(fp_model, train_loader, selected, calibration_batches)
+        selected = _filter_unobserved_nodes(selected, stats)
 
     setups = {name: _build_ptq_setup(name, fp_model.get_submodule(name), stats[name], cfg) for name in selected}
     gather_ptq_dequant_moments(fp_model, train_loader, selected, stats, setups, calibration_batches)
@@ -350,16 +414,9 @@ def run_ptq(
     log_line(f"PTQ model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}")
     log_line(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}")
 
-    write_json(
-        meta_abs,
-        _ptq_summary(
-            cfg,
-            selected,
-            fp_acc,
-            fp_loss,
-            ptq_acc,
-            ptq_loss,
-            node_meta,
-        ),
+    summary = _ptq_summary(cfg, selected, fp_acc, fp_loss, ptq_acc, ptq_loss, node_meta)
+    summary["calibration"].update(
+        {"calibration_seed": calibration_seed, "brent_scaling": bool(getattr(cfg, "brent_scaling", False)), **brent}
     )
+    write_json(meta_abs, summary)
     log_wrote(meta_abs)

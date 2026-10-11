@@ -1220,7 +1220,12 @@ def build_ptq_node_setup(
     weight_axis_used: Optional[int] = None
     weight_fp = _weight_tensor(module, kind)
     q_weight: Optional[torch.Tensor] = None
-    if weight_fp is not None:
+    if weight_fp is not None and getattr(module, "ptq_dequantized_inputs", False):
+        # AffineCombine: each input is rescaled by its own multiplier before the sum, as in an integer Add with
+        # per-input multipliers, so its coefficients are part of those multipliers and stay exact.
+        weight_scale = torch.tensor(1.0, dtype=torch.float32)
+        q_weight = weight_fp.detach().to(dtype=torch.float32, device="cpu")
+    elif weight_fp is not None:
         weight_axis_used = 0 if kind in ("linear", "conv2d") and per_output_channel else None
         weight_scale = _symmetric_scale(weight_fp, int(weight_bits), axis=weight_axis_used)
         q_weight = ptq_quantize_proxy(weight_fp, weight_scale, int(weight_bits)).to(dtype=torch.float32, device="cpu")

@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -165,6 +165,13 @@ mix-precision: artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/ch
 	mkdir -p $(MIX_PRECISION_LOG)
 	$(PYTHON) scripts/mix_precision.py 16 197 | tee $(MIX_PRECISION_LOG)/mix_precision.log
 
+# Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit inputs of the compiled
+# affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).
+PTQ_BALANCE_LOG := artifacts/logs/ptq_balance_2026-10-11
+ptq-balance-check: artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr_gs.pt
+	mkdir -p $(PTQ_BALANCE_LOG)
+	$(PYTHON) scripts/ptq_balance_check.py | tee $(PTQ_BALANCE_LOG)/ptq_balance_check.log
+
 profile-hadamard: $(PROFILE_HADAMARD_CKPTS)
 	mkdir -p $(PROFILE_HADAMARD_LOG)
 	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_HADAMARD_LOG)/profile.json" > $(PROFILE_HADAMARD_LOG)/command.txt
@@ -278,3 +285,21 @@ $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_8bit,ts_surgery_topk$
 $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_pertensor_8bit,ts_surgery_topk$(k)_strict_sr)))
 $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_8bit,ts_surgery_topk$(k)_strict_sr_gs)))
 $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_pertensor_8bit,ts_surgery_topk$(k)_strict_sr_gs)))
+# Brent scaling at model level (seeded PTQ calibration): strict graph with GELU ~ x*sigmoid(1.702x), k = 16, 64, 197,
+# compiled accumulators of 12 or 10 bits, without and with brent_scaling, per-channel first, then per-tensor.
+PTQ_BRENT_NAMES := \
+	16_strict_sr_gs_acc12_8bit 16_strict_sr_gs_acc12_brent_8bit 16_strict_sr_gs_acc10_8bit 16_strict_sr_gs_acc10_brent_8bit \
+	64_strict_sr_gs_acc12_8bit 64_strict_sr_gs_acc12_brent_8bit 64_strict_sr_gs_acc10_8bit 64_strict_sr_gs_acc10_brent_8bit \
+	197_strict_sr_gs_acc12_8bit 197_strict_sr_gs_acc12_brent_8bit 197_strict_sr_gs_acc10_8bit 197_strict_sr_gs_acc10_brent_8bit \
+	16_strict_sr_gs_acc12_pertensor_8bit 16_strict_sr_gs_acc12_brent_pertensor_8bit 16_strict_sr_gs_acc10_pertensor_8bit 16_strict_sr_gs_acc10_brent_pertensor_8bit \
+	64_strict_sr_gs_acc12_pertensor_8bit 64_strict_sr_gs_acc12_brent_pertensor_8bit 64_strict_sr_gs_acc10_pertensor_8bit 64_strict_sr_gs_acc10_brent_pertensor_8bit \
+	197_strict_sr_gs_acc12_pertensor_8bit 197_strict_sr_gs_acc12_brent_pertensor_8bit 197_strict_sr_gs_acc10_pertensor_8bit 197_strict_sr_gs_acc10_brent_pertensor_8bit
+$(foreach n,$(PTQ_BRENT_NAMES),$(eval $(call PTQ_RULE,$(n),ts_surgery_topk$(firstword $(subst _, ,$(n)))_strict_sr_gs)))
+ptq-brent: $(foreach n,$(PTQ_BRENT_NAMES),artifacts/checkpoints/ts_ptq_$(n).pt)
+# Same with lam on the value mix only (brent_sites=["mix"]): folding lam into the LayerNorm costs bf16 accuracy.
+PTQ_BRENT_MIX_NAMES := \
+	16_strict_sr_gs_acc12_brentmix_8bit 16_strict_sr_gs_acc10_brentmix_8bit 64_strict_sr_gs_acc12_brentmix_8bit 64_strict_sr_gs_acc10_brentmix_8bit \
+	197_strict_sr_gs_acc12_brentmix_8bit 197_strict_sr_gs_acc10_brentmix_8bit 16_strict_sr_gs_acc12_brentmix_pertensor_8bit 16_strict_sr_gs_acc10_brentmix_pertensor_8bit \
+	64_strict_sr_gs_acc12_brentmix_pertensor_8bit 64_strict_sr_gs_acc10_brentmix_pertensor_8bit 197_strict_sr_gs_acc12_brentmix_pertensor_8bit 197_strict_sr_gs_acc10_brentmix_pertensor_8bit
+$(foreach n,$(PTQ_BRENT_MIX_NAMES),$(eval $(call PTQ_RULE,$(n),ts_surgery_topk$(firstword $(subst _, ,$(n)))_strict_sr_gs)))
+ptq-brent-mix: $(foreach n,$(PTQ_BRENT_MIX_NAMES),artifacts/checkpoints/ts_ptq_$(n).pt)

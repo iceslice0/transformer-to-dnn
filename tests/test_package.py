@@ -324,6 +324,38 @@ class PackageSmokeTests(unittest.TestCase):
             set_inplace_eval(True)
             set_surgery_dtype(torch.bfloat16)
 
+    def test_brent_scaling_fold_keeps_the_function(self) -> None:
+        # The folded power-of-two lam changes only fixed coefficients: Mix and LayerNorm compute the same values.
+        import types
+
+        import torch
+
+        from transformer_surgery.internal.util import set_surgery_dtype
+        from transformer_surgery.ops import RewrittenLayerNorm, SparseWeightedSumBySquare
+        from transformer_surgery.ptq import apply_brent_scaling
+
+        set_surgery_dtype(torch.float64)
+        try:
+            torch.manual_seed(0)
+            model = torch.nn.ModuleDict({"mix": SparseWeightedSumBySquare(), "ln": RewrittenLayerNorm(12, eps=1e-3)})
+            model = model.double()
+            probs, idx = torch.rand(2, 2, 5, 3, dtype=torch.float64), torch.randint(0, 7, (2, 2, 5, 3))
+            v, x = torch.randn(2, 2, 7, 6, dtype=torch.float64) * 4, torch.randn(2, 7, 12, dtype=torch.float64) * 9
+            with torch.no_grad():
+                before = (model["mix"](probs, idx, v), model["ln"](x))
+            st = lambda *m: types.SimpleNamespace(input_max_abs=[torch.tensor(float(t)) for t in m])
+            lams = apply_brent_scaling(model, {"mix.sub_vp": st(9.0, 1.0), "ln.add_u_invstd": st(30.0, 0.3)})
+            self.assertEqual(lams, {"mix": 4.0, "ln": 0.125})  # sqrt(9) -> 4, sqrt(0.01) -> 1/8
+            with torch.no_grad():
+                after = (model["mix"](probs, idx, v), model["ln"](x))
+            for a, b in zip(before, after):
+                self.assertTrue(torch.allclose(a, b, atol=1e-10))
+            ln_coeff = model["ln"].combine_z.coeff.clone()
+            self.assertEqual(apply_brent_scaling(model, {"mix.sub_vp": st(9.0, 1.0)}, ("mix",)), {"mix": 4.0})
+            self.assertTrue(torch.equal(model["ln"].combine_z.coeff, ln_coeff))  # LayerNorm left as it is
+        finally:
+            set_surgery_dtype(torch.bfloat16)
+
     def test_kmeans_repeats_bitwise_under_one_seed(self) -> None:
         # The centroid update must not use float atomics (CUDA scatter_add_), so a seeded routed run repeats.
         import torch
