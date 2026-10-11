@@ -5,7 +5,6 @@ import os
 import importlib.util
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -83,18 +82,17 @@ class PackageSmokeTests(unittest.TestCase):
     def test_gibbs_tail_calibration_helpers(self) -> None:
         import torch
 
-        from transformer_surgery.internal.calibration import sample_topk_scores, topk_tail_mass_stats
+        from transformer_surgery.internal.calibration import sample_topk_scores, topk_tail_mass
 
         scores = torch.arange(4 * 7, dtype=torch.float32).reshape(4, 7)
         teacher, vals, idx, nk, k_top = sample_topk_scores(scores, top_k=3, max_rows=2)
         self.assertEqual(tuple(teacher.shape), (2, 7))
         self.assertEqual(tuple(vals.shape), (2, 3))
-        stats = topk_tail_mass_stats(teacher, idx, nk, k_top)
-        self.assertEqual(stats["count"], 2)
-        self.assertGreaterEqual(stats["mean"], 0.0)
-        self.assertIn("std", stats)
-        self.assertGreaterEqual(stats["std"], 0.0)
-        self.assertLessEqual(stats["min"], stats["max"])
+        tail = topk_tail_mass(teacher, idx, nk, k_top)
+        expected = 1.0 - torch.softmax(teacher, dim=-1).gather(1, idx).sum(dim=-1)
+        self.assertEqual(tuple(tail.shape), (2,))
+        self.assertTrue(torch.allclose(tail, expected, atol=1e-6))
+        self.assertTrue(torch.equal(topk_tail_mass(teacher, idx, 3, 3), torch.zeros(2)))
 
     def test_gibbs_topk_stabilizes_from_ordered_topk(self) -> None:
         import torch
@@ -102,17 +100,11 @@ class PackageSmokeTests(unittest.TestCase):
         from transformer_surgery.ops import GibbsTopKSoftmax
 
         scores = torch.tensor([[[[1.0, 5.0, 3.0, -2.0, 4.0]]]])
-        gibbs = GibbsTopKSoftmax(
-            seq_len=5,
-            top_k=3,
-            eps=1e-6,
-            gibbs_tail_prob_eps=0.0,
-            allow_matmul=False,
-        )
+        gibbs = GibbsTopKSoftmax(seq_len=5, top_k=3, gibbs_tail_prob_eps=0.0, allow_matmul=False)
         probs, idx, q_tail = gibbs(scores)
         raw_vals, expected_idx = torch.topk(scores, k=3, dim=-1, largest=True, sorted=True)
         stable = raw_vals - raw_vals[..., :1]
-        expected = torch.exp(stable) / (torch.exp(stable).sum(dim=-1, keepdim=True) + 1e-6)
+        expected = torch.exp(stable) / torch.exp(stable).sum(dim=-1, keepdim=True)
         self.assertTrue(torch.equal(idx, expected_idx))
         self.assertTrue(torch.allclose(probs, expected, atol=1e-6))
         self.assertTrue(torch.equal(q_tail, torch.zeros_like(q_tail)))
@@ -128,9 +120,7 @@ class PackageSmokeTests(unittest.TestCase):
         k = torch.randn(1, 2, 6, 4)
         scores = q @ k.transpose(-2, -1) / 2.0
         for exact in (False, True):
-            gibbs = GibbsTopKSoftmax(
-                seq_len=6, top_k=3, eps=1e-6, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact
-            )
+            gibbs = GibbsTopKSoftmax(seq_len=6, top_k=3, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
             # Exact scores as selection scores reproduce the default top-k path.
             for a, b in zip(gibbs(scores), gibbs(scores, scores)):
                 self.assertTrue(torch.allclose(a, b, atol=1e-6))
@@ -143,7 +133,7 @@ class PackageSmokeTests(unittest.TestCase):
         from transformer_surgery.ops import PairwiseDotBySquare
 
         router = QueryCentroidRouter(torch.randn(2, 3, 4))
-        gibbs = GibbsTopKSoftmax(seq_len=6, top_k=3, eps=1e-6, gibbs_tail_prob_eps=0.2)
+        gibbs = GibbsTopKSoftmax(seq_len=6, top_k=3, gibbs_tail_prob_eps=0.2)
         for allow_matmul in (False, True):
             dot = PairwiseDotBySquare(4, allow_matmul=allow_matmul)
             dense = gibbs(dot(q, k), router(q, k))
@@ -160,11 +150,12 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(km_identical["centroids"]).all())
         self.assertTrue(torch.equal(km_identical["relative_inertia"], torch.zeros(2)))
         with self.assertRaisesRegex(ValueError, "top_k >= 1"):
-            GibbsTopKSoftmax(seq_len=6, top_k=0, eps=0.0, gibbs_tail_prob_eps=0.0)
+            GibbsTopKSoftmax(seq_len=6, top_k=0, gibbs_tail_prob_eps=0.0)
 
-    def test_strict_sigmoid_rsqrt_matches_reference(self) -> None:
+    def test_strict_graph_matches_reference(self) -> None:
         import torch
 
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.internal.util import set_surgery_dtype
         from transformer_surgery.ops import GibbsTopKSoftmax, RewrittenLayerNorm, SigmoidGELU, SurgeryAttention
 
@@ -173,22 +164,22 @@ class PackageSmokeTests(unittest.TestCase):
             torch.manual_seed(0)
             x = torch.randn(2, 7, 12, dtype=torch.float64) * 3 + 1
             ref = torch.nn.LayerNorm(12, eps=1e-3).double()
-            ln = RewrittenLayerNorm(12, eps=1e-3, allow_matmul=False, strict_unary="sigmoid_rsqrt").double()
+            ln = RewrittenLayerNorm(12, eps=1e-3, allow_matmul=False).double()
             self.assertTrue(torch.allclose(ln(x), ref(x), atol=1e-10))
             scores = torch.randn(1, 2, 5, 9, dtype=torch.float64) * 4
             for exact in (False, True):
-                kw = dict(seq_len=9, top_k=4, eps=0.0, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
+                kw = dict(seq_len=9, top_k=4, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
                 fast = GibbsTopKSoftmax(allow_matmul=True, **kw).double()
-                strict = GibbsTopKSoftmax(allow_matmul=False, strict_unary="sigmoid_rsqrt", **kw).double()
+                strict = GibbsTopKSoftmax(allow_matmul=False, **kw).double()
                 for a, b in zip(fast(scores), strict(scores)):
                     self.assertTrue(torch.allclose(a.double(), b.double(), atol=1e-10))
             g = SigmoidGELU(allow_matmul=False).double()
             self.assertTrue(torch.allclose(g(x), x * torch.sigmoid(1.702 * x), atol=1e-10))
             for exact in (False, True):
                 torch.manual_seed(1)
-                kw = dict(dim=12, num_heads=2, seq_len=7, top_k=3, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
-                fast = SurgeryAttention(allow_matmul=True, **kw).double()
-                strict = SurgeryAttention(allow_matmul=False, strict_unary="sigmoid_rsqrt", **kw).double()
+                kw = dict(top_k=3, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                fast = SurgeryAttention(12, 2, 7, SurgeryConfig(allow_matmul=True, **kw)).double()
+                strict = SurgeryAttention(12, 2, 7, SurgeryConfig(**kw)).double()
                 strict.load_state_dict(fast.state_dict(), strict=False)
                 self.assertTrue(torch.allclose(fast(x), strict(x), atol=1e-9))
         finally:
@@ -197,6 +188,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_hadamard_graph_matches_reference_with_two_unary_maps(self) -> None:
         import torch
 
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.internal.util import set_surgery_dtype
         from transformer_surgery.models.deit_tiny.surgery_model import DeiTTinySurgeryModel
         from transformer_surgery.ops import (
@@ -216,7 +208,7 @@ class PackageSmokeTests(unittest.TestCase):
             self.assertTrue(torch.allclose(ln(x), ref(x), atol=1e-10))
             scores = torch.randn(1, 2, 5, 9, dtype=torch.float64) * 4
             for exact in (False, True):
-                kw = dict(seq_len=9, top_k=4, eps=0.0, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
+                kw = dict(seq_len=9, top_k=4, gibbs_tail_prob_eps=0.3, use_exact_tail_mass=exact)
                 fast = GibbsTopKSoftmax(allow_matmul=True, **kw).double()
                 had = GibbsTopKSoftmax(hadamard=True, **kw).double()
                 for a, b in zip(fast(scores), had(scores)):
@@ -231,9 +223,9 @@ class PackageSmokeTests(unittest.TestCase):
             for exact in (False, True):
                 for top_k in (3, 7):
                     torch.manual_seed(1)
-                    kw = dict(dim=12, num_heads=2, seq_len=7, top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
-                    fast = SurgeryAttention(allow_matmul=True, **kw).double()
-                    had = SurgeryAttention(hadamard=True, **kw).double()
+                    kw = dict(top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                    fast = SurgeryAttention(12, 2, 7, SurgeryConfig(allow_matmul=True, **kw)).double()
+                    had = SurgeryAttention(12, 2, 7, SurgeryConfig(hadamard=True, **kw)).double()
                     had.load_state_dict(fast.state_dict(), strict=False)
                     self.assertTrue(torch.allclose(fast(x), had(x), atol=1e-9))
             with self.assertRaises(ValueError):
@@ -241,8 +233,8 @@ class PackageSmokeTests(unittest.TestCase):
             # Unary maps of the whole Hadamard graph: sigmoid and inverse square root, plus GELU unless replaced.
             for gelu, expected in (("exact", {"NLGELU", "NLRsqrtPlusEps", "NLSigmoid"}), ("sigmoid", {"NLRsqrtPlusEps", "NLSigmoid"})):
                 model = DeiTTinySurgeryModel(
-                    num_classes=3, img_size=32, patch_size=16, embed_dim=12, depth=1, num_heads=2, top_k=3,
-                    hadamard=True, gelu=gelu, drop_path_rate=0.0,
+                    SurgeryConfig(top_k=3, hadamard=True, gelu=gelu),
+                    num_classes=3, img_size=32, patch_size=16, embed_dim=12, depth=1, num_heads=2, drop_path_rate=0.0,
                 ).double().eval()
                 seen = set()
                 for m in model.modules():
@@ -256,6 +248,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_norm_expansion_strict_products_match_reference(self) -> None:
         import torch
 
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.internal.util import set_surgery_dtype
         from transformer_surgery.ops import (
             AffineCombine,
@@ -316,10 +309,10 @@ class PackageSmokeTests(unittest.TestCase):
             for exact in (False, True):
                 for top_k in (3, 7):
                     torch.manual_seed(1)
-                    kw = dict(dim=12, num_heads=2, seq_len=7, top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
-                    fast = SurgeryAttention(allow_matmul=True, **kw).double()
+                    kw = dict(top_k=top_k, gibbs_tail_prob_eps=0.2, use_exact_tail_mass=exact)
+                    fast = SurgeryAttention(12, 2, 7, SurgeryConfig(allow_matmul=True, **kw)).double()
                     for product in ("norm", "polarization"):
-                        strict = SurgeryAttention(strict_product=product, **kw).double()
+                        strict = SurgeryAttention(12, 2, 7, SurgeryConfig(strict_product=product, **kw)).double()
                         strict.load_state_dict(fast.state_dict(), strict=False)
                         with torch.no_grad():
                             self.assertTrue(torch.allclose(fast(x), strict(x), atol=1e-9))
@@ -406,12 +399,7 @@ class PackageSmokeTests(unittest.TestCase):
         scores = torch.tensor([[[[1.0, 5.0, 3.0, -2.0, 4.0], [0.5, -1.0, 2.0, 2.5, 0.0]]]])
         for allow_matmul in (False, True):
             gibbs = GibbsTopKSoftmax(
-                seq_len=5,
-                top_k=2,
-                eps=1e-6,
-                gibbs_tail_prob_eps=0.5,
-                allow_matmul=allow_matmul,
-                use_exact_tail_mass=True,
+                seq_len=5, top_k=2, gibbs_tail_prob_eps=0.5, allow_matmul=allow_matmul, use_exact_tail_mass=True
             )
             probs, idx, q_tail = gibbs(scores)
             flat = scores.reshape(-1, 5)
@@ -429,29 +417,25 @@ class PackageSmokeTests(unittest.TestCase):
             kept = dense.gather(1, idx.reshape(-1, 2)).reshape_as(probs)
             self.assertTrue(torch.allclose(probs, kept, atol=1e-5))
 
-    def test_strict_unary_default_and_log_exp_deprecation(self) -> None:
-        import warnings
+    def test_strict_layernorm_products_match_reference(self) -> None:
+        # Every strict LayerNorm product rule and the fast graph compute LayerNorm with squares and rsqrt only.
+        import torch
 
-        from transformer_surgery.cli.surgery_config import SurgeryConfig
-        from transformer_surgery.models.deit_tiny.surgery_model import DeiTTinySurgeryModel
+        from transformer_surgery.internal.util import set_surgery_dtype
         from transformer_surgery.ops import RewrittenLayerNorm
 
-        self.assertEqual(SurgeryConfig().strict_unary, "sigmoid_rsqrt")
-        self.assertEqual(RewrittenLayerNorm(8, eps=1e-6).strict_unary, "sigmoid_rsqrt")
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            RewrittenLayerNorm(8, eps=1e-6, strict_unary="log_exp")
-            RewrittenLayerNorm(8, eps=1e-6, allow_matmul=True, strict_unary="log_exp")
-        self.assertEqual(sum(issubclass(w.category, FutureWarning) for w in caught), 1)
-        # Checkpoints written before ``strict_unary`` existed are log-domain.
-        extra = {
-            "top_k": 4, "eps_ln": 1e-6, "gibbs_tail_prob_eps": 0.1, "disable_layernorm_replacement": False,
-            "disable_attention_surgery": False, "disable_softmax_replacement": False, "allow_matmul": False,
-        }
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            model = DeiTTinySurgeryModel.from_pretrained_extra(extra, num_classes=2)
-        self.assertEqual(model.fc_norm.strict_unary, "log_exp")
+        set_surgery_dtype(torch.float64)
+        try:
+            torch.manual_seed(0)
+            x = torch.randn(2, 7, 12, dtype=torch.float64) * 3 + 1
+            ref = torch.nn.LayerNorm(12, eps=1e-3).double()
+            for kw in (dict(strict_product="norm"), dict(strict_product="polarization"), dict(allow_matmul=True)):
+                ln = RewrittenLayerNorm(12, eps=1e-3, **kw).double()
+                self.assertTrue(torch.allclose(ln(x), ref(x), atol=1e-10), kw)
+                unary = {type(m).__name__ for m in ln.modules() if type(m).__name__.startswith("NL")}
+                self.assertEqual(unary, {"NLSquare", "NLRsqrtPlusEps"}, kw)
+        finally:
+            set_surgery_dtype(torch.bfloat16)
 
     def test_integer_polarization_is_exact_for_int8(self) -> None:
         import torch
@@ -483,6 +467,7 @@ class PackageSmokeTests(unittest.TestCase):
         import torch
         import torch.nn as nn
 
+        from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
         from transformer_surgery.internal.calibration import (
             build_ptq_node_setup,
             build_ptq_wrapper,
@@ -490,6 +475,7 @@ class PackageSmokeTests(unittest.TestCase):
             gather_ptq_range_moments,
         )
 
+        cfg = PTQSurgeryConfig(per_output_channel=False)
         torch.manual_seed(0)
         cases = (
             ("conv2d", nn.Conv2d(2, 3, kernel_size=1, bias=True), (4, 2, 5, 5)),
@@ -506,16 +492,7 @@ class PackageSmokeTests(unittest.TestCase):
             with torch.no_grad():
                 ref = layer(x)
             stats = gather_ptq_range_moments(model, loader, selected, batch_indices)
-            setup = build_ptq_node_setup(
-                "0",
-                layer,
-                stats["0"],
-                weight_bits=8,
-                activation_bits=8,
-                compiled_accumulator_bits=None,
-                matmul_activation_bits=None,
-                per_output_channel=False,
-            )
+            setup = build_ptq_node_setup("0", layer, stats["0"], cfg)
             self.assertEqual(setup.weight_scale.ndim, 0)
             gather_ptq_dequant_moments(model, loader, selected, stats, {"0": setup}, batch_indices)
             built = build_ptq_wrapper(layer, setup, stats["0"], dequant_var_eps=1e-8)
@@ -528,27 +505,26 @@ class PackageSmokeTests(unittest.TestCase):
     def test_ptq_calibration_samples_random_batches(self) -> None:
         import torch
         import torch.nn as nn
-        from types import SimpleNamespace
 
+        from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
         from transformer_surgery.internal.calibration import (
             build_ptq_node_setup,
             build_ptq_wrapper,
+            calibration_batch_indices,
             gather_ptq_dequant_moments,
             gather_ptq_range_moments,
-            make_ptq_wrapper,
             ptq_wrapper_from_reload_config,
-            sample_calibration_batch_indices,
         )
 
         gen = torch.Generator().manual_seed(123)
         expected_gen = torch.Generator().manual_seed(123)
-        indices = sample_calibration_batch_indices(10, 4, generator=gen)
+        indices = calibration_batch_indices(10, 4, random=True, generator=gen)
         expected = sorted(torch.randperm(10, generator=expected_gen)[:4].tolist())
         self.assertEqual(indices, expected)
-        self.assertEqual(len(indices), 4)
         self.assertEqual(len(set(indices)), 4)
-        self.assertEqual(sample_calibration_batch_indices(10, None), list(range(10)))
-        self.assertEqual(sample_calibration_batch_indices(0, None), [])
+        self.assertEqual(calibration_batch_indices(10, 4), [0, 1, 2, 3])
+        self.assertEqual(calibration_batch_indices(10, None), list(range(10)))
+        self.assertEqual(calibration_batch_indices(0, None), [])
 
         model = nn.Sequential(nn.Linear(3, 2, bias=False))
         selected = {"0": "linear"}
@@ -559,83 +535,29 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(data.examples_total, 8)
         self.assertGreaterEqual(data.input_max_abs[0].item(), 3.0)
 
-        cfg = SimpleNamespace(
-            weight_bits=8,
-            activation_bits=8,
-            compiled_accumulator_bits=None,
-            matmul_activation_bits=None,
-            per_output_channel=True,
-            dequant_var_eps=1e-8,
-        )
-        setup = build_ptq_node_setup(
-            "0",
-            model[0],
-            data,
-            weight_bits=cfg.weight_bits,
-            activation_bits=cfg.activation_bits,
-            compiled_accumulator_bits=cfg.compiled_accumulator_bits,
-            matmul_activation_bits=cfg.matmul_activation_bits,
-            per_output_channel=cfg.per_output_channel,
-        )
-        gather_ptq_dequant_moments(
-            model,
-            loader,
-            selected,
-            stats,
-            {"0": setup},
-            batch_indices,
-        )
-        self.assertEqual(data.dequant_examples_total, 8)
+        cfg = PTQSurgeryConfig()
+        setup = build_ptq_node_setup("0", model[0], data, cfg)
+        gather_ptq_dequant_moments(model, loader, selected, stats, {"0": setup}, batch_indices)
         self.assertGreater(data.bias_fit.count, 0)
-        wrapper = make_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
-        self.assertEqual(wrapper.quantizer.input_scale.numel(), 1)
-        self.assertIsInstance(wrapper.accumulator, nn.Linear)
         self.assertEqual(setup.activation_bits, 8)
         built = build_ptq_wrapper(model[0], setup, data, dequant_var_eps=cfg.dequant_var_eps)
+        self.assertEqual(built.module.quantizer.input_scale.numel(), 1)
+        self.assertIsInstance(built.module.accumulator, nn.Linear)
         skeleton = ptq_wrapper_from_reload_config(built.reload_config, nn.Linear(3, 2, bias=False))
         skeleton.load_state_dict(built.module.state_dict(), strict=True)
         self.assertEqual(tuple(skeleton(torch.ones(2, 3)).shape), (2, 2))
 
-        from transformer_surgery.internal.calibration import (
-            ptq_activation_bits_for_kind,
-            ptq_activation_group,
-        )
+        from transformer_surgery.internal.calibration import ptq_activation_bits, ptq_activation_group
 
         self.assertEqual(ptq_activation_group("linear"), "linear")
         self.assertEqual(ptq_activation_group("conv2d"), "linear")
         self.assertEqual(ptq_activation_group("affine_scale"), "affine")
         self.assertEqual(ptq_activation_group("matmul"), "matmul")
-        # Linear/Conv keep activation_bits even when affine override is set.
-        self.assertEqual(
-            ptq_activation_bits_for_kind(
-                "linear", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
-            ),
-            8,
-        )
-        self.assertEqual(
-            ptq_activation_bits_for_kind(
-                "conv2d", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
-            ),
-            8,
-        )
-        self.assertEqual(
-            ptq_activation_bits_for_kind(
-                "affine_scale", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
-            ),
-            12,
-        )
-        self.assertEqual(
-            ptq_activation_bits_for_kind(
-                "matmul", 8, compiled_accumulator_bits=12, matmul_activation_bits=8
-            ),
-            8,
-        )
-        self.assertEqual(
-            ptq_activation_bits_for_kind(
-                "affine_scale", 8, compiled_accumulator_bits=None, matmul_activation_bits=None
-            ),
-            8,
-        )
+        # Linear/Conv keep activation_bits even when the compiled-accumulator width is set.
+        widths = PTQSurgeryConfig(activation_bits=8, compiled_accumulator_bits=12, matmul_activation_bits=8)
+        for kind, bits in (("linear", 8), ("conv2d", 8), ("affine_scale", 12), ("matmul", 8)):
+            self.assertEqual(ptq_activation_bits(kind, widths), bits, kind)
+        self.assertEqual(ptq_activation_bits("affine_scale", PTQSurgeryConfig(activation_bits=8)), 8)
 
     def test_traceable_artifact_names(self) -> None:
         from transformer_surgery.internal.reporting import (
@@ -677,8 +599,7 @@ class PackageSmokeTests(unittest.TestCase):
                 "artifacts/checkpoints/anything.pt",
                 str(ptq_cfg),
                 "ts-ptq",
-                "",
-                ".pt",
+                extension=".pt",
             ).endswith("artifacts/checkpoints/ts_ptq_64_fast_jeffreys_8bit.pt")
         )
         self.assertTrue(
@@ -698,31 +619,21 @@ class PackageSmokeTests(unittest.TestCase):
         )
 
     def test_distill_repeat_metadata_helpers(self) -> None:
-        from transformer_surgery.distill import _validation_accuracy_summary, merge_post_distill_into_surgery_meta
+        from transformer_surgery.distill import distill_metadata
+        from transformer_surgery.models.adapters import get_model_adapter
 
         runs = [
             {"run_index": 0, "seed": 42, "val_acc": 0.60, "val_ce_mean": 1.0, "val_jeffreys_mean": 0.3},
             {"run_index": 1, "seed": 43, "val_acc": 0.80, "val_ce_mean": 0.8, "val_jeffreys_mean": 0.2},
         ]
-        summary = _validation_accuracy_summary(runs)
-        self.assertAlmostEqual(summary["val_acc_mean"], 0.70)
-        self.assertAlmostEqual(summary["val_acc_std"], math.sqrt(0.02))
-        with tempfile.TemporaryDirectory() as td:
-            meta_path = os.path.join(td, "distill.json")
-            merge_post_distill_into_surgery_meta(
-                meta_path,
-                0.80,
-                0.8,
-                0.2,
-                run_results=runs,
-                accuracy_summary=summary,
-                best_run=runs[1],
-            )
-            with open(meta_path, encoding="utf-8") as f:
-                cal = json.load(f)["calibration"]
+        meta = distill_metadata(get_model_adapter("deit_tiny_pet"), runs, runs[1])
+        cal = meta["calibration"]
+        self.assertEqual(meta["patient"], "DeiT-Tiny")
         self.assertEqual(cal["student_post_distill_runs"], runs)
         self.assertEqual(cal["student_post_distill_best_seed"], 43)
+        self.assertEqual(cal["student_post_distill_val_acc"], 0.80)
         self.assertAlmostEqual(cal["student_post_distill_val_acc_mean"], 0.70)
+        self.assertAlmostEqual(cal["student_post_distill_val_acc_std"], math.sqrt(0.02))
 
     def test_cli_help(self) -> None:
         env = dict(os.environ)
@@ -752,13 +663,13 @@ class PackageSmokeTests(unittest.TestCase):
         import torch.nn as nn
         import torch.nn.functional as F
 
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.models import DeiTTinySurgeryModel
-        from transformer_surgery.models import adapters
         from transformer_surgery.internal import calibration as calibration_mod
         from transformer_surgery.models.adapters import get_model_adapter
         from transformer_surgery.ops import SurgeryAttention
 
-        model = DeiTTinySurgeryModel(num_classes=37).cpu()
+        model = DeiTTinySurgeryModel(SurgeryConfig(), num_classes=37).cpu()
         self.assertEqual(model.num_classes, 37)
         self.assertEqual(model.seq_len, 197)
         self.assertIsInstance(model.blocks[0].attn, SurgeryAttention)
@@ -774,16 +685,12 @@ class PackageSmokeTests(unittest.TestCase):
         for helper_name in ("_attention_scores", "_sample_topk_scores", "_topk_tail_mass_stats"):
             self.assertFalse(hasattr(adapter, helper_name), helper_name)
         self.assertTrue(hasattr(calibration_mod, "sample_topk_scores"))
-        self.assertTrue(hasattr(calibration_mod, "topk_tail_mass_stats"))
+        self.assertTrue(hasattr(calibration_mod, "topk_tail_mass"))
         self.assertTrue(hasattr(calibration_mod, "apply_gibbs_tail_calibration"))
-        self.assertTrue(hasattr(calibration_mod, "calibrate_vit_reference"))
+        self.assertTrue(hasattr(calibration_mod, "calibrate_reference"))
         self.assertTrue(hasattr(calibration_mod, "fused_qkv_attention_qk_scores"))
 
-        disabled_calibration = DeiTTinySurgeryModel(
-            num_classes=37,
-            depth=1,
-            gibbs_tail_prob_eps=0.1,
-        ).cpu()
+        disabled_calibration = DeiTTinySurgeryModel(SurgeryConfig(gibbs_tail_prob_eps=0.1), num_classes=37, depth=1)
         skipped = adapter.apply_calibration(
             disabled_calibration,
             {"disable_calib_gibbs_tail_prob": True, "gibbs_tail_prob_eps_calibrated_by_block": [0.02]},
@@ -793,11 +700,7 @@ class PackageSmokeTests(unittest.TestCase):
             float(disabled_calibration.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.1, places=2
         )
 
-        calibrated = DeiTTinySurgeryModel(
-            num_classes=37,
-            depth=2,
-            gibbs_tail_prob_eps=0.1,
-        ).cpu()
+        calibrated = DeiTTinySurgeryModel(SurgeryConfig(gibbs_tail_prob_eps=0.1), num_classes=37, depth=2)
         applied = adapter.apply_calibration(
             calibrated,
             {"gibbs_tail_prob_eps_calibrated_by_block": [0.02, 0.03]},
@@ -808,20 +711,18 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_pythia_adapter_and_causal_attention(self) -> None:
         import torch
+        from dataclasses import asdict
         from types import SimpleNamespace
 
-        from transformer_surgery.models.adapters import get_model_adapter
-        from transformer_surgery.models.pythia.surgery_model import (
-            PYTHIA_70M_DEFAULTS,
-            PythiaSurgeryModel,
-            arch_dict_from_hf_config,
-        )
+        from transformer_surgery.cli.surgery_config import SurgeryConfig
+        from transformer_surgery.internal.util import get_surgery_dtype, set_surgery_dtype
+        from transformer_surgery.models.adapters import build_surgery_student, get_model_adapter
+        from transformer_surgery.models.pythia.surgery_model import PythiaSurgeryModel, arch_dict_from_hf_config
         from transformer_surgery.ops import (
             SurgeryCausalAttention,
             build_causal_attn_mask,
             build_causal_valid_key_mean_matrix,
         )
-        from transformer_surgery.cli.surgery_config import SurgeryConfig
 
         adapter = get_model_adapter("pythia_70m_wikitext2")
         self.assertEqual(adapter.patient_name, "Pythia-70M")
@@ -835,7 +736,7 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(L[2], torch.tensor([1 / 3, 1 / 3, 1 / 3])))
 
         attn = SurgeryCausalAttention(
-            32, 4, 8, 8, rotary_ndims=8, allow_matmul=True, gibbs_tail_prob_eps=0.0
+            32, 4, 8, SurgeryConfig(top_k=8, allow_matmul=True, gibbs_tail_prob_eps=0.0), rotary_ndims=8
         )
         x = torch.randn(2, 8, 32)
         y1 = attn(x)
@@ -845,9 +746,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(y1[:, :-1], y2[:, :-1], atol=1e-5))
 
         # Sparse exact-tail mass: top probs + q_tail ~= 1; early rows have ~0 tail.
-        sparse = SurgeryCausalAttention(
-            32, 4, 16, 4, rotary_ndims=8, allow_matmul=True, use_exact_tail_mass=True, gibbs_tail_prob_eps=0.5
-        )
+        sparse_cfg = SurgeryConfig(top_k=4, allow_matmul=True, use_exact_tail_mass=True, gibbs_tail_prob_eps=0.5)
+        sparse = SurgeryCausalAttention(32, 4, 16, sparse_cfg, rotary_ndims=8)
         xs = torch.randn(1, 16, 32)
         q, k, v = sparse._split_qkv(xs)
         q, k = sparse._apply_rotary(q, k)
@@ -863,45 +763,33 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(float(future_mass), 0.0)
         _ = sparse(xs)  # full forward
 
-        # Synthetic reconstruct from extra (no HF download).
-        cfg = SimpleNamespace(
-            top_k=16,
-            eps=1e-5,
-            gibbs_tail_prob_eps=0.0,
-            disable_layernorm_replacement=False,
-            disable_attention_surgery=False,
-            disable_softmax_replacement=False,
-            allow_matmul=True,
-            use_exact_tail_mass=False,
-            context_length=16,
+        # Synthetic reconstruct from a checkpoint record (no HF download).
+        cfg = SurgeryConfig(
+            model_key="pythia_70m_wikitext2", top_k=16, gibbs_tail_prob_eps=0.0, allow_matmul=True, context_length=16
         )
-        arch = dict(PYTHIA_70M_DEFAULTS)
-        arch.update(
-            {
-                "vocab_size": 128,
-                "hidden_size": 32,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "intermediate_size": 64,
-            }
-        )
-        model = PythiaSurgeryModel.from_arch_and_surgery(arch, cfg)
-        ids = torch.randint(0, 128, (2, 16))
-        logits = model(ids)
-        self.assertEqual(tuple(logits.shape), (2, 16, 128))
-        extra = {
-            "top_k": 16,
-            "gibbs_tail_prob_eps": 0.0,
-            "disable_layernorm_replacement": False,
-            "disable_attention_surgery": False,
-            "disable_softmax_replacement": False,
-            "allow_matmul": True,
-            "use_exact_tail_mass": False,
-            "context_length": 16,
-            "eps_ln": 1e-5,
-            "arch": {**arch, "seq_len": 16, "context_length": 16},
+        arch = {
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "rotary_pct": 0.25,
+            "rope_theta": 10000.0,
+            "attention_bias": True,
+            "use_parallel_residual": True,
+            "hidden_dropout": 0.0,
+            "attention_dropout": 0.0,
         }
-        rebuilt = PythiaSurgeryModel.from_pretrained_extra(extra, cfg)
+        saved_dtype = get_surgery_dtype()
+        try:
+            set_surgery_dtype(torch.float32)
+            model = PythiaSurgeryModel(cfg, arch)
+            record = {**asdict(cfg), "surgery_dtype": "float32", "arch": arch}
+            rebuilt, _ = build_surgery_student(record, SimpleNamespace(top_k=None, eps=None))
+        finally:
+            set_surgery_dtype(saved_dtype)
+        ids = torch.randint(0, 128, (2, 16))
+        self.assertEqual(tuple(model(ids).shape), (2, 16, 128))
         rebuilt.load_state_dict(model.state_dict(), strict=True)
         with torch.no_grad():
             self.assertTrue(torch.allclose(model(ids), rebuilt(ids), atol=1e-6))
@@ -924,19 +812,18 @@ class PackageSmokeTests(unittest.TestCase):
             hidden_act="gelu",
         )
         ref = GPTNeoXForCausalLM(hf_cfg).eval()
-        scfg = SimpleNamespace(
+        scfg = SurgeryConfig(
             top_k=16,
-            eps=1e-5,
             gibbs_tail_prob_eps=0.0,
             disable_layernorm_replacement=True,
             disable_attention_surgery=True,
             disable_softmax_replacement=True,
             allow_matmul=True,
-            use_exact_tail_mass=False,
             context_length=16,
         )
-        student = PythiaSurgeryModel.from_arch_and_surgery(arch_dict_from_hf_config(hf_cfg), scfg).eval()
-        student.load_from_reference(ref)
+        student = PythiaSurgeryModel(scfg, arch_dict_from_hf_config(hf_cfg)).eval()
+        mapping = adapter.copy_reference_weights(student, ref)
+        self.assertEqual(len(mapping), len(ref.state_dict()))
         with torch.no_grad():
             a = ref(input_ids=ids, use_cache=False).logits
             b = student(ids)

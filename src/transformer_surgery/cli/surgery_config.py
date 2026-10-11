@@ -3,31 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
-from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
-from transformer_surgery.internal.util import DEFAULT_MODEL_KEY
+from transformer_surgery.cli.common import AdapterRunConfig, parse_cli_config
 
 
 @dataclass
-class SurgeryConfig:
-    """Surgery transform + calibration run; JSON + CLI via :meth:`load`."""
+class SurgeryConfig(AdapterRunConfig):
+    """Surgery transform + calibration run; also the architecture record of a surgery checkpoint."""
 
-    model_key: str = DEFAULT_MODEL_KEY
-    data_dir: str = "./data"
-    batch_size: int = 128
-    workers: int = 2
-    # Super-resolution (MambaIR) fields; ignored by classification adapters.
-    scale: int = 2
-    train_hr: Optional[str] = None
-    train_lr: Optional[str] = None
-    val_hr: Optional[str] = None
-    val_lr: Optional[str] = None
-    patch_size: int = 64
-    train_repeat: int = 1
-    max_train_items: Optional[int] = None
-    max_val_items: Optional[int] = None
-    sr_download: bool = True
     # Causal LM (Pythia) fields; ignored by vision / SR adapters.
     context_length: int = 128
     hf_model_id: str = "EleutherAI/pythia-70m"
@@ -36,27 +20,14 @@ class SurgeryConfig:
     max_train_tokens: Optional[int] = None
     max_val_tokens: Optional[int] = None
     top_k: int = 32
-    # LayerNorm epsilon. Softmax normalization uses no additive epsilon.
     eps: float = 1e-5
     gibbs_tail_prob_eps: float = 1e-5
     gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
     use_exact_tail_mass: bool = False
-    # Strict unary set: "sigmoid_rsqrt" (no exp and no log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2,
-    # products by polarization) or the deprecated "log_exp" (log-domain LayerNorm and softmax). Ignored when allow_matmul.
-    strict_unary: str = "sigmoid_rsqrt"
-    # MLP activation: "exact" GELU or "sigmoid" x*sigmoid(1.702x) (model change for NPUs without GELU).
     gelu: str = "exact"
-    # Hadamard graph (DeiT-Tiny): the strict graph with every product of two activations, squares included, as one
-    # elementwise product instead of polarization; QK^T and PV as products plus sums. Needs allow_matmul=False
-    # and strict_unary="sigmoid_rsqrt"; the unary maps are then the sigmoid, the inverse square root and GELU.
     hadamard: bool = False
-    # Products of two activations in the DeiT-Tiny strict graph: "norm" (default, the paper's strict construction:
-    # ((a+b)^2 - a^2 - b^2)/2 where a square is shared, i.e. QK^T, PV, LayerNorm and the exact tail term, and
-    # polarization ((a+b)^2-(a-b)^2)/4 elsewhere) or "polarization" everywhere (earlier runs).
     strict_product: str = "norm"
-    # Sparse support selection: "topk" keeps the top-k exact scores; "query_centroids" keeps the
-    # top-k keys of the nearest fixed query centroid (k-means on calibration queries).
     support_routing: str = "topk"
     routing_clusters: int = 32
     routing_calibration_batches: Optional[int] = 20
@@ -64,31 +35,17 @@ class SurgeryConfig:
     routing_kmeans_iters: int = 30
     routing_seed: int = 0
     routing_eval_batches: Optional[int] = None
-    # Seed of the global RNGs, set before the loaders are built, so the calibration batches (order and augmentation)
-    # and with them the tail mass and the centroids repeat run to run. None: unseeded (runs before 2026-10-11).
     calibration_seed: Optional[int] = 0
-    reference_checkpoint: Optional[str] = None
-    device: str = "cuda"
     surgery_dtype: str = "bfloat16"
     disable_layernorm_replacement: bool = False
     disable_attention_surgery: bool = False
     disable_softmax_replacement: bool = False
     allow_matmul: bool = False
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing_prob: float = 0.0
     pre_ft_checkpoint: str = "artifacts/checkpoints/ts_surgery_topk64_fast.pt"
     log_dir: str = "artifacts/logs"
-    config_json_path: Optional[str] = None
-
-    @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "SurgeryConfig":
-        return load_dataclass_from_json(cls, json_path, overrides)
 
 
 FIELD_HELP_SURGERY: Dict[str, str] = {
-    "model_key": "Model adapter key. Default: deit_tiny_pet.",
-    "reference_checkpoint": "Reference/teacher checkpoint path.",
     "eps": "LayerNorm epsilon; softmax normalization always uses zero additive epsilon.",
     "gibbs_tail_prob_eps": "Initial omitted-tail probability mass; calibration overwrites per-block values.",
     "gibbs_tail_calibration_batches": "Training batches for Gibbs tail mass; JSON null uses the full train loader.",
@@ -97,15 +54,15 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
         "Compute omitted-tail mass at runtime from dense softmax via the centroid partition trick "
         "(N * mean(exp)) instead of using the calibrated/fixed gibbs_tail_prob_eps scalar."
     ),
-    "strict_unary": "Strict unary set: 'sigmoid_rsqrt' (default; squares, sigmoid, rsqrt) or deprecated 'log_exp'.",
-    "gelu": "MLP activation: 'exact' GELU or 'sigmoid' x*sigmoid(1.702x) (a model change).",
+    "gelu": "MLP activation: 'exact' GELU or 'sigmoid' x*sigmoid(1.702x) (a model change for NPUs without GELU).",
     "strict_product": (
-        "DeiT-Tiny strict graph products: 'norm' (default; norm expansion where a square is shared, polarization "
-        "elsewhere) or 'polarization' everywhere (earlier runs)."
+        "DeiT-Tiny strict graph products of two activations: 'norm' (default; ((a+b)^2 - a^2 - b^2)/2 where a "
+        "square is shared: QK^T, PV, LayerNorm and the exact tail term; polarization elsewhere) or 'polarization' "
+        "((a+b)^2 - (a-b)^2)/4 everywhere (earlier runs)."
     ),
     "hadamard": (
         "DeiT-Tiny Hadamard graph: elementwise products instead of polarization, QK^T and PV as products plus "
-        "sums, no matmul; needs allow_matmul=false and strict_unary='sigmoid_rsqrt'."
+        "sums, no matmul; needs allow_matmul=false."
     ),
     "support_routing": (
         "Sparse support selection: 'topk' (top-k exact scores) or 'query_centroids' "
@@ -124,7 +81,7 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "disable_layernorm_replacement": "Debug: use nn.LayerNorm instead of RewrittenLayerNorm.",
     "disable_attention_surgery": "Debug: use dense scaled-dot attention instead of attention surgery modules.",
     "disable_softmax_replacement": "Debug: when attention surgery is on, use full softmax @ V.",
-    "allow_matmul": "Debug: use matmul fast paths where supported.",
+    "allow_matmul": "Fast graph: matmul and Hadamard products of activations.",
     "surgery_dtype": "torch dtype name for surgery compute, e.g. bfloat16, float16, or float32.",
     "log_dir": "Directory for model structure dumps.",
     "context_length": "Fixed token window length for causal-LM surgery (Pythia).",
@@ -135,14 +92,13 @@ FIELD_HELP_SURGERY: Dict[str, str] = {
     "max_val_tokens": "Optional cap on concatenated validation tokens before windowing.",
 }
 
-CLI_SURGERY_DESCRIPTION = "Model-adapter surgery: reference checkpoint -> surgery student + metadata"
 CLI_SURGERY_CONFIG_DEFAULT = "configs/surgery/topk64_fast.json"
 
 
 def parse_surgery_config(argv: Optional[Sequence[str]] = None) -> SurgeryConfig:
     return parse_cli_config(
         SurgeryConfig,
-        description=CLI_SURGERY_DESCRIPTION,
+        description="Model-adapter surgery: reference checkpoint -> surgery student + metadata",
         config_default=CLI_SURGERY_CONFIG_DEFAULT,
         field_help=FIELD_HELP_SURGERY,
         argv=argv,

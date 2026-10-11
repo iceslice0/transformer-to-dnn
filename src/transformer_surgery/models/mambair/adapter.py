@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from transformer_surgery.cli.surgery_config import SurgeryConfig
 from transformer_surgery.internal.util import get_device, get_surgery_dtype, maybe_surgery_cuda_autocast
 from transformer_surgery.models.adapters import SurgeryModelAdapter
 
@@ -33,18 +34,10 @@ def _infer_scale_from_state(state: Dict[str, torch.Tensor]) -> int:
     return scale
 
 
-def _crop_border(model: nn.Module, cfg: Any = None) -> int:
-    if cfg is not None and getattr(cfg, "scale", None):
-        return int(cfg.scale)
-    return int(getattr(model, "scale", None) or getattr(model, "upscale", 1))
-
-
 class MambaIRLightSRAdapter(SurgeryModelAdapter):
     key = "mambair_lightsr"
     patient_name = "MambaIRv2-Light"
     dataset_name = "DIV2K/Set5"
-
-    # -- construction / IO -----------------------------------------------------------------
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         from transformer_surgery.models.mambair.loaders import build_mambair_loaders
@@ -55,96 +48,32 @@ class MambaIRLightSRAdapter(SurgeryModelAdapter):
         from transformer_surgery.models.mambair.arch import build_mambair_lightsr
 
         device = get_device()
-        path = os.path.abspath(path)
-        payload = torch.load(path, map_location=device, weights_only=False)
-        state = None
-        for key in ("params_ema", "params", "state_dict"):
-            if isinstance(payload, dict) and key in payload:
-                state = payload[key]
-                break
-        if state is None:
-            state = payload
-        scale = _infer_scale_from_state(state)
-        model = build_mambair_lightsr(scale).to(device)
+        payload = torch.load(os.path.abspath(path), map_location=device, weights_only=False)
+        state = next((payload[k] for k in ("params_ema", "params", "state_dict") if k in payload), payload)
+        model = build_mambair_lightsr(_infer_scale_from_state(state)).to(device)
         model.load_state_dict(state, strict=False)
-        model.eval()
-        return model
+        return model.eval()
 
-    def build_surgery_model(self, cfg: Any) -> nn.Module:
+    def build_surgery_model(self, cfg: SurgeryConfig, extra: Optional[Mapping[str, Any]] = None) -> nn.Module:
         from transformer_surgery.models.mambair.surgery_model import MambaIRLightSurgeryModel
 
-        return MambaIRLightSurgeryModel.from_surgery_config(cfg)
+        return MambaIRLightSurgeryModel(cfg)
 
-    def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
-        from transformer_surgery.models.mambair.surgery_model import MambaIRLightSurgeryModel
-
-        return MambaIRLightSurgeryModel.from_pretrained_extra(extra)
-
-    def copy_reference_weights(self, student: nn.Module, reference: nn.Module) -> Dict[str, str]:
-        return student.load_from_reference(reference)
-
-    def freeze_surgery_parameters(self, model: nn.Module) -> None:
-        from transformer_surgery.models.deit_tiny.surgery_model import freeze_eps_parameters
-
-        freeze_eps_parameters(model)
-
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
-        from transformer_surgery.internal.calibration import calibrate_softmax_layernorm_reference
-
-        return calibrate_softmax_layernorm_reference(reference, loader, cfg)
-
-    def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
-        if cfg.disable_layernorm_replacement:
-            ln = "nn.LayerNorm"
-        elif cfg.allow_matmul:
-            ln = "RewrittenLayerNorm(rsqrt.mul)"
-        else:
-            ln = "RewrittenLayerNorm(log/sqrt_exp)"
-        if cfg.disable_attention_surgery:
-            attn = "WindowAttention(vanilla scaled QK^T softmax @ V)"
-        else:
-            dot = "PairwiseDotBySquare(QK^T matmul)" if cfg.allow_matmul else "PairwiseDotBySquare(square identity)"
-            if cfg.disable_softmax_replacement:
-                attn = f"SurgeryWindowAttention({dot}+full_softmax+dense@V)"
-            else:
-                mix = (
-                    "SparseWeightedSumBySquare(elementwise p*v)"
-                    if cfg.allow_matmul
-                    else "SparseWeightedSumBySquare(square identity)"
-                )
-                if bool(getattr(cfg, "use_exact_tail_mass", False)):
-                    tail = "+exact_tail@V"
-                elif bool(getattr(cfg, "disable_calib_gibbs_tail_prob", False)):
-                    tail = "+initial_tail@V"
-                else:
-                    tail = "+calibrated_tail@V"
-                attn = f"SurgeryWindowAttention({dot}+GibbsTopKSoftmax{tail}+{mix})"
-        mapping: Dict[str, str] = {}
-        if model is None:
-            return {"WindowAttention.*": attn, "LayerNorm.*": ln}
-        from transformer_surgery.models.mambair.surgery_model import SurgeryWindowAttention
-        from transformer_surgery.ops import RewrittenLayerNorm
-
-        uniform_attn = "SurgeryWindowAttention(AffineMean uniform key-mean @ V)"
-        net = getattr(model, "net", model)
-        for name, module in net.named_modules():
-            if isinstance(module, SurgeryWindowAttention):
-                mapping[name] = uniform_attn if getattr(module, "uniform", False) else attn
-            elif isinstance(module, RewrittenLayerNorm):
-                mapping[name] = ln
-        return mapping
+    def reference_key(self, key: str) -> str:
+        # The student wraps the reference network as ``net``.
+        return super().reference_key(key.removeprefix("net."))
 
     # -- SR task hooks (override classification defaults) -----------------------------------
 
     @torch.no_grad()
-    def evaluate(self, model: nn.Module, val_loader: DataLoader, cfg: Any = None) -> Tuple[float, float, Dict[str, float]]:
+    def evaluate(self, model: nn.Module, val_loader: DataLoader, cfg: Any) -> Tuple[float, float, Dict[str, float]]:
         from transformer_surgery.internal.sr_metrics import align_spatial, calc_psnr, calc_ssim
 
         device = get_device()
         model.eval()
         dt = get_surgery_dtype()
         use_cuda = device.type == "cuda"
-        crop = _crop_border(model, cfg)
+        crop = cfg.scale
         psnr_sum = l1_sum = ssim_sum = 0.0
         n = 0
         for lq, hr in val_loader:
@@ -171,7 +100,7 @@ class MambaIRLightSRAdapter(SurgeryModelAdapter):
         student.eval()
         dt = get_surgery_dtype()
         use_cuda = device.type == "cuda"
-        crop = _crop_border(student)
+        crop = student.scale
         psnr_sum = l1_sum = match_sum = 0.0
         n = 0
         for lq, hr in val_loader:

@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 src/transformer_surgery/__init__.py
@@ -25,7 +26,9 @@ src/transformer_surgery/cli/surgery_config.py
 src/transformer_surgery/internal/__init__.py
 src/transformer_surgery/internal/calibration.py
 src/transformer_surgery/internal/metrics.py
+src/transformer_surgery/internal/pointwise.py
 src/transformer_surgery/internal/reporting.py
+src/transformer_surgery/internal/routing.py
 src/transformer_surgery/internal/sr_metrics.py
 src/transformer_surgery/internal/util.py
 src/transformer_surgery/models/__init__.py

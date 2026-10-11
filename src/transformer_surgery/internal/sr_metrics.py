@@ -6,7 +6,7 @@ MambaIR SR path reports the same numbers. Tensors are ``[B, 3, H, W]`` in ``[0, 
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -46,25 +46,21 @@ def calc_psnr(pred: torch.Tensor, target: torch.Tensor, crop_border: int, y_chan
 def calc_ssim(pred: torch.Tensor, target: torch.Tensor, crop_border: int, y_channel: bool = True) -> torch.Tensor:
     """Standard skimage SSIM averaged over batch."""
     pred_np, target_np = _prepare_metric_arrays(pred, target, crop_border, y_channel)
-    scores: List[float] = []
-    for i in range(pred_np.shape[0]):
-        if pred_np.ndim == 3:
-            scores.append(structural_similarity(target_np[i], pred_np[i], data_range=1.0))
-        else:
-            scores.append(structural_similarity(target_np[i], pred_np[i], data_range=1.0, channel_axis=-1))
+    channel_axis = None if pred_np.ndim == 3 else -1
+    scores = [
+        structural_similarity(target_np[i], pred_np[i], data_range=1.0, channel_axis=channel_axis)
+        for i in range(pred_np.shape[0])
+    ]
     return torch.tensor(float(np.mean(scores)), dtype=pred.dtype, device=pred.device)
+
+
+def _center_crop(t: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    dh, dw = t.shape[-2] - h, t.shape[-1] - w
+    return t[..., dh // 2 : dh // 2 + h, dw // 2 : dw // 2 + w]
 
 
 def align_spatial(pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Center-crop pred/target to a shared spatial size for safe loss/metric eval."""
     h = min(pred.shape[-2], target.shape[-2])
     w = min(pred.shape[-1], target.shape[-1])
-    if pred.shape[-2:] != (h, w):
-        dh = pred.shape[-2] - h
-        dw = pred.shape[-1] - w
-        pred = pred[..., dh // 2:dh // 2 + h, dw // 2:dw // 2 + w]
-    if target.shape[-2:] != (h, w):
-        dh = target.shape[-2] - h
-        dw = target.shape[-1] - w
-        target = target[..., dh // 2:dh // 2 + h, dw // 2:dw // 2 + w]
-    return pred, target
+    return _center_crop(pred, h, w), _center_crop(target, h, w)

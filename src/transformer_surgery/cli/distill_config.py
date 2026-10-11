@@ -3,33 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
-from transformer_surgery.cli.surgery_config import FIELD_HELP_SURGERY
-from transformer_surgery.cli.common import load_dataclass_from_json, parse_cli_config
-from transformer_surgery.internal.util import DEFAULT_MODEL_KEY
+from transformer_surgery.cli.common import AdapterRunConfig, parse_cli_config
 
 
 @dataclass
-class JeffreysDistillConfig:
-    """Mixed CE + Jeffreys distillation; JSON + CLI via :meth:`load`."""
+class JeffreysDistillConfig(AdapterRunConfig):
+    """Mixed hard-label + teacher-matching (CE + Jeffreys for classification) distillation."""
 
-    model_key: str = DEFAULT_MODEL_KEY
-    data_dir: str = "./data"
     epochs: int = 2
-    batch_size: int = 128
-    workers: int = 2
-    # Super-resolution (MambaIR) fields; ignored by classification adapters.
-    scale: int = 2
-    train_hr: Optional[str] = None
-    train_lr: Optional[str] = None
-    val_hr: Optional[str] = None
-    val_lr: Optional[str] = None
-    patch_size: int = 64
-    train_repeat: int = 1
-    max_train_items: Optional[int] = None
-    max_val_items: Optional[int] = None
-    sr_download: bool = True
     lr: float = 5e-4
     weight_decay: float = 0.05
     warmup_epochs: Optional[int] = None
@@ -41,42 +24,30 @@ class JeffreysDistillConfig:
     keep_best: bool = True
     base_seed: int = 42
     num_trainings: int = 1
-    reference_checkpoint: Optional[str] = None
     pre_checkpoint: str = "artifacts/checkpoints/ts_surgery_topk64_fast.pt"
     output: str = "artifacts/checkpoints/ts_distill_64_fast_jeffreys.pt"
-    randaugment: bool = True
-    ra_magnitude: int = 9
-    random_erasing_prob: float = 0.0
-    device: str = "cuda"
     train_progress_interval: int = 10
     top_k: Optional[int] = None
     eps: Optional[float] = None
-    config_json_path: Optional[str] = None
-
-    @classmethod
-    def load(cls, json_path: str, overrides: Optional[Dict[str, Any]] = None) -> "JeffreysDistillConfig":
-        return load_dataclass_from_json(cls, json_path, overrides)
 
 
 FIELD_HELP_JEFFREYS: Dict[str, str] = {
-    "model_key": FIELD_HELP_SURGERY["model_key"],
-    "reference_checkpoint": FIELD_HELP_SURGERY["reference_checkpoint"],
+    "warmup_epochs": "Linear warmup epochs; JSON null uses min(5, epochs).",
     "distill_weight": "Mixing weight for teacher matching vs hard-label CE.",
     "base_seed": "Base random seed; run i uses base_seed + i.",
     "num_trainings": "Number of independent distillation trainings to run; only the best checkpoint is saved.",
+    "top_k": "Override of the checkpoint's top_k.",
+    "eps": "Override of the checkpoint's LayerNorm epsilon.",
 }
 
-CLI_JEFFREYS_DESCRIPTION = "Model-adapter CE + Jeffreys teacher matching"
 CLI_JEFFREYS_CONFIG_DEFAULT = "configs/distill/64_fast_jeffreys.json"
-CLI_JEFFREYS_CONFIG_HELP = "JSON hyperparameters (merged with JeffreysDistillConfig defaults)."
 
 
 def parse_distill_config(argv: Optional[Sequence[str]] = None) -> JeffreysDistillConfig:
     return parse_cli_config(
         JeffreysDistillConfig,
-        description=CLI_JEFFREYS_DESCRIPTION,
+        description="Model-adapter CE + Jeffreys teacher matching",
         config_default=CLI_JEFFREYS_CONFIG_DEFAULT,
-        config_help=CLI_JEFFREYS_CONFIG_HELP,
         field_help=FIELD_HELP_JEFFREYS,
         argv=argv,
     )

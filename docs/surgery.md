@@ -67,8 +67,8 @@ The graph shows an `AffineContract` child; the stack is plain tensor wiring in `
 
 Strictly nonlinear scalar maps:
 
-- Exact unaries: `NLSquare`, `NLSigmoid`, `NLExp`, `NLLogPlusEps`, `NLSqrtExp`,
-  `NLRsqrtPlusEps`, `NLReciprocalPlusEps`, `NLGELU`.
+- Exact unaries: `NLSquare`, `NLSigmoid`, `NLRsqrtPlusEps`, `NLGELU` (strict graph), plus `NLExp` and
+  `NLReciprocalPlusEps` (fast graph).
 
 Composite modules built from these (no new unary types): `ElementwiseProduct` (polarization
 `((a+b)^2-(a-b)^2)/4` on the strict path, `AffineHadamard` with `allow_matmul`), `ReciprocalByRsqrt`
@@ -78,8 +78,8 @@ and `QueryCentroidRouter` (fixed affine centroid scores plus routing).
 `NLGELU` is an exact GELU basis op, not a piecewise-linear approximation and not a trainable
 parameter block.
 
-`NLLogPlusEps`, `NLRsqrtPlusEps`, and `NLReciprocalPlusEps` carry a fixed `eps` buffer
-set from the run config. As a buffer it never appears in `model.parameters()` and is therefore
+`NLRsqrtPlusEps` and `NLReciprocalPlusEps` carry a fixed `eps` buffer: the LayerNorm `eps` from the run
+config, zero for the softmax normalizer. As a buffer it never appears in `model.parameters()` and is therefore
 not trainable.
 
 ### Routing
@@ -88,16 +88,12 @@ Pure tensor wiring and discrete selection - no arithmetic, no parameters:
 
 - Shape and layout: `reshape`/`view`, `transpose`, `expand`, `cat`, `stack`,
   `broadcast_tensors`, `unsqueeze`.
-- Discrete selection: `torch.topk`, `torch.gather`, `F.relu` (sign split in the LN strict path),
-  `Dropout`/`DropPath`.
-
-`F.relu` is classified as routing - it chooses between an operand and zero rather than computing a
-smooth nonlinearity, so it lives with `topk` and `gather`, not with `NLSquare`/`NLExp`.
+- Discrete selection: `torch.topk`, `torch.gather`, `torch.scatter`, `Dropout`/`DropPath`.
 
 The routing surface is also re-exported from `transformer_surgery.ops` under `Routing*`
 aliases (`RoutingTranspose`, `RoutingCat`, `RoutingStack`, `RoutingUnsqueeze`, `RoutingExpand`,
 `RoutingExpandAs`, `RoutingSqueeze`, `RoutingBroadcastTensors`, `RoutingTopK`, `RoutingGather`,
-`RoutingFullLike`, `RoutingReLU`, `RoutingDropPath`) so the routing vocabulary is
+`RoutingScatter`, `RoutingFullLike`, `RoutingAdd`, `RoutingDropPath`) so the routing vocabulary is
 discoverable alongside the `Affine*` and `NL*` classes. The op implementations use these aliases
 for routing inside `ops.py`; the aliases are names for tensor wiring, not extra graph modules.
 
@@ -111,28 +107,22 @@ Common prefix:
 - `u = AffineContract("i,...i->...", [1, -1])(stack(x, mu, dim=-1))` (centering, no add module).
 - `r2 = AffineMean(-1, keepdim=True)(NLSquare()(u))`.
 
-Strict path, `strict_unary="sigmoid_rsqrt"` (default; the paper's strict graph: squares, sigmoid, rsqrt):
+Strict path (squares, sigmoid, rsqrt):
 
 - `inv_std = NLRsqrtPlusEps(eps)(r2)` (one inverse square root per token).
-- `z = ElementwiseProduct()(u, inv_std)` (polarization, two squares per entry).
-- Unary count per LayerNorm: `3 N d_model + N` (paper Table 1).
-
-Strict path, `strict_unary="log_exp"` (deprecated log-domain form; emits a `FutureWarning`):
-
-- `au = stack(F.relu(u), F.relu(-u), dim=-2)` - magnitude split, no `abs`.
-- `log_num = NLLogPlusEps(eps)(au)`.
-- `log_den = NLLogPlusEps(eps)(r2)` broadcast to match `log_num`.
-- `t = AffineContract("q,...qpc->...pc", [2, -1])(stack(log_num, log_den, dim=2))`.
-- `a_mag = NLSqrtExp()(t)` (= `sqrt(exp(t))`, equivalent to `exp(log_num - 0.5*log_den)`).
-- `z = AffineContract("p,...pc->...c", [1, -1])(a_mag)`.
+- `strict_product="norm"` (default): `z = ((u+a)^2 - u^2 - a^2)/2` with `a = inv_std` and `u^2` from the variance,
+  `2 N d_model + N` squares per LayerNorm.
+- `strict_product="polarization"`: `z = ElementwiseProduct()(u, inv_std)` (two squares per entry); unary count per
+  LayerNorm `3 N d_model + N` (paper Table 1).
 
 Fast path (`allow_matmul=True`):
 
 - `inv_std = NLRsqrtPlusEps(eps)(r2)`.
 - `z = AffineHadamard()(u, inv_std)`.
 
-Final affine: `AffineScaleBias(normalized_shape)` carries `gamma`/`beta`. Weights are copied
-from the timm `nn.LayerNorm` by `copy_ln_params_to_rewritten`. `eps` is fixed at construction
+Final affine: `AffineScaleBias(normalized_shape)` carries `gamma`/`beta`. The adapter's
+`copy_reference_weights` copies them from the reference `nn.LayerNorm` (the student keeps them
+under `affine`). `eps` is fixed at construction
 from `cfg.eps` and stored as a buffer (not a parameter), so it is never trained; it is not
 copied from `src.eps`.
 
@@ -204,7 +194,8 @@ forcing distillation to absorb the bias into trainable parameters elsewhere.
 
 ## Transform 3: Softmax Replacement
 
-`GibbsTopKSoftmax(seq_len, top_k, eps=0, gibbs_tail_prob_eps, allow_matmul)` replaces dense softmax.
+`GibbsTopKSoftmax(seq_len, top_k, gibbs_tail_prob_eps, allow_matmul, use_exact_tail_mass, hadamard)` replaces dense
+softmax.
 It returns sparse probabilities on the top-k indices, the index tensor, and a tail-mass scalar
 `q_tail`.
 
@@ -218,7 +209,6 @@ routing plus `AffineContract` submodules so the graph lists explicit affine node
 - `gibbs_tail_prob_eps` is a scalar module parameter that reserves omitted-tail probability mass.
 - `scale_top_probs_by_tail` (`AffineHadamard`) applies `1 - gibbs_tail_prob_eps` to the top-k
   probabilities.
-- `logit_logz_contract` (`[1, 1]`) implements `vals + (-log_z)`.
 
 Tail term:
 
@@ -233,20 +223,17 @@ Tail term:
 
 Normalization:
 
-- Strict, `strict_unary="sigmoid_rsqrt"`: `exp_vals = ExpBySigmoid()(vals)` (two sigmoids, one rsqrt, three
-  squares per entry), `inv_z = ReciprocalByRsqrt(eps)(sum_exp)` (one rsqrt and one square per row), and
+- Strict: `exp_vals = ExpBySigmoid()(vals)` (two sigmoids, one rsqrt, three
+  squares per entry), `inv_z = ReciprocalByRsqrt()(sum_exp)` (one rsqrt and one square per row), and
   `top_probs = ElementwiseProduct()(exp_vals, inv_z)` (two squares per entry): 8 unary maps per entry and 2 per
   row (paper Table 1). No exp, no log, no `/` operator.
-- Strict, `strict_unary="log_exp"` (deprecated): `top_probs = exp(vals - log(sum_exp + eps))` via `NLLogPlusEps` +
-  `AffineContract` + `NLExp`, then `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`. No `/`
-  operator.
-- Fast: `top_probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(eps)(sum_exp))`, then
+- Fast: `top_probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(0)(sum_exp))`, then
   `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`.
 
-Every current model construction sets the softmax-normalizer `eps` to zero. The positive `eps`
-field in run configuration and checkpoint metadata belongs only to LayerNorm. The explicit
-`GibbsTopKSoftmax` argument and its stored buffers remain for compatibility with older nonzero-eps
-runs; those compatibility runs are not reported in the paper.
+The softmax-normalizer offsets are zero, as in dense softmax. The positive `eps` field in run
+configuration and checkpoint metadata belongs only to LayerNorm. Checkpoints of runs before
+2026-10-09 store nonzero normalizer offsets; `GibbsTopKSoftmax.set_normalizer_epsilon(0)` resets them
+(`scripts/check_exact_fp64.py`).
 `gibbs_tail_prob_eps` is an `nn.Parameter` initialized from config, saved in the checkpoint state
 dict, overwritten by calibration, and clamped to `[0, 1]` in `forward` before applying it as
 probability mass.
@@ -267,9 +254,6 @@ exposes four debug flags that selectively bypass the rewrites:
 
 Graph options that change the compiled model (not debug flags):
 
-- `strict_unary` - `"sigmoid_rsqrt"` (default, paper) or the deprecated `"log_exp"` on the strict path. The
-  superseded log-domain configs (`topk*_strict.json`, `topk*_strict_qc32.json`) set `"log_exp"` explicitly;
-  checkpoints written before the option existed reload as `"log_exp"`.
 - `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (paper Corollary 1; a model change).
 - `support_routing` - `"topk"` or `"query_centroids"` (see `docs/cluster_routing.md`).
 - `strict_product` - products of two activations in the DeiT-Tiny strict graph. `"norm"` (default, the paper's
@@ -288,15 +272,15 @@ Graph options that change the compiled model (not debug flags):
   `test_affine_combine_keeps_dtype_of_first_input`; the PTQ runs made with the promoted add are kept in
   `artifacts/logs/norm_construction_2026-10-10/obsolete_fp32_promotion/`. During evaluation the full-size steps run in
   place on fresh tensors; PTQ turns this off (`set_inplace_eval(False)`), since its calibration reads node inputs in
-  forward hooks. `"polarization"` uses polarization for every product; checkpoints written before the option existed
-  reload as `"polarization"`. Since 2026-10-10 its value mix subtracts the two squares per term before the sum over keys
+  forward hooks. `"polarization"` uses polarization for every product. Since 2026-10-10 its value mix subtracts the two squares per term before the sum over keys
   (`AffineContractPerTerm`), the optimal order (bf16 mix error 14.1% at k=197 against 31.3% when the squares are summed
   over keys first; `make mix-precision`). The polarization strict runs with the earlier order are kept in
   `artifacts/backup_polarization_2026-10-10/` (code at commit 7141fcc); the Table 2 baseline with the per-term order is
-  `make strict-pol` (`*_strict_sr_gs_pol*.json`).
+  `make strict-pol` (`*_strict_sr_gs_pol*.json`). `topk*_strict.json` and `topk*_strict_qc32.json` (`make c`,
+  `make routing-strict`) are the polarization strict graph with exact GELU.
   Exploratory variants of the same day (partial-sum mix, first per-term mix) are in
   `artifacts/backup_norm_explore_2026-10-10/`.
-- `hadamard` - DeiT-Tiny only, with `allow_matmul=false` and `strict_unary="sigmoid_rsqrt"`: the Hadamard
+- `hadamard` - DeiT-Tiny only, with `allow_matmul=false`: the Hadamard
   graph. `ElementwiseProduct` becomes one `AffineHadamard` node and every square (`RewrittenLayerNorm`
   second moment, `ReciprocalByRsqrt`) one `AffineSelfHadamard` node, so no `NLSquare` remains;
   `PairwiseDotBySquare` and `SparseWeightedSumBySquare` form `(q/sqrt(d)) * k` and `p * v` on the
@@ -310,19 +294,20 @@ Graph options that change the compiled model (not debug flags):
   `null` leaves a run unseeded, as were all runs before 2026-10-11: two unseeded runs of one strict config differ by
   up to 0.5 points with top-k and 1.5 points with routed support.
 
-`build_module_mapping` records the resulting per-block module choices (`norm1`, `attn`,
-`norm2`, `mlp.act`, `fc_norm`) into the surgery metadata.
+`build_module_mapping` records the replacement of every LayerNorm, attention and MLP activation
+module into the surgery metadata.
 
 ## Calibration
 
-`adapter.calibrate_reference` walks up to `gibbs_tail_calibration_batches` training minibatches.
-For `deit_tiny_pet`, the model-local helper walks the timm DeiT blocks and calls common adapter
-helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reported diagnostics are:
+`adapter.calibrate_reference` runs the reference on the first `gibbs_tail_calibration_batches`
+training minibatches with forward hooks: attention scores from each timm `Attention` (QK logits of
+its fused `qkv`) or each `nn.Softmax` input, and every `nn.LayerNorm` against a `RewrittenLayerNorm`
+of the same affine. The reported diagnostics are:
 
 - `ln_rewrite_mse_layer0_minibatch` - MSE of `RewrittenLayerNorm` against the reference LN at
   block 0 on the first calibration minibatch.
-- `ln_rewrite_mse_all_norms_mean` - mean MSE across all `norm1`/`norm2` and the final `norm`
-  while replaying the residual stream of the reference model.
+- `ln_rewrite_mse_all_norms_mean` - mean MSE across all reference LayerNorms (`norm1`/`norm2`
+  and the final `norm` for DeiT-Tiny) on the calibration minibatches.
 - `gibbs_tail_calibration_batches` - actual number of training minibatches used.
 - `gibbs_tail_prob_eps_calibrated_by_block` - per-block estimates of the true omitted dense-softmax
   probability mass outside the top-k set over the calibration batches (copied into parameters when
@@ -358,7 +343,7 @@ helpers for top-k sampling, tail statistics, and Jeffreys summaries. The reporte
 
 The surgery driver then runs full-validation passes on both the reference (`ref_val_acc`,
 `ref_val_loss`) and the freshly built surgery student (`student_pre_ft_val_acc`,
-`student_pre_ft_mean_ce`) and adds them to the calibration block.
+`student_pre_ft_val_loss`) and adds them to the calibration block.
 
 ## Outputs
 
@@ -375,10 +360,10 @@ The CLI writes:
   `named_modules` listing, and per-module forward output tensor shapes from one `eval` pass on
   a dummy batch.
 
-Checkpoint `extra` records the adapter key, reference checkpoint, metadata basename, mapping,
-top_k, eps_ln, the applied-mean `gibbs_tail_prob_eps`, config JSON path, all transform flags, and
-the surgery dtype, so the surgery student can be reconstructed by `build_surgery_model_from_extra`
-without the original config. Per-block calibrated `gibbs_tail_prob_eps` values live in the
+Checkpoint `extra` records every `SurgeryConfig` field (with the applied-mean `gibbs_tail_prob_eps`),
+the adapter key, reference checkpoint, metadata basename and weight mapping, so
+`build_surgery_student` rebuilds the surgery student from a `SurgeryConfig` of the record without
+the original config. Per-block calibrated `gibbs_tail_prob_eps` values live in the
 checkpoint state dict, checkpoint `extra`, and the metadata calibration block.
 When `disable_calib_gibbs_tail_prob` is true, the configured scalar remains in the checkpoint state
 dict and no per-block applied values are written.

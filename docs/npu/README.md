@@ -7,7 +7,7 @@ exported graphs.
 
 What each graph needs:
 
-- **Strict graph** (`strict_unary=sigmoid_rsqrt`): fixed affine maps, routing, the square, the sigmoid and the
+- **Strict graph** (`allow_matmul=false`): fixed affine maps, routing, the square, the sigmoid and the
   inverse square root (the reciprocal is `rsqrt(x)^2`, the exponential is `sigmoid(t)/sigmoid(-t)`), plus GELU.
 - **Hadamard graph** (`hadamard=true`): the operations of the strict graph, with the elementwise product between
   two activations (of equal shape after the same broadcast routing the strict graph uses) instead of an

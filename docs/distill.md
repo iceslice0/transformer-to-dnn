@@ -50,10 +50,9 @@ Not trainable:
 
 - ``AffineContract`` and ``AffineFixedMix`` coefficients - registered as buffers (``coeff``,
   ``weight``), so they never enter ``parameters()``.
-- LayerNorm ``eps`` buffers in ``NLLogPlusEps``/``NLRsqrtPlusEps`` are registered as buffers.
-- Softmax normalizer offsets in ``NLLogPlusEps``/``NLRsqrtPlusEps``/``NLReciprocalPlusEps`` are
-  also buffers. Current model constructions fix them to zero; nonzero values remain loadable for
-  compatibility with older runs.
+- LayerNorm ``eps`` buffers in ``NLRsqrtPlusEps`` are registered as buffers.
+- Softmax normalizer offsets in ``NLRsqrtPlusEps``/``NLReciprocalPlusEps`` are also buffers, zero in every
+  model construction.
 - teacher parameters (``requires_grad`` is set to ``False`` before training).
 
 When the runtime device is CUDA and the surgery dtype is ``float16``, distillation uses a float32

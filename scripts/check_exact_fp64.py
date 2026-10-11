@@ -68,7 +68,7 @@ def main() -> None:
         name = os.path.basename(path)
         print(
             f"{name}: top_k={extra.get('top_k')} allow_matmul={extra.get('allow_matmul')} "
-            f"strict_unary={extra.get('strict_unary')} LayerNorm eps={extra.get('eps_ln')} softmax eps=0; "
+            f"strict_product={extra.get('strict_product')} LayerNorm eps={extra.get('eps')} softmax eps=0; "
             f"max|dlogit| {(y - r).abs().max().item():.2e}; "
             f"argmax agreement {(y.argmax(-1) == r.argmax(-1)).float().mean().item():.3f}"
         )

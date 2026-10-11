@@ -69,7 +69,7 @@ PYTHIA_ROUTING_TARGETS := $(foreach k,$(PYTHIA_ROUTING_KS),$(foreach m,_qc32_tai
 
 STRICT_ROUTING_TARGETS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_qc32.pt)
 
-# Strict graph without exp and log (strict_unary=sigmoid_rsqrt: squares, sigmoid, inverse square root) and with the
+# Strict graph without exp and log (squares, sigmoid, inverse square root) and with the
 # default strict products (strict_product=norm: norm expansion where a square is shared, polarization elsewhere; the
 # polarization-only runs are in artifacts/backup_polarization_2026-10-10/),
 # with exact GELU (_sr) or GELU ~ x*sigmoid(1.702x) (_sr_gs), routed strict variants, and PTQ of the
@@ -197,8 +197,8 @@ help:
 	@echo "Targets:"
 	@echo "  make a      # Main fast-path top-k sweep"
 	@echo "  make b      # Tail-mass ablation"
-	@echo "  make c      # Strict (log-domain, superseded by strict-sr) vs fast surgery"
-	@echo "  make d      # PTQ granularity ablation (fast rows used; log-domain strict rows superseded by ptq-strict-sr)"
+	@echo "  make c      # Strict (polarization products, exact GELU) vs fast surgery"
+	@echo "  make d      # PTQ granularity ablation (fast and polarization strict graphs)"
 	@echo "  make e      # Exact runtime tail-mass pet-fast sweep"
 	@echo "  make a_imagenet  # ImageNet fast-path surgery sweep"
 	@echo "  make mambair-data # Download DIV2K + Set5 (x2 and x4 LR) into ./data"
@@ -212,7 +212,7 @@ help:
 	@echo "  make pythia-tailmass0 # Pythia-70M zero fixed-tail (no exact mass) sweep (k=1..128)"
 	@echo "  make routing      # DeiT Pet query-centroid support routing (k=8..64, calibrated/exact/tail-drop)"
 	@echo "  make pythia-routing # Pythia-70M query-centroid support routing (k=8..32, exact/tail-drop)"
-	@echo "  make routing-strict # log-domain strict graph with routed support (superseded by strict-sr)"
+	@echo "  make routing-strict # polarization strict graph with routed support"
 	@echo "  make routing-strict-bench # same-session cost: strict_sr and fast, top-k vs routed"
 	@echo "  make exact-fp64   # float64 end-to-end check of exact compilation (k=197)"
 	@echo "  make strict-sr    # strict graph without exp/log (+GELU approx) and routed strict"

@@ -18,34 +18,27 @@ the exact top-k support of the same size on rows with more valid keys than ``top
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.internal.calibration import (
-    _effective_gibbs_seq_len,
-    _gibbs_cal_batch_indices,
-    run_hook_phase,
+    apply_gibbs_tail_calibration,
+    calibration_batch_indices,
+    dense_gibbs,
+    gibbs_attention_modules,
+    run_hooked,
 )
 from transformer_surgery.internal.reporting import log_line
 from transformer_surgery.internal.util import get_device
+from transformer_surgery.ops import QueryCentroidRouter
+
+if TYPE_CHECKING:
+    from transformer_surgery.cli.surgery_config import SurgeryConfig
 
 SUPPORT_ROUTINGS = ("topk", "query_centroids")
-
-
-def routed_attention_modules(model: nn.Module) -> List[nn.Module]:
-    """Surgery attention modules with a Gibbs top-k softmax, in module order (block order)."""
-    return [
-        m
-        for m in model.modules()
-        if bool(getattr(m, "use_attention_surgery", False))
-        and bool(getattr(m, "use_surgery_softmax", False))
-        and hasattr(m, "gibbs")
-        and hasattr(m, "dot")
-        and hasattr(m, "router")
-    ]
 
 
 @torch.no_grad()
@@ -101,23 +94,19 @@ def _collect_queries(
     per_batch = max(1, math.ceil(int(max_samples) / max(1, len(batch_indices))))
     samples: List[List[torch.Tensor]] = [[] for _ in attns]
 
-    def install(_batch_ctx: Any, _batch_set: set[int]) -> List[Any]:
-        handles = []
-        for bi, attn in enumerate(attns):
+    def hook(_m: nn.Module, inputs: Any, _out: Any, bi: int) -> None:
+        q = inputs[0].detach()
+        b, h, n, d = q.shape
+        xq = q.permute(1, 0, 2, 3).reshape(h, b * n, d)
+        if xq.shape[1] > per_batch:
+            keep = torch.randperm(xq.shape[1], generator=generator)[:per_batch].to(xq.device)
+            xq = xq[:, keep]
+        samples[bi].append(xq.float().cpu())
 
-            def hook(_m: nn.Module, inputs: Any, _out: Any, bi: int = bi) -> None:
-                q = inputs[0].detach()
-                b, h, n, d = q.shape
-                xq = q.permute(1, 0, 2, 3).reshape(h, b * n, d)
-                if xq.shape[1] > per_batch:
-                    keep = torch.randperm(xq.shape[1], generator=generator)[:per_batch].to(xq.device)
-                    xq = xq[:, keep]
-                samples[bi].append(xq.float().cpu())
-
-            handles.append(attn.dot.register_forward_hook(hook))
-        return handles
-
-    run_hook_phase(model, loader, batch_indices, install)
+    handles = [
+        attn.dot.register_forward_hook(lambda m, i, o, bi=bi: hook(m, i, o, bi)) for bi, attn in enumerate(attns)
+    ]
+    run_hooked(model, loader, batch_indices, handles)
     return [torch.cat(s, dim=1) for s in samples]
 
 
@@ -183,41 +172,30 @@ def _support_stats_pass(
     batch_indices: Sequence[int],
     top_k: int,
 ) -> List[Dict[str, Any]]:
-    acc = [_SupportStats(int(getattr(a, "num_heads"))) for a in attns]
+    acc = [_SupportStats(a.num_heads) for a in attns]
     stash: Dict[int, Any] = {}
 
-    def install(_batch_ctx: Any, _batch_set: set[int]) -> List[Any]:
-        handles = []
-        for bi, attn in enumerate(attns):
+    def dot_hook(inputs: Any, bi: int) -> None:
+        stash[bi] = (inputs[0].detach(), inputs[1].detach())
 
-            def dot_hook(_m: nn.Module, inputs: Any, _out: Any, bi: int = bi) -> None:
-                stash[bi] = (inputs[0].detach(), inputs[1].detach())
+    def gibbs_pre_hook(inputs: Any, bi: int) -> None:
+        q, k = stash.pop(bi)
+        acc[bi].add(q, k, inputs[0].detach(), routers[bi], top_k)
 
-            def gibbs_pre_hook(_m: nn.Module, inputs: Any, bi: int = bi) -> None:
-                q, k = stash.pop(bi)
-                acc[bi].add(q, k, inputs[0].detach(), routers[bi], top_k)
-
-            handles.append(attn.dot.register_forward_hook(dot_hook))
-            handles.append(attn.gibbs.register_forward_pre_hook(gibbs_pre_hook))
-        return handles
-
-    run_hook_phase(model, loader, batch_indices, install)
+    handles = []
+    for bi, attn in enumerate(attns):
+        handles.append(attn.dot.register_forward_hook(lambda _m, i, _o, bi=bi: dot_hook(i, bi)))
+        handles.append(attn.gibbs.register_forward_pre_hook(lambda _m, i, bi=bi: gibbs_pre_hook(i, bi)))
+    run_hooked(model, loader, batch_indices, handles)
     return [a.summary() for a in acc]
 
 
-def install_routers_from_state_dict(model: nn.Module, state_dict: Dict[str, Any]) -> int:
+def install_routers_from_state_dict(model: nn.Module, state_dict: Dict[str, Any]) -> None:
     """Create empty :class:`QueryCentroidRouter` modules where ``state_dict`` holds router buffers."""
-    from transformer_surgery.ops import QueryCentroidRouter
-
-    installed = 0
     for name, m in model.named_modules():
-        if not hasattr(m, "router") or getattr(m, "router") is not None:
-            continue
         key = f"{name}.router.assign_scores.coeff" if name else "router.assign_scores.coeff"
-        if key in state_dict:
-            m.router = QueryCentroidRouter(torch.zeros(tuple(state_dict[key].shape)))
-            installed += 1
-    return installed
+        if getattr(m, "router", 0) is None and key in state_dict:
+            m.router = QueryCentroidRouter(torch.zeros(state_dict[key].shape))
 
 
 def _pooled(blocks: Sequence[Dict[str, Any]], key: str) -> float:
@@ -227,37 +205,28 @@ def _pooled(blocks: Sequence[Dict[str, Any]], key: str) -> float:
 
 @torch.no_grad()
 def calibrate_support_routing(
-    model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, cfg: Any
+    model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, cfg: "SurgeryConfig"
 ) -> Dict[str, Any]:
     """Fit query centroids, install routers, and (calibrated mode) apply the routed tail mass."""
-    from transformer_surgery.ops import QueryCentroidRouter
-
-    routing = str(getattr(cfg, "support_routing", "topk"))
-    if routing not in SUPPORT_ROUTINGS:
-        raise ValueError(f"support_routing must be one of {SUPPORT_ROUTINGS}, got {routing!r}")
-    if routing == "topk":
+    if cfg.support_routing not in SUPPORT_ROUTINGS:
+        raise ValueError(f"support_routing must be one of {SUPPORT_ROUTINGS}, got {cfg.support_routing!r}")
+    if cfg.support_routing == "topk":
         return {}
-    attns = routed_attention_modules(model)
+    attns = [a for a in gibbs_attention_modules(model) if hasattr(a, "router")]
     if not attns:
         raise ValueError("support_routing needs surgery attention with the surgery softmax")
     device = get_device()
-    top_k = int(cfg.top_k)
-    seed = int(cfg.routing_seed)
-    cpu_gen = torch.Generator().manual_seed(seed)
-    seq_len = _effective_gibbs_seq_len(model)
-    saved_top_k = [a.gibbs.top_k for a in attns]
+    cpu_gen = torch.Generator().manual_seed(cfg.routing_seed)
     fit: List[Dict[str, Any]] = []
-    try:
-        for a in attns:
-            a.gibbs.top_k = seq_len
-        fit_batches = _gibbs_cal_batch_indices(
-            len(train_loader), cfg.routing_calibration_batches, random_when_limited=True, generator=cpu_gen
+    routers: List[nn.Module] = []
+    with dense_gibbs(attns):
+        fit_batches = calibration_batch_indices(
+            len(train_loader), cfg.routing_calibration_batches, random=True, generator=cpu_gen
         )
         queries = _collect_queries(model, attns, train_loader, fit_batches, cfg.routing_max_samples, cpu_gen)
-        routers: List[nn.Module] = []
         for bi, xq in enumerate(queries):
-            dev_gen = torch.Generator(device=device).manual_seed(seed + 1000 * (bi + 1))
-            km = kmeans_per_head(xq.to(device), int(cfg.routing_clusters), int(cfg.routing_kmeans_iters), dev_gen)
+            dev_gen = torch.Generator(device=device).manual_seed(cfg.routing_seed + 1000 * (bi + 1))
+            km = kmeans_per_head(xq.to(device), cfg.routing_clusters, cfg.routing_kmeans_iters, dev_gen)
             routers.append(QueryCentroidRouter(km["centroids"]).to(device))
             fit.append(
                 {
@@ -266,21 +235,16 @@ def calibrate_support_routing(
                     "empty_clusters_by_head": [int(v) for v in km["empty_clusters"]],
                 }
             )
-        cal_batches = _gibbs_cal_batch_indices(
-            len(train_loader), cfg.gibbs_tail_calibration_batches, random_when_limited=False
-        )
-        train_blocks = _support_stats_pass(model, attns, routers, train_loader, cal_batches, top_k)
-        val_batches = _gibbs_cal_batch_indices(len(val_loader), cfg.routing_eval_batches, random_when_limited=False)
-        val_blocks = _support_stats_pass(model, attns, routers, val_loader, val_batches, top_k)
-    finally:
-        for a, kk in zip(attns, saved_top_k):
-            a.gibbs.top_k = kk
+        cal_batches = calibration_batch_indices(len(train_loader), cfg.gibbs_tail_calibration_batches)
+        train_blocks = _support_stats_pass(model, attns, routers, train_loader, cal_batches, cfg.top_k)
+        val_batches = calibration_batch_indices(len(val_loader), cfg.routing_eval_batches)
+        val_blocks = _support_stats_pass(model, attns, routers, val_loader, val_batches, cfg.top_k)
     for a, r in zip(attns, routers):
         a.router = r
 
     stats: Dict[str, Any] = {
-        "support_routing": routing,
-        "routing_clusters": int(cfg.routing_clusters),
+        "support_routing": cfg.support_routing,
+        "routing_clusters": cfg.routing_clusters,
         "routing_fit_batches": len(fit_batches),
         "routing_fit_by_block": fit,
         "routing_train_batches": len(cal_batches),
@@ -292,18 +256,13 @@ def calibrate_support_routing(
         "routing_val_recall": _pooled(val_blocks, "recall"),
         "routing_train_tail_routed_by_block": [b["tail_routed"] for b in train_blocks],
     }
-    calibrated_mode = not bool(getattr(cfg, "use_exact_tail_mass", False)) and not bool(
-        getattr(cfg, "disable_calib_gibbs_tail_prob", False)
-    )
-    if calibrated_mode:
-        applied: List[float] = []
-        for a, b in zip(attns, train_blocks):
-            param = a.gibbs.gibbs_tail_prob_eps
-            value = max(0.0, min(float(b["tail_routed"]), 1.0 - 1e-7))
-            param.data.fill_(value)
-            applied.append(value)
-        stats["gibbs_tail_prob_eps_applied_by_block"] = applied
-        stats["gibbs_tail_prob_eps_applied_mean"] = float(sum(applied) / len(applied))
+    # Calibrated mode: the routed support's mean tail mass replaces the top-k one.
+    routed_tail = {
+        "use_exact_tail_mass": cfg.use_exact_tail_mass,
+        "disable_calib_gibbs_tail_prob": cfg.disable_calib_gibbs_tail_prob,
+        "gibbs_tail_prob_eps_calibrated_by_block": stats["routing_train_tail_routed_by_block"],
+    }
+    stats.update(apply_gibbs_tail_calibration(model, routed_tail))
     return stats
 
 

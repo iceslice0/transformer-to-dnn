@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import math
-import warnings
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,12 +12,13 @@ from timm.layers import DropPath as _TimmDropPath
 
 from transformer_surgery.internal.util import get_surgery_dtype
 
+if TYPE_CHECKING:
+    from transformer_surgery.cli.surgery_config import SurgeryConfig
+
 
 # ---------------------------------------------------------------------------
-# Routing vocabulary: aliases to torch / F / nn ops that carry no parameters and do no
-# arithmetic - pure tensor wiring and discrete selection. Defined here, before the op classes,
-# so internal call sites in this module use ``Routing*`` names rather than ``torch.*``/``F.*``
-# directly. External callers may import them to make the routing surface explicit.
+# Routing vocabulary: aliases to torch / F / nn ops without parameters or arithmetic - pure tensor
+# wiring and discrete selection. The op classes below call them by these names.
 # ---------------------------------------------------------------------------
 
 RoutingTranspose = torch.transpose
@@ -30,7 +30,6 @@ RoutingTopK = torch.topk
 RoutingGather = torch.gather
 RoutingScatter = torch.scatter
 RoutingFullLike = torch.full_like
-RoutingReLU = F.relu
 RoutingDropPath = _TimmDropPath
 
 
@@ -42,31 +41,23 @@ def RoutingExpandAs(x: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
     return x.expand_as(other)
 
 
-def RoutingSqueeze(x: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
-    return x.squeeze() if dim is None else x.squeeze(dim)
+def RoutingSqueeze(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return x.squeeze(dim)
 
 
 def RoutingAdd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Pure broadcast add used for score masking / residual wiring helpers."""
+    """Broadcast add of an additive score mask."""
     return a + b
 
 
 def build_causal_attn_mask(seq_len: int, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Additive causal mask ``[1, 1, N, N]``: 0 on allowed keys, ``-inf`` on future keys."""
-    n = int(seq_len)
-    mask = torch.zeros((1, 1, n, n), dtype=dtype)
-    future = torch.triu(torch.ones((n, n), dtype=torch.bool), diagonal=1)
-    mask = mask.masked_fill(future, float("-inf"))
-    return mask
+    return torch.full((seq_len, seq_len), float("-inf"), dtype=dtype).triu(1).view(1, 1, seq_len, seq_len)
 
 
 def build_causal_valid_key_mean_matrix(seq_len: int, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Lower-triangular mean matrix ``L[i, j] = 1/(i+1)`` for ``j <= i`` (valid-key mean of V)."""
-    n = int(seq_len)
-    idx = torch.arange(n, dtype=dtype)
-    valid = idx + 1.0
-    tril = torch.tril(torch.ones((n, n), dtype=dtype))
-    return tril / valid.unsqueeze(1)
+    return torch.ones(seq_len, seq_len, dtype=dtype).tril() / torch.arange(1, seq_len + 1, dtype=dtype).unsqueeze(1)
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +66,10 @@ def build_causal_valid_key_mean_matrix(seq_len: int, *, dtype: torch.dtype = tor
 #              scale+bias, fixed 2x2 mixes, linear unary reductions/scalings, and the variable
 #              bilinear ops (AffineMatMul, AffineHadamard) gated by allow_matmul (and AffineHadamard
 #              alone gated by ``hadamard``).
-#   NL*      - strictly nonlinear scalar maps (square, exp, log+eps, sqrt-exp, rsqrt+eps,
-#              reciprocal+eps, GELU).
+#   NL*      - strictly nonlinear scalar maps (square, sigmoid, rsqrt+eps, GELU; exp and reciprocal in the fast
+#              graph).
 #   Routing* - pure tensor wiring and discrete selection (reshape/transpose/cat/stack/expand/
-#              squeeze/broadcast_tensors/topk/gather/full_like, F.relu, Dropout/DropPath); see the
+#              squeeze/broadcast_tensors/topk/gather/scatter/full_like, Dropout/DropPath); see the
 #              ``Routing*`` aliases above.
 # ---------------------------------------------------------------------------
 
@@ -93,24 +84,7 @@ class AffineScale(nn.Module):
         self.register_buffer("scale", torch.tensor(float(scale)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = self.scale
-        if s.device != x.device:
-            s = s.to(device=x.device)
-        return x * s.to(dtype=x.dtype)
-
-
-class AffineScaleTensor(nn.Module):
-    """Elementwise scale by a fixed buffer tensor (broadcastable), e.g. rotary cos/sin tables."""
-
-    def __init__(self, scale: torch.Tensor) -> None:
-        super().__init__()
-        self.register_buffer("scale", scale.clone().detach())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = self.scale
-        if s.device != x.device:
-            s = s.to(device=x.device)
-        return x * s.to(dtype=x.dtype)
+        return x * self.scale.to(device=x.device, dtype=x.dtype)
 
 
 class AffineHadamard(nn.Module):
@@ -153,29 +127,41 @@ class AffineScaleBias(nn.Module):
         return x * self.weight + self.bias
 
 
-class NLLogPlusEps(nn.Module):
-    """``log(x + eps)`` with fixed scalar ``eps`` (LayerNorm-style floor), exact ``torch.log``."""
+class _NLPlusEps(nn.Module):
+    """``fn(x + eps)`` with a fixed scalar ``eps`` buffer; subclasses set ``fn``."""
 
     def __init__(self, eps: float) -> None:
         super().__init__()
         self.register_buffer("eps", torch.tensor(float(eps)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e = self.eps.to(device=x.device, dtype=x.dtype)
-        return torch.log(x + e)
+        return self.fn(x + self.eps.to(device=x.device, dtype=x.dtype))
+
+
+class NLRsqrtPlusEps(_NLPlusEps):
+    """``1/sqrt(x + eps)`` (e.g. LayerNorm inv-std from variance)."""
+
+    fn = staticmethod(torch.rsqrt)
+
+
+class NLReciprocalPlusEps(_NLPlusEps):
+    """``1 / (x + eps)`` (pair with :class:`AffineHadamard`, not ``/``)."""
+
+    fn = staticmethod(torch.reciprocal)
 
 
 # In-place evaluation of full-size intermediates (strict graph): on by default, used only when gradients are off.
 # PTQ turns it off, since its calibration reads node inputs in forward hooks after the node has run.
-_INPLACE_EVAL = [True]
+_INPLACE_EVAL = True
 
 
 def set_inplace_eval(enabled: bool) -> None:
-    _INPLACE_EVAL[0] = bool(enabled)
+    global _INPLACE_EVAL
+    _INPLACE_EVAL = bool(enabled)
 
 
 def _inplace_ok(flag: bool) -> bool:
-    return bool(flag) and _INPLACE_EVAL[0] and not torch.is_grad_enabled()
+    return flag and _INPLACE_EVAL and not torch.is_grad_enabled()
 
 
 class NLSquare(nn.Module):
@@ -191,30 +177,6 @@ class NLSquare(nn.Module):
         return x * x
 
 
-class NLRsqrtPlusEps(nn.Module):
-    """``1/sqrt(x + eps)`` via ``torch.rsqrt`` (e.g. LayerNorm inv-std from variance)."""
-
-    def __init__(self, eps: float) -> None:
-        super().__init__()
-        self.register_buffer("eps", torch.tensor(float(eps)))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e = self.eps.to(device=x.device, dtype=x.dtype)
-        return torch.rsqrt(x + e)
-
-
-class NLReciprocalPlusEps(nn.Module):
-    """``1 / (x + eps)`` (pair with :class:`AffineHadamard`, not ``/``)."""
-
-    def __init__(self, eps: float) -> None:
-        super().__init__()
-        self.register_buffer("eps", torch.tensor(float(eps)))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e = self.eps.to(device=x.device, dtype=x.dtype)
-        return torch.reciprocal(x + e)
-
-
 class NLSigmoid(nn.Module):
     """Logistic sigmoid ``1/(1+exp(-x))`` as a unary basis op."""
 
@@ -222,17 +184,14 @@ class NLSigmoid(nn.Module):
         return torch.sigmoid(x)
 
 
-# "sigmoid_rsqrt": squares, sigmoid, inverse square root (the paper's strict graph, default).
-# "log_exp": deprecated log-domain LayerNorm and softmax, kept to reload and reproduce earlier runs.
-STRICT_UNARY_SETS = ("sigmoid_rsqrt", "log_exp")
+class NLGELU(nn.Module):
+    """Exact GELU as a unary basis op (MLP nonlinearity)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x)
+
+
 GELU_MODES = ("exact", "sigmoid")
-
-
-def check_strict_unary(strict_unary: str) -> str:
-    value = str(strict_unary)
-    if value not in STRICT_UNARY_SETS:
-        raise ValueError(f"strict_unary must be one of {STRICT_UNARY_SETS}, got {value!r}")
-    return value
 
 
 # Products of two activations in the strict graph.
@@ -253,13 +212,13 @@ def check_strict_product(strict_product: str, *, allow_matmul: bool, hadamard: b
     return "polarization" if (allow_matmul or hadamard) else value
 
 
-def check_hadamard(hadamard: bool, *, allow_matmul: bool, strict_unary: str = "sigmoid_rsqrt") -> bool:
+def check_hadamard(hadamard: bool, *, allow_matmul: bool) -> bool:
     """``hadamard=True`` is the Hadamard graph: the strict graph with every product of two activations, squares
     included, as one elementwise product instead of polarization, and QK^T and PV as products plus sums (no
-    matmul). It requires ``allow_matmul=False`` and ``strict_unary="sigmoid_rsqrt"``."""
+    matmul). It requires ``allow_matmul=False``."""
     value = bool(hadamard)
-    if value and (allow_matmul or str(strict_unary) != "sigmoid_rsqrt"):
-        raise ValueError("hadamard=True needs allow_matmul=False and strict_unary='sigmoid_rsqrt'")
+    if value and allow_matmul:
+        raise ValueError("hadamard=True needs allow_matmul=False")
     return value
 
 
@@ -276,17 +235,10 @@ class AffineSum(nn.Module):
 
 
 class NLExp(nn.Module):
-    """``torch.exp`` (Gibbs softmax, LN magnitude, etc.)."""
+    """``torch.exp`` (Gibbs softmax of the fast graph)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x)
-
-
-class NLSqrtExp(nn.Module):
-    """``sqrt(exp(x))``."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt(torch.exp(x))
 
 
 class AffineFixedMix(nn.Module):
@@ -296,16 +248,10 @@ class AffineFixedMix(nn.Module):
     Exposed as a submodule so surgery graphs list an explicit affine node, like LN submodules.
     """
 
-    def __init__(
-        self,
-        einsum_equation: str,
-        matrix: Optional[torch.Tensor] = None,
-    ) -> None:
+    def __init__(self, einsum_equation: str) -> None:
         super().__init__()
         self.einsum_equation = einsum_equation
-        if matrix is None:
-            matrix = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=get_surgery_dtype())
-        self.register_buffer("weight", matrix.clone().detach())
+        self.register_buffer("weight", torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=get_surgery_dtype()))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight.to(device=x.device, dtype=x.dtype)
@@ -313,14 +259,17 @@ class AffineFixedMix(nn.Module):
 
 
 class AffineContract(nn.Module):
-    """
-    Contract operand / head dims with a fixed coefficient vector.
-    """
+    """Contract operand / head dims with a fixed coefficient vector."""
 
     def __init__(self, einsum_equation: str, coeffs: torch.Tensor) -> None:
         super().__init__()
         self.einsum_equation = einsum_equation
         self.register_buffer("coeff", coeffs.clone().detach().float())
+
+    @classmethod
+    def stacked(cls, *coeffs: float) -> "AffineContract":
+        """``sum_i c_i x[..., i]`` over a stacked last dimension, coefficients rounded to the surgery dtype."""
+        return cls("i,...i->...", torch.tensor(coeffs, dtype=get_surgery_dtype()))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         c = self.coeff.to(device=x.device, dtype=x.dtype)
@@ -410,25 +359,23 @@ class NormExpansionProduct(nn.Module):
         return self.combine(s, self.square_a(a), self.square_b(b))
 
 
+def _polarization_coeffs(scale: float = 1.0) -> torch.Tensor:
+    """Coefficients ``scale * [1/4, -1/4]`` of ``(a+b)^2`` and ``(a-b)^2`` in polarization."""
+    return torch.tensor([0.25 * scale, -0.25 * scale], dtype=get_surgery_dtype())
+
+
 class SquareIdentityOperandChain(nn.Module):
     """
-    ``((a+b)^2-(a-b)^2)/4`` as operand stack, fixed 2x2 mix, square, coeff contraction.
-    :class:`PairwiseDotBySquare` and
-    :class:`SparseWeightedSumBySquare` share this chain; they differ only in how ``a`` and ``b`` are
-    formed (QK broadcast vs gathered ``p``/``v``) and in the ``einsum`` equations / coefficient
-    vector (attention includes ``1/sqrt(d)``, value mix does not).
+    ``((a+b)^2-(a-b)^2)/4`` as operand stack, fixed 2x2 mix, square, coeff contraction ``out_contract``.
+    :class:`PairwiseDotBySquare`, :class:`SparseWeightedSumBySquare` and :class:`ElementwiseProduct` share this chain;
+    they differ in how ``a`` and ``b`` are formed and in the contraction (attention includes ``1/sqrt(d)``).
     """
 
-    def __init__(
-        self,
-        mix_einsum: str,
-        contract_einsum: str,
-        coeffs: torch.Tensor,
-    ) -> None:
+    def __init__(self, mix_einsum: str, out_contract: AffineContract) -> None:
         super().__init__()
         self.operand_mix = AffineFixedMix(mix_einsum)
         self.square = NLSquare()
-        self.out_contract = AffineContract(contract_einsum, coeffs)
+        self.out_contract = out_contract
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         stacked = RoutingStack((a, b), dim=-2)
@@ -462,19 +409,17 @@ class ElementwiseProduct(nn.Module):
 
     def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False) -> None:
         super().__init__()
-        self.allow_matmul = bool(allow_matmul) or bool(hadamard)
-        if self.allow_matmul:
+        self.direct = allow_matmul or hadamard
+        if self.direct:
             self.hadamard = AffineHadamard()
         else:
             self.square_chain = SquareIdentityOperandChain(
-                "pq,...qd->...pd",
-                "p,...pd->...d",
-                torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()),
+                "pq,...qd->...pd", AffineContract("p,...pd->...d", _polarization_coeffs())
             )
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a, b = RoutingBroadcastTensors(a, b)
-        if self.allow_matmul:
+        if self.direct:
             return self.hadamard(a, b)
         return self.square_chain(a, b)
 
@@ -482,9 +427,9 @@ class ElementwiseProduct(nn.Module):
 class ReciprocalByRsqrt(nn.Module):
     """``1/x = (x^{-1/2})^2`` for ``x > 0``: one inverse square root and one square (a self-product if ``hadamard``)."""
 
-    def __init__(self, eps: float = 0.0, *, hadamard: bool = False) -> None:
+    def __init__(self, *, hadamard: bool = False) -> None:
         super().__init__()
-        self.rsqrt = NLRsqrtPlusEps(eps)
+        self.rsqrt = NLRsqrtPlusEps(0.0)
         self.square = AffineSelfHadamard() if hadamard else NLSquare()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -503,8 +448,8 @@ class ExpBySigmoid(nn.Module):
         super().__init__()
         self.sigmoid = NLSigmoid()
         self.negate = AffineScale(-1.0)
-        self.reciprocal = ReciprocalByRsqrt(0.0, hadamard=hadamard)
-        self.product = ElementwiseProduct(allow_matmul=False, hadamard=hadamard)
+        self.reciprocal = ReciprocalByRsqrt(hadamard=hadamard)
+        self.product = ElementwiseProduct(hadamard=hadamard)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.product(self.sigmoid(t), self.reciprocal(self.sigmoid(self.negate(t))))
@@ -538,30 +483,22 @@ class AffineMean(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm rewrite: polarization with the inverse square root (strict), Hadamard (fast)
+# LayerNorm rewrite: inverse square root, product by norm expansion or polarization (strict), Hadamard (fast)
 # ---------------------------------------------------------------------------
 
 
 class RewrittenLayerNorm(nn.Module):
     """
-    mu = mean(x); u = x - mu; r2 = mean(u*u).
+    mu = mean(x); u = x - mu; r2 = mean(u*u); inv_std = 1/sqrt(r2+eps) via :class:`NLRsqrtPlusEps`; z = u * inv_std.
 
-    **``allow_matmul=False``, ``strict_unary="sigmoid_rsqrt"`` (default, strict):** ``inv_std = 1/sqrt(r2+eps)``
-    via :class:`NLRsqrtPlusEps`, and ``z = u * inv_std`` by polarization (:class:`ElementwiseProduct`):
-    no log, no exp and no sign split.
+    The product ``u * inv_std`` by graph:
 
-    **``allow_matmul=False``, ``strict_unary="log_exp"`` (deprecated):** ``au = stack(relu(u),relu(-u))``
-    (dim ``-2``); ``log_num = log_eps(au)`` (operand ``p``); ``log_den = log_eps(r2)`` broadcast;
-    ``t = AffineContract([2,-1])(stack(log_num, log_den))``; ``a_mag = NLSqrtExp(t)``;
-    ``z = out_contract(a_mag)``.
-
-    **``allow_matmul=True`` (debug / fast):** same ``r2``, then ``z = u * inv_std`` with
-    ``inv_std = 1/sqrt(r2+eps)`` via :class:`NLRsqrtPlusEps` and :class:`AffineHadamard`, not the
-    log-domain path. The shared ``NLSquare`` module computes ``u * u`` exactly like
-    :class:`AffineSelfHadamard`; extended-basis accounting classifies it as that Hadamard product.
-
-    **``hadamard=True`` (Hadamard graph):** ``u*u`` and ``u * inv_std`` are elementwise products; the inverse
-    square root is the only unary map.
+    - strict, ``strict_product="norm"`` (default): ``((u+a)^2 - u^2 - a^2)/2`` with ``u^2`` from the variance;
+    - strict, ``strict_product="polarization"``: :class:`ElementwiseProduct` (polarization);
+    - ``allow_matmul=True`` (fast): one :class:`AffineHadamard` node. The shared ``NLSquare`` computes ``u * u``
+      exactly like :class:`AffineSelfHadamard`; extended-basis accounting classifies it as that Hadamard product;
+    - ``hadamard=True`` (Hadamard graph): ``u*u`` and ``u * inv_std`` are elementwise products; the inverse square
+      root is the only unary map.
     """
 
     def __init__(
@@ -570,71 +507,44 @@ class RewrittenLayerNorm(nn.Module):
         eps: float,
         *,
         allow_matmul: bool = False,
-        strict_unary: str = "sigmoid_rsqrt",
         hadamard: bool = False,
         strict_product: str = "norm",
     ) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
-        e = float(eps)
         self.allow_matmul = allow_matmul
-        self.strict_unary = check_strict_unary(strict_unary)
-        self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
+        self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul)
         self.strict_product = check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard)
         # Norm expansion of u * inv_std: u^2 is already formed for the variance, inv_std^2 is one square per token.
-        self.norm_ln = self.strict_product == "norm" and self.strict_unary == "sigmoid_rsqrt"
+        self.norm_ln = self.strict_product == "norm"
         self.mean_u = AffineMean(-1, keepdim=True)
         self.mean_r2 = AffineMean(-1, keepdim=True)
         self.square = AffineSelfHadamard() if self.hadamard else NLSquare()
-        self.u_center_contract = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
-        )
+        self.u_center_contract = AffineContract.stacked(1.0, -1.0)
         self.affine = AffineScaleBias(normalized_shape)
+        self.inv_sqrt_var = NLRsqrtPlusEps(eps)
         if allow_matmul:
-            self.inv_sqrt_var = NLRsqrtPlusEps(e)
             self.u_mul_invstd = AffineHadamard()
         elif self.norm_ln:
-            self.inv_sqrt_var = NLRsqrtPlusEps(e)
             self.add_u_invstd = AffineCombine([1.0, 1.0])
             self.square_sum = NLSquare(inplace=True)
             self.square_invstd = NLSquare()
             self.combine_z = AffineCombine([0.5, -0.5, -0.5], inplace=True)
-        elif self.strict_unary == "sigmoid_rsqrt":
-            self.inv_sqrt_var = NLRsqrtPlusEps(e)
-            self.u_mul_invstd = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
         else:
-            warnings.warn(
-                "strict_unary='log_exp' (log-domain strict graph) is deprecated; use 'sigmoid_rsqrt'",
-                FutureWarning,
-                stacklevel=2,
-            )
-            self.out_contract = AffineContract("p,...pc->...c", torch.tensor([1.0, -1.0]))
-            self.log_a_contract = AffineContract("q,...qpc->...pc", torch.tensor([2.0, -1.0]))
-            self.log_eps = NLLogPlusEps(e)
-            self.sqrt_exp = NLSqrtExp()
+            self.u_mul_invstd = ElementwiseProduct(hadamard=self.hadamard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.mean_u(x)
         _x, _m = RoutingBroadcastTensors(x, mu)
         u = self.u_center_contract(RoutingStack((_x, _m), dim=-1))
         u2 = self.square(u)
-        r2 = self.mean_r2(u2)
+        inv_std = self.inv_sqrt_var(self.mean_r2(u2))
         if self.norm_ln:
-            inv_std = self.inv_sqrt_var(r2)
             _u, _a = RoutingBroadcastTensors(u, inv_std)
             s = self.square_sum(self.add_u_invstd(_u, _a))
             z = self.combine_z(s, u2, self.square_invstd(inv_std))
-        elif self.allow_matmul or self.strict_unary == "sigmoid_rsqrt":
-            inv_std = self.inv_sqrt_var(r2)
-            z = self.u_mul_invstd(u, inv_std)
         else:
-            au = RoutingStack((RoutingReLU(u), RoutingReLU(-u)), dim=-2)
-            log_num = self.log_eps(au)
-            log_den = RoutingExpandAs(RoutingUnsqueeze(self.log_eps(r2), -2), log_num)
-            lin_log = self.log_a_contract(RoutingStack((log_num, log_den), dim=2))
-            a_mag = self.sqrt_exp(lin_log)
-            z = self.out_contract(a_mag)
+            z = self.u_mul_invstd(u, inv_std)
         return self.affine(z)
 
 
@@ -686,11 +596,8 @@ class PairwiseDotBySquare(nn.Module):
             self.qk_hadamard = AffineHadamard()
             self.reduce = AffineSum(-1)
         else:
-            w = 0.25 / math.sqrt(float(head_dim))
             self.square_chain = SquareIdentityOperandChain(
-                "pq,...qd->...pd",
-                "p,...pd->...",
-                torch.tensor([w, -w], dtype=get_surgery_dtype()),
+                "pq,...qd->...pd", AffineContract("p,...pd->...", _polarization_coeffs(1.0 / math.sqrt(head_dim)))
             )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
@@ -747,25 +654,20 @@ class GibbsTopKSoftmax(nn.Module):
     Returns per-row: sparse probs on idx, tail mass scalar q_tail, and idx.
 
     Normalization never uses the ``/`` operator: with ``allow_matmul=True`` use
-    :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; strict ``strict_unary="sigmoid_rsqrt"`` uses
-    :class:`ExpBySigmoid` and ``1/(Z+eps) = ((Z+eps)^{-1/2})^2`` (:class:`ReciprocalByRsqrt`) with products by
-    polarization (no exp, no log); the deprecated strict ``"log_exp"`` uses ``exp(vals - log(sum_exp + eps))``.
+    :class:`NLReciprocalPlusEps` and :class:`AffineHadamard`; the strict graph uses :class:`ExpBySigmoid` and
+    ``1/Z = (Z^{-1/2})^2`` (:class:`ReciprocalByRsqrt`) with products by polarization (no exp, no log).
 
     By default ``gibbs_tail_prob_eps`` reserves probability mass for all omitted entries and scales
     the top-k probabilities by ``1 - gibbs_tail_prob_eps``. The value is an ``nn.Parameter``
-    initialized from config, then typically overwritten by surgery calibration. The scale is applied
-    to top-k probabilities through an explicit ``AffineHadamard`` module rather than a bare tensor
-    multiply in ``forward``.
+    initialized from config, then typically overwritten by surgery calibration.
 
     With ``use_exact_tail_mass=True``, ``q_tail`` is the exact dense-softmax omitted mass computed at
     runtime via the centroid partition trick: ``Z_all = N * mean(exp(scores - row_max))``,
     ``q_tail = 1 - Z_top / Z_all``. Omitted keys are never gathered; the mean over all keys is the
     centroid. The calibrated ``gibbs_tail_prob_eps`` parameter is unused in that mode.
 
-    Only normalization subgraphs for the chosen ``allow_matmul`` / exact-tail mode are registered.
-
-    ``eps`` is an optional offset retained for compatibility with older runs. Current model
-    constructions pass zero; it is independent of the positive epsilon used by LayerNorm.
+    Only normalization subgraphs for the chosen ``allow_matmul`` / exact-tail mode are registered. The normalizer
+    offsets ``eps`` are zero, as in dense softmax.
     """
 
     def __init__(
@@ -773,11 +675,9 @@ class GibbsTopKSoftmax(nn.Module):
         seq_len: int,
         top_k: int,
         *,
-        eps: float,
         gibbs_tail_prob_eps: float,
         allow_matmul: bool = False,
         use_exact_tail_mass: bool = False,
-        strict_unary: str = "sigmoid_rsqrt",
         hadamard: bool = False,
     ) -> None:
         super().__init__()
@@ -786,10 +686,7 @@ class GibbsTopKSoftmax(nn.Module):
         if self.top_k < 1:
             raise ValueError("GibbsTopKSoftmax requires top_k >= 1")
         self.use_exact_tail_mass = bool(use_exact_tail_mass)
-        self.strict_unary = check_strict_unary(strict_unary)
-        h = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
-        # Strict graph without exp and log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2.
-        self.sigmoid_rsqrt = (not allow_matmul) and self.strict_unary == "sigmoid_rsqrt"
+        h = check_hadamard(hadamard, allow_matmul=allow_matmul)
         tail_prob = float(gibbs_tail_prob_eps)
         if not 0.0 <= tail_prob < 1.0:
             raise ValueError("gibbs_tail_prob_eps must be in [0, 1)")
@@ -797,55 +694,33 @@ class GibbsTopKSoftmax(nn.Module):
             torch.tensor(tail_prob, dtype=get_surgery_dtype()),
         )
         self.allow_matmul = allow_matmul
-        e = float(eps)
         self.exp = NLExp()
         self.sum_exp_vals = AffineSum(-1, keepdim=True)
-        self.top_vals_stable_contract = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
-        )
+        self.top_vals_stable_contract = AffineContract.stacked(1.0, -1.0)
         self.scale_top_probs_by_tail = AffineHadamard()
         if allow_matmul:
-            self.inv_z = NLReciprocalPlusEps(e)
+            self.inv_z = NLReciprocalPlusEps(0.0)
             self.mul_by_inv_z = AffineHadamard()
-        elif self.sigmoid_rsqrt:
-            self.exp = ExpBySigmoid(hadamard=h)
-            self.inv_z = ReciprocalByRsqrt(e, hadamard=h)
-            self.mul_by_inv_z = ElementwiseProduct(allow_matmul=False, hadamard=h)
         else:
-            self.log_z = NLLogPlusEps(e)
-            self.logit_logz_contract = AffineContract(
-                "i,...i->...",
-                torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-            )
+            # Strict graph without exp and log: exp(t) = sigmoid(t)/sigmoid(-t), 1/x = rsqrt(x)^2.
+            self.exp = ExpBySigmoid(hadamard=h)
+            self.inv_z = ReciprocalByRsqrt(hadamard=h)
+            self.mul_by_inv_z = ElementwiseProduct(hadamard=h)
         if self.use_exact_tail_mass:
-            self.all_vals_stable_contract = AffineContract(
-                "i,...i->...",
-                torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
-            )
+            self.all_vals_stable_contract = AffineContract.stacked(1.0, -1.0)
             self.mean_exp_all = AffineMean(dim=-1, keepdim=True)
             self.scale_z_all = AffineScale(float(self.seq_len))
-            self.one_minus_top_mass = AffineContract(
-                "i,...i->...",
-                torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
-            )
+            self.one_minus_top_mass = AffineContract.stacked(1.0, -1.0)
             if allow_matmul:
-                self.inv_z_all = NLReciprocalPlusEps(e)
+                self.inv_z_all = NLReciprocalPlusEps(0.0)
                 self.mul_ztop_inv_zall = AffineHadamard()
-            elif self.sigmoid_rsqrt:
-                self.inv_z_all = ReciprocalByRsqrt(e, hadamard=h)
-                self.mul_ztop_inv_zall = ElementwiseProduct(allow_matmul=False, hadamard=h)
-                self.scale_top_probs_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=h)
             else:
-                self.log_z_all = NLLogPlusEps(e)
-                self.log_z_top = NLLogPlusEps(e)
-                self.top_mass_log_contract = AffineContract(
-                    "i,...i->...",
-                    torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-                )
+                self.inv_z_all = ReciprocalByRsqrt(hadamard=h)
+                self.mul_ztop_inv_zall = ElementwiseProduct(hadamard=h)
+                self.scale_top_probs_by_tail = ElementwiseProduct(hadamard=h)
 
     def set_normalizer_epsilon(self, value: float = 0.0) -> None:
-        """Set every registered softmax-normalizer offset in this module."""
+        """Set every softmax-normalizer offset; checkpoints of earlier runs store nonzero offsets."""
         with torch.no_grad():
             for module in self.modules():
                 eps = getattr(module, "eps", None)
@@ -900,16 +775,7 @@ class GibbsTopKSoftmax(nn.Module):
         s_k = vals[..., -1:]
         exp_vals = self.exp(vals)
         normalizer = self.sum_exp_vals(exp_vals)
-
-        if self.allow_matmul or self.sigmoid_rsqrt:
-            inv_z = self.inv_z(normalizer)
-            top_probs = self.mul_by_inv_z(exp_vals, inv_z)
-        else:
-            log_z = self.log_z(normalizer)
-            neg_log_z = -log_z
-            _v, _nlz = RoutingBroadcastTensors(vals, neg_log_z)
-            logits_norm = self.logit_logz_contract(RoutingStack((_v, _nlz), dim=-1))
-            top_probs = self.exp(logits_norm)
+        top_probs = self.mul_by_inv_z(exp_vals, self.inv_z(normalizer))
 
         if nk > k:
             if self.use_exact_tail_mass:
@@ -917,13 +783,7 @@ class GibbsTopKSoftmax(nn.Module):
                 scores_stable = self.all_vals_stable_contract(RoutingStack((_s, _rm), dim=-1))
                 exp_all = self.exp(scores_stable)
                 z_all = self.scale_z_all(self.mean_exp_all(exp_all))
-                if self.allow_matmul or self.sigmoid_rsqrt:
-                    top_mass = self.mul_ztop_inv_zall(normalizer, self.inv_z_all(z_all))
-                else:
-                    log_z_top = self.log_z_top(normalizer)
-                    neg_log_z_all = -self.log_z_all(z_all)
-                    _lt, _nlza = RoutingBroadcastTensors(log_z_top, neg_log_z_all)
-                    top_mass = self.exp(self.top_mass_log_contract(RoutingStack((_lt, _nlza), dim=-1)))
+                top_mass = self.mul_ztop_inv_zall(normalizer, self.inv_z_all(z_all))
                 ones = RoutingFullLike(top_mass, 1.0)
                 q_tail = self.one_minus_top_mass(RoutingStack((ones, top_mass), dim=-1))
                 probs = self.scale_top_probs_by_tail(top_probs, top_mass)
@@ -964,14 +824,17 @@ class QueryCentroidRouter(nn.Module):
         self.register_buffer("assign_bias", (-0.5 * c.pow(2).sum(-1)).view(1, c.shape[0], 1, c.shape[1]))
         self.add_assign_bias = AffineAdd()
 
+    def _nearest_centroid(self, q: torch.Tensor) -> torch.Tensor:
+        """Index ``[B,H,Nq,1]`` of each query's nearest centroid."""
+        bias = self.assign_bias.to(device=q.device, dtype=q.dtype)
+        _a, m = RoutingTopK(self.add_assign_bias(self.assign_scores(q), bias), k=1, dim=-1)
+        return m
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """q: [B,H,Nq,D], k: [B,H,Nk,D], optional additive mask; returns selection scores [B,H,Nq,Nk]."""
-        bias = self.assign_bias.to(device=q.device, dtype=q.dtype)
-        assign = self.add_assign_bias(self.assign_scores(q), bias)
-        _a, m = RoutingTopK(assign, k=1, dim=-1)
+        m = self._nearest_centroid(q)
         key_scores = self.key_scores(k)
-        m_e = RoutingExpand(m, -1, -1, -1, key_scores.shape[-1])
-        selection = RoutingGather(key_scores, 2, m_e)
+        selection = RoutingGather(key_scores, 2, RoutingExpand(m, -1, -1, -1, key_scores.shape[-1]))
         return selection if mask is None else RoutingAdd(selection, mask)
 
     def support(self, q: torch.Tensor, k: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -979,11 +842,9 @@ class QueryCentroidRouter(nn.Module):
 
         Equals the top-k of :meth:`forward` row by row without forming an ``Nq x Nk`` matrix.
         """
-        bias = self.assign_bias.to(device=q.device, dtype=q.dtype)
-        assign = self.add_assign_bias(self.assign_scores(q), bias)
-        _a, m = RoutingTopK(assign, k=1, dim=-1)
-        _v, idx_c = RoutingTopK(self.key_scores(k), k=int(top_k), dim=-1, largest=True, sorted=False)
-        return RoutingGather(idx_c, 2, RoutingExpand(m, -1, -1, -1, int(top_k)))
+        m = self._nearest_centroid(q)
+        _v, idx_c = RoutingTopK(self.key_scores(k), k=top_k, dim=-1, largest=True, sorted=False)
+        return RoutingGather(idx_c, 2, RoutingExpand(m, -1, -1, -1, top_k))
 
 
 # ---------------------------------------------------------------------------
@@ -1031,12 +892,7 @@ class SparseWeightedSumBySquare(nn.Module):
         else:
             # Polarization, combined per term: (p+v)^2 - (p-v)^2 for each key, then the sum over keys, in one node.
             self.square_chain = SquareIdentityOperandChain(
-                "pq,...kqd->...kpd",
-                "p,...kpd->...kd",
-                torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()),
-            )
-            self.square_chain.out_contract = AffineContractPerTerm(
-                "p,...kpd->...kd", torch.tensor([0.25, -0.25], dtype=get_surgery_dtype()), sum_dim=-2
+                "pq,...kqd->...kpd", AffineContractPerTerm("p,...kpd->...kd", _polarization_coeffs(), sum_dim=-2)
             )
 
     def forward(
@@ -1079,134 +935,140 @@ class SparseWeightedSumBySquare(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class SurgeryAttention(nn.Module):
-    """ViT multi-head attention assembled from surgery op modules."""
+def dense_softmax_mix(
+    scores: torch.Tensor, v: torch.Tensor, attn_drop: nn.Module, matmul: Optional[nn.Module]
+) -> torch.Tensor:
+    """Dense softmax of ``scores`` [B,H,Nq,Nk] applied to ``v`` [B,H,Nk,D]: ``matmul`` or a broadcast product sum."""
+    attn = attn_drop(scores.softmax(dim=-1))
+    if matmul is not None:
+        return matmul(attn, v)
+    _, _, nq, nk = attn.shape
+    return (RoutingUnsqueeze(attn, -1) * RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)).sum(dim=3)
+
+
+def graph_options(cfg: "SurgeryConfig") -> Tuple[bool, str]:
+    """Validated ``(hadamard, strict_product)`` of a surgery config."""
+    hadamard = check_hadamard(cfg.hadamard, allow_matmul=cfg.allow_matmul)
+    return hadamard, check_strict_product(cfg.strict_product, allow_matmul=cfg.allow_matmul, hadamard=hadamard)
+
+
+def surgery_layer_norm(dim: int, cfg: "SurgeryConfig") -> nn.Module:
+    """LayerNorm of a surgery student: :class:`RewrittenLayerNorm` in the configured graph, or ``nn.LayerNorm``."""
+    if cfg.disable_layernorm_replacement:
+        return nn.LayerNorm(dim, eps=cfg.eps)
+    return RewrittenLayerNorm(
+        dim,
+        eps=cfg.eps,
+        allow_matmul=cfg.allow_matmul,
+        hadamard=cfg.hadamard,
+        strict_product=cfg.strict_product,
+    )
+
+
+class SparseTailAttention(nn.Module):
+    """
+    Gibbs top-k attention with the omitted tail mass reinjected through the mean of ``V``:
+    ``y = sum_{j in S} (p_j - q_tail / (N - k)) v_j + q_tail N / (N - k) mean(v)`` spreads ``q_tail`` uniformly over
+    the ``N - k`` omitted keys without gathering them.
+    """
+
+    def _init_sparse_tail(self, seq_len: int, cfg: "SurgeryConfig") -> None:
+        """Register ``gibbs``, ``sparse_mix`` and the tail reinjection of the configured graph."""
+        hadamard, strict_product = graph_options(cfg)
+        self.gibbs = GibbsTopKSoftmax(
+            seq_len,
+            cfg.top_k,
+            gibbs_tail_prob_eps=cfg.gibbs_tail_prob_eps,
+            allow_matmul=cfg.allow_matmul,
+            use_exact_tail_mass=cfg.use_exact_tail_mass,
+            hadamard=hadamard,
+        )
+        self.sparse_mix = SparseWeightedSumBySquare(
+            allow_matmul=cfg.allow_matmul, hadamard=hadamard, strict_product=strict_product
+        )
+        n_dropped = max(seq_len - min(cfg.top_k, seq_len), 1)
+        self.mean_v = AffineMean(dim=-2, keepdim=True)
+        # The exact tail mass is an activation: in the strict graph q_tail * mean(V) is a product of two activations.
+        if cfg.use_exact_tail_mass and not cfg.allow_matmul:
+            if strict_product == "norm":
+                self.scale_mean_v_by_tail = NormExpansionProduct()
+            else:
+                self.scale_mean_v_by_tail = ElementwiseProduct(hadamard=hadamard)
+        else:
+            self.scale_mean_v_by_tail = AffineHadamard()
+        self.adj_probs_contract = AffineContract.stacked(1.0, -1.0 / n_dropped)
+        self.attn_tail_sum = AffineContract.stacked(1.0, seq_len / n_dropped)
+
+    def _sparse_tail_mix(
+        self, probs: torch.Tensor, idx: torch.Tensor, q_tail: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        _p, _qt = RoutingBroadcastTensors(probs, q_tail)
+        attn_top = self.sparse_mix(self.adj_probs_contract(RoutingStack((_p, _qt), dim=-1)), idx, v)
+        tail = self.scale_mean_v_by_tail(self.mean_v(v), q_tail)
+        _a, _t = RoutingBroadcastTensors(attn_top, tail)
+        return self.attn_tail_sum(RoutingStack((_a, _t), dim=-1))
+
+
+class SurgeryAttention(SparseTailAttention):
+    """ViT multi-head attention assembled from surgery op modules, configured by a ``SurgeryConfig``."""
 
     def __init__(
         self,
         dim: int,
         num_heads: int,
         seq_len: int,
-        top_k: int,
+        cfg: "SurgeryConfig",
+        *,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        use_attention_surgery: bool = True,
-        use_surgery_softmax: bool = True,
-        allow_matmul: bool = False,
-        gibbs_tail_prob_eps: float = 1e-5,
-        use_exact_tail_mass: bool = False,
-        strict_unary: str = "sigmoid_rsqrt",
-        hadamard: bool = False,
-        strict_product: str = "norm",
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.strict_unary = check_strict_unary(strict_unary)
-        self.hadamard = check_hadamard(hadamard, allow_matmul=allow_matmul, strict_unary=self.strict_unary)
-        self.strict_product = check_strict_product(strict_product, allow_matmul=allow_matmul, hadamard=self.hadamard)
-        self.use_attention_surgery = use_attention_surgery
-        self.use_surgery_softmax = use_surgery_softmax
-        self.allow_matmul = allow_matmul
-        if use_attention_surgery and not use_surgery_softmax and allow_matmul:
-            self.matmul = AffineMatMul()
+        self.use_attention_surgery = not cfg.disable_attention_surgery
+        self.use_surgery_softmax = not cfg.disable_softmax_replacement
+        hadamard, strict_product = graph_options(cfg)
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
         self.router: Optional[nn.Module] = None
-        if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(
-                self.head_dim, allow_matmul=allow_matmul, hadamard=self.hadamard, strict_product=self.strict_product
-            )
-            if use_surgery_softmax:
-                self.gibbs = GibbsTopKSoftmax(
-                    seq_len,
-                    top_k,
-                    eps=0.0,
-                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
-                    allow_matmul=allow_matmul,
-                    use_exact_tail_mass=use_exact_tail_mass,
-                    strict_unary=self.strict_unary,
-                    hadamard=self.hadamard,
-                )
-                self.sparse_mix = SparseWeightedSumBySquare(
-                    allow_matmul=allow_matmul, hadamard=self.hadamard, strict_product=self.strict_product
-                )
-                k_eff = min(int(top_k), int(seq_len))
-                n_dropped = max(int(seq_len) - k_eff, 1)
-                inv_dropped = 1.0 / n_dropped
-                n_over_dropped = float(seq_len) / n_dropped
-                self.mean_v = AffineMean(dim=-2, keepdim=True)
-                if use_exact_tail_mass and not allow_matmul and self.strict_unary == "sigmoid_rsqrt":
-                    if self.strict_product == "norm":
-                        self.scale_mean_v_by_tail = NormExpansionProduct()
-                    else:
-                        self.scale_mean_v_by_tail = ElementwiseProduct(allow_matmul=False, hadamard=self.hadamard)
-                else:
-                    self.scale_mean_v_by_tail = AffineHadamard()
-                self.adj_probs_contract = AffineContract(
-                    "i,...i->...",
-                    torch.tensor([1.0, -inv_dropped], dtype=get_surgery_dtype()),
-                )
-                self.attn_tail_sum = AffineContract(
-                    "i,...i->...",
-                    torch.tensor([1.0, n_over_dropped], dtype=get_surgery_dtype()),
-                )
-            else:
-                self.attn_drop = nn.Dropout(attn_drop)
-        else:
+        if not self.use_attention_surgery:
             self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
             self.attn_drop = nn.Dropout(attn_drop)
+            return
+        self.dot = PairwiseDotBySquare(
+            self.head_dim, allow_matmul=cfg.allow_matmul, hadamard=hadamard, strict_product=strict_product
+        )
+        if self.use_surgery_softmax:
+            self._init_sparse_tail(seq_len, cfg)
+        else:
+            self.attn_drop = nn.Dropout(attn_drop)
+            self.matmul = AffineMatMul() if cfg.allow_matmul else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, n, c = x.shape
-        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         if not self.use_attention_surgery:
-            s = self.attn_scale.to(device=q.device, dtype=q.dtype)
-            qs = q * s
-            kt = RoutingTranspose(k, -2, -1)
-            attn = qs @ kt
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            attn = attn @ v
-        elif self.use_surgery_softmax:
-            nk = k.shape[2]
-            if self.router is not None and self.gibbs.top_k < nk and not self.gibbs.use_exact_tail_mass:
+            qs = q * self.attn_scale.to(device=q.device, dtype=q.dtype)
+            attn = self.attn_drop((qs @ RoutingTranspose(k, -2, -1)).softmax(dim=-1)) @ v
+        elif not self.use_surgery_softmax:
+            attn = dense_softmax_mix(self.dot(q, k), v, self.attn_drop, self.matmul)
+        else:
+            if self.router is not None and self.gibbs.top_k < n and not self.gibbs.use_exact_tail_mass:
                 # Routed support first, exact scores only on it: no Nq x Nk score matrix.
                 support = self.router.support(q, k, self.gibbs.top_k)
-                probs, idx, q_tail = self.gibbs.forward_selected(self.dot.selected(q, k, support), support, nk)
+                probs, idx, q_tail = self.gibbs.forward_selected(self.dot.selected(q, k, support), support, n)
             else:
                 scores = self.dot(q, k)
-                selection = self.router(q, k) if self.router is not None else None
-                probs, idx, q_tail = self.gibbs(scores, selection)
-            _p, _qt = RoutingBroadcastTensors(probs, q_tail)
-            adjusted_probs = self.adj_probs_contract(RoutingStack((_p, _qt), dim=-1))
-            attn_top = self.sparse_mix(adjusted_probs, idx, v)
-            mean_v = self.mean_v(v)
-            tail_contrib = self.scale_mean_v_by_tail(mean_v, q_tail)
-            _a, _t = RoutingBroadcastTensors(attn_top, tail_contrib)
-            attn = self.attn_tail_sum(RoutingStack((_a, _t), dim=-1))
-        else:
-            scores = self.dot(q, k)
-            attn = scores.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            if self.allow_matmul:
-                attn = self.matmul(attn, v)
-            else:
-                _, _, nq, nk = attn.shape
-                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
-                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
-        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
-        attn = self.proj(attn)
-        attn = self.proj_drop(attn)
-        return attn
+                probs, idx, q_tail = self.gibbs(scores, None if self.router is None else self.router(q, k))
+            attn = self._sparse_tail_mix(probs, idx, q_tail, v)
+        return self.proj_drop(self.proj(RoutingTranspose(attn, 1, 2).reshape(b, n, c)))
 
 
 class SurgeryCausalAttention(nn.Module):
     """
-    Causal GPT-NeoX-style attention in the surgery vocabulary.
+    Causal GPT-NeoX-style attention in the surgery vocabulary, configured by a ``SurgeryConfig``.
 
     Fused QKV uses the NeoX head-interleaved layout ``(B, H, N, 3*D) -> chunk Q/K/V``.
     Partial rotary is applied with fixed cos/sin buffers, then scores are masked with an
@@ -1222,34 +1084,25 @@ class SurgeryCausalAttention(nn.Module):
         dim: int,
         num_heads: int,
         seq_len: int,
-        top_k: int,
+        cfg: "SurgeryConfig",
         *,
         rotary_ndims: int,
         rope_theta: float = 10000.0,
         attn_bias: bool = True,
         attn_drop: float = 0.0,
-        use_attention_surgery: bool = True,
-        use_surgery_softmax: bool = True,
-        allow_matmul: bool = False,
-        gibbs_tail_prob_eps: float = 1e-5,
-        use_exact_tail_mass: bool = False,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.num_heads = int(num_heads)
+        self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.seq_len = int(seq_len)
-        self.rotary_ndims = int(rotary_ndims)
-        if self.rotary_ndims < 0 or self.rotary_ndims > self.head_dim:
-            raise ValueError(f"rotary_ndims={rotary_ndims} out of range for head_dim={self.head_dim}")
-        if self.rotary_ndims % 2 != 0:
-            raise ValueError(f"rotary_ndims must be even, got {self.rotary_ndims}")
-        self.use_attention_surgery = bool(use_attention_surgery)
-        self.use_surgery_softmax = bool(use_surgery_softmax)
-        self.allow_matmul = bool(allow_matmul)
-        self.use_exact_tail_mass = bool(use_exact_tail_mass)
-        self.top_k = int(top_k)
+        self.seq_len = seq_len
+        if rotary_ndims % 2 or not 0 <= rotary_ndims <= self.head_dim:
+            raise ValueError(f"rotary_ndims={rotary_ndims} must be even and at most head_dim={self.head_dim}")
+        self.rotary_ndims = rotary_ndims
+        self.use_attention_surgery = not cfg.disable_attention_surgery
+        self.use_surgery_softmax = not cfg.disable_softmax_replacement
+        hadamard, strict_product = graph_options(cfg)
 
         self.query_key_value = nn.Linear(dim, dim * 3, bias=attn_bias)
         self.dense = nn.Linear(dim, dim, bias=attn_bias)
@@ -1257,119 +1110,78 @@ class SurgeryCausalAttention(nn.Module):
         # Optional support router (e.g. QueryCentroidRouter); None keeps the top-k of exact scores.
         self.router: Optional[nn.Module] = None
 
-        self.register_buffer("causal_mask", build_causal_attn_mask(self.seq_len), persistent=False)
-        self._init_rotary_buffers(rope_theta)
+        self.register_buffer("causal_mask", build_causal_attn_mask(seq_len), persistent=False)
+        inv_freq = 1.0 / (float(rope_theta) ** (torch.arange(0, rotary_ndims, 2, dtype=torch.float64) / rotary_ndims))
+        freqs = torch.outer(torch.arange(seq_len, dtype=torch.float64), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1).view(1, 1, seq_len, rotary_ndims)
+        self.register_buffer("cos_cached", emb.cos().to(dtype=get_surgery_dtype()), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype=get_surgery_dtype()), persistent=False)
 
-        if use_attention_surgery:
-            self.dot = PairwiseDotBySquare(self.head_dim, allow_matmul=allow_matmul)
+        self.matmul: Optional[nn.Module] = None
+        if not self.use_attention_surgery:
+            self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
+            self.matmul = AffineMatMul() if cfg.allow_matmul else None
+        else:
+            self.dot = PairwiseDotBySquare(
+                self.head_dim, allow_matmul=cfg.allow_matmul, hadamard=hadamard, strict_product=strict_product
+            )
             # Hookable masked-score node so calibration sees causal logits (not raw QK).
             self.mask_scores = AffineAdd()
-            if use_surgery_softmax:
-                # Softmax normalizer floor is independent of LayerNorm eps; use 0 to match
-                # dense softmax (no additive floor in logZ / reciprocal).
+            if not self.use_surgery_softmax:
+                self.matmul = AffineMatMul() if cfg.allow_matmul else None
+            else:
                 self.gibbs = GibbsTopKSoftmax(
-                    self.seq_len,
-                    top_k,
-                    eps=0.0,
-                    gibbs_tail_prob_eps=gibbs_tail_prob_eps,
-                    allow_matmul=allow_matmul,
-                    use_exact_tail_mass=use_exact_tail_mass,
+                    seq_len,
+                    cfg.top_k,
+                    gibbs_tail_prob_eps=cfg.gibbs_tail_prob_eps,
+                    allow_matmul=cfg.allow_matmul,
+                    use_exact_tail_mass=cfg.use_exact_tail_mass,
+                    hadamard=hadamard,
                 )
-                self.sparse_mix = SparseWeightedSumBySquare(allow_matmul=allow_matmul)
-                self._init_causal_tail_modules(top_k)
-            elif allow_matmul:
-                self.matmul = AffineMatMul()
-        else:
-            self.register_buffer("attn_scale", torch.tensor(float(self.head_dim) ** -0.5))
-            if allow_matmul:
-                self.matmul = AffineMatMul()
+                self.sparse_mix = SparseWeightedSumBySquare(
+                    allow_matmul=cfg.allow_matmul, hadamard=hadamard, strict_product=strict_product
+                )
+                valid = torch.arange(1, seq_len + 1, dtype=torch.float32)
+                n_dropped = torch.clamp(valid - float(min(cfg.top_k, seq_len)), min=1.0)
+                self.register_buffer("inv_n_dropped", (1.0 / n_dropped).view(1, 1, seq_len, 1), persistent=False)
+                self.register_buffer(
+                    "valid_over_dropped", (valid / n_dropped).view(1, 1, seq_len, 1), persistent=False
+                )
+                self.valid_key_mean = AffineContract(
+                    "nk,bhkd->bhnd", build_causal_valid_key_mean_matrix(seq_len, dtype=get_surgery_dtype())
+                )
+                self.scale_mean_v_by_tail = AffineHadamard()
+                self.scale_q_tail_by_inv_dropped = AffineHadamard()
+                self.scale_tail_by_valid_over_dropped = AffineHadamard()
+                self.scale_top_probs_by_valid = AffineHadamard()
+                self.adj_probs_contract = AffineContract.stacked(1.0, -1.0)
+                self.attn_tail_sum = AffineContract.stacked(1.0, 1.0)
 
         self.rotate_neg = AffineScale(-1.0)
         self.rope_cos_mul = AffineHadamard()
         self.rope_sin_mul = AffineHadamard()
-        self.rope_sum = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-        )
+        self.rope_sum = AffineContract.stacked(1.0, 1.0)
 
-    def _init_rotary_buffers(self, rope_theta: float) -> None:
-        n = self.seq_len
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         rd = self.rotary_ndims
-        if rd == 0:
-            self.register_buffer("cos_cached", torch.ones(1, 1, n, 0), persistent=False)
-            self.register_buffer("sin_cached", torch.zeros(1, 1, n, 0), persistent=False)
-            return
-        inv_freq = 1.0 / (
-            float(rope_theta)
-            ** (torch.arange(0, rd, 2, dtype=torch.float64) / float(rd))
-        )
-        positions = torch.arange(n, dtype=torch.float64)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(dtype=get_surgery_dtype())
-        sin = emb.sin().to(dtype=get_surgery_dtype())
-        self.register_buffer("cos_cached", cos.view(1, 1, n, rd), persistent=False)
-        self.register_buffer("sin_cached", sin.view(1, 1, n, rd), persistent=False)
-
-    def _init_causal_tail_modules(self, top_k: int) -> None:
-        n = self.seq_len
-        k_eff = min(int(top_k), n)
-        valid = torch.arange(1, n + 1, dtype=torch.float32)
-        n_dropped = torch.clamp(valid - float(k_eff), min=1.0)
-        inv_dropped = 1.0 / n_dropped
-        valid_over_dropped = valid / n_dropped
-        self.register_buffer("inv_n_dropped", inv_dropped.view(1, 1, n, 1), persistent=False)
-        self.register_buffer("valid_over_dropped", valid_over_dropped.view(1, 1, n, 1), persistent=False)
-        self.valid_key_mean = AffineContract(
-            "nk,bhkd->bhnd",
-            build_causal_valid_key_mean_matrix(n, dtype=get_surgery_dtype()),
-        )
-        self.scale_mean_v_by_tail = AffineHadamard()
-        self.scale_q_tail_by_inv_dropped = AffineHadamard()
-        self.scale_tail_by_valid_over_dropped = AffineHadamard()
-        self.scale_top_probs_by_valid = AffineHadamard()
-        self.adj_probs_contract = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, -1.0], dtype=get_surgery_dtype()),
-        )
-        self.attn_tail_sum = AffineContract(
-            "i,...i->...",
-            torch.tensor([1.0, 1.0], dtype=get_surgery_dtype()),
-        )
-
-    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return RoutingCat((self.rotate_neg(x2), x1), dim=-1)
+        x_rot, x_pass = x[..., :rd], x[..., rd:]
+        x1, x2 = x_rot[..., : rd // 2], x_rot[..., rd // 2 :]
+        rotated = RoutingCat((self.rotate_neg(x2), x1), dim=-1)
+        x_embed = self.rope_sum(RoutingStack((self.rope_cos_mul(x_rot, cos), self.rope_sin_mul(rotated, sin)), dim=-1))
+        return RoutingCat((x_embed, x_pass), dim=-1)
 
     def _apply_rotary(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        rd = self.rotary_ndims
-        if rd == 0:
+        if self.rotary_ndims == 0:
             return q, k
         cos = self.cos_cached.to(device=q.device, dtype=q.dtype)
         sin = self.sin_cached.to(device=q.device, dtype=q.dtype)
-        q_rot, q_pass = q[..., :rd], q[..., rd:]
-        k_rot, k_pass = k[..., :rd], k[..., rd:]
-        q_embed = self.rope_sum(
-            RoutingStack(
-                (self.rope_cos_mul(q_rot, cos), self.rope_sin_mul(self._rotate_half(q_rot), sin)),
-                dim=-1,
-            )
-        )
-        k_embed = self.rope_sum(
-            RoutingStack(
-                (self.rope_cos_mul(k_rot, cos), self.rope_sin_mul(self._rotate_half(k_rot), sin)),
-                dim=-1,
-            )
-        )
-        return RoutingCat((q_embed, q_pass), dim=-1), RoutingCat((k_embed, k_pass), dim=-1)
+        return self._rope(q, cos, sin), self._rope(k, cos, sin)
 
     def _split_qkv(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, n, _ = hidden.shape
         # NeoX layout: (B, N, H, 3*D) -> (B, H, N, 3*D) -> chunk on last dim.
-        qkv = self.query_key_value(hidden).view(b, n, self.num_heads, 3 * self.head_dim)
-        qkv = qkv.transpose(1, 2)
-        return tuple(qkv.chunk(3, dim=-1))  # type: ignore[return-value]
+        qkv = self.query_key_value(hidden).view(b, n, self.num_heads, 3 * self.head_dim).transpose(1, 2)
+        return qkv.chunk(3, dim=-1)  # type: ignore[return-value]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, n, c = x.shape
@@ -1380,15 +1192,13 @@ class SurgeryCausalAttention(nn.Module):
         mask = self.causal_mask.to(device=q.device, dtype=q.dtype)
 
         if not self.use_attention_surgery:
-            s = self.attn_scale.to(device=q.device, dtype=q.dtype)
-            qs = q * s
-            kt = RoutingTranspose(k, -2, -1)
-            scores = self.matmul(qs, kt) if self.allow_matmul else torch.matmul(qs, kt)
-            scores = RoutingAdd(scores, mask)
-            attn = scores.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            attn = self.matmul(attn, v) if self.allow_matmul else torch.matmul(attn, v)
-        elif self.use_surgery_softmax:
+            matmul = torch.matmul if self.matmul is None else self.matmul
+            qs = q * self.attn_scale.to(device=q.device, dtype=q.dtype)
+            scores = RoutingAdd(matmul(qs, RoutingTranspose(k, -2, -1)), mask)
+            attn = matmul(self.attn_drop(scores.softmax(dim=-1)), v)
+        elif not self.use_surgery_softmax:
+            attn = dense_softmax_mix(self.mask_scores(self.dot(q, k), mask), v, self.attn_drop, self.matmul)
+        else:
             if self.router is not None and self.gibbs.top_k < n and not self.gibbs.use_exact_tail_mass:
                 # The causal mask differs per row, so the support is the top-k of the masked selection;
                 # exact scores are formed only on it.
@@ -1400,50 +1210,22 @@ class SurgeryCausalAttention(nn.Module):
                 probs, idx, q_tail = self.gibbs.forward_selected(scores_sel, support, n)
             else:
                 scores = self.mask_scores(self.dot(q, k), mask)
-                selection = self.router(q, k, mask) if self.router is not None else None
-                probs, idx, q_tail = self.gibbs(scores, selection)
+                probs, idx, q_tail = self.gibbs(scores, None if self.router is None else self.router(q, k, mask))
             # When valid_keys < top_k, topk may return future (-inf) filler indices with ~0
             # probability. Zero them explicitly so no mass is routed past the causal boundary.
-            query_pos = torch.arange(n, device=idx.device).view(1, 1, n, 1)
-            valid = (idx <= query_pos).to(dtype=probs.dtype)
+            valid = (idx <= torch.arange(n, device=idx.device).view(1, 1, n, 1)).to(dtype=probs.dtype)
             probs = self.scale_top_probs_by_valid(probs, valid)
             inv = self.inv_n_dropped.to(device=probs.device, dtype=probs.dtype)
             vod = self.valid_over_dropped.to(device=probs.device, dtype=probs.dtype)
-            q_tail_adj = self.scale_q_tail_by_inv_dropped(q_tail, inv)
-            _p, _qta = RoutingBroadcastTensors(probs, q_tail_adj)
+            _p, _qta = RoutingBroadcastTensors(probs, self.scale_q_tail_by_inv_dropped(q_tail, inv))
             adjusted_probs = self.adj_probs_contract(RoutingStack((_p, _qta), dim=-1))
             adjusted_probs = self.scale_top_probs_by_valid(adjusted_probs, valid)
             attn_top = self.sparse_mix(adjusted_probs, idx, v)
-            mean_v = self.valid_key_mean(v)
-            tail_scaled = self.scale_mean_v_by_tail(mean_v, q_tail)
-            tail_contrib = self.scale_tail_by_valid_over_dropped(tail_scaled, vod)
-            _a, _t = RoutingBroadcastTensors(attn_top, tail_contrib)
+            tail_scaled = self.scale_mean_v_by_tail(self.valid_key_mean(v), q_tail)
+            _a, _t = RoutingBroadcastTensors(attn_top, self.scale_tail_by_valid_over_dropped(tail_scaled, vod))
             attn = self.attn_tail_sum(RoutingStack((_a, _t), dim=-1))
-        else:
-            scores = self.mask_scores(self.dot(q, k), mask)
-            attn = scores.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            if self.allow_matmul:
-                attn = self.matmul(attn, v)
-            else:
-                _, _, nq, nk = attn.shape
-                v_b = RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)
-                attn = (RoutingUnsqueeze(attn, -1) * v_b).sum(dim=3)
 
-        attn = RoutingTranspose(attn, 1, 2).reshape(b, n, c)
-        return self.dense(attn)
-
-
-# ---------------------------------------------------------------------------
-# GELU basis op (MLP nonlinearity)
-# ---------------------------------------------------------------------------
-
-
-class NLGELU(nn.Module):
-    """Exact GELU as a nonlinear unary basis op."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.gelu(x)
+        return self.dense(RoutingTranspose(attn, 1, 2).reshape(b, n, c))
 
 
 # ---------------------------------------------------------------------------
@@ -1464,11 +1246,7 @@ def ptq_quantize_proxy(x: torch.Tensor, scale: torch.Tensor, bits: int) -> torch
 
 
 class PTQInputQuantizer(nn.Module):
-    """Apply the consuming node's interface grid, including to preceding node outputs.
-
-    ``activation_bits`` is already resolved for this node's group. A preceding
-    node's width is not inherited: this node quantizes each input on its own grid.
-    """
+    """Signed integer codes of each input on its own grid ``input_scale[i]`` at this node's width."""
 
     def __init__(self, activation_bits: int, input_scale: torch.Tensor) -> None:
         super().__init__()
@@ -1485,13 +1263,10 @@ class PTQInputQuantizer(nn.Module):
 
 
 class CalibratedAffinePTQWrapper(nn.Module):
-    """Forward-only PTQ proxy: quantize inputs, accumulate, dequantize outputs.
+    """Forward-only PTQ proxy: quantize the inputs, accumulate, dequantize the output.
 
-    A producer's output is its consumer's input. Quantize each boundary once,
-    at the selected consumer, using its resolved width and input scale. The
-    accumulator result is dequantized; the next selected consumer applies the
-    next boundary's grid, after any intervening unary/routing nodes. Integer
-    codes are stored in float32 tensors.
+    Each producer/consumer boundary is quantized once, at the selected consumer, with that consumer's width and input
+    scale; unary and routing nodes in between run in floating point. Integer codes are stored in float32 tensors.
     """
 
     def __init__(
@@ -1504,10 +1279,8 @@ class CalibratedAffinePTQWrapper(nn.Module):
         out_bias: torch.Tensor,
         skip_out_scale: bool = False,
         out_bcast_shape: Optional[Tuple[int, ...]] = None,
-        module_device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
-        self.activation_bits = int(activation_bits)
         self.skip_out_scale = bool(skip_out_scale)
         self.quantizer = PTQInputQuantizer(activation_bits, input_scale)
         self.accumulator = accumulator
@@ -1515,17 +1288,13 @@ class CalibratedAffinePTQWrapper(nn.Module):
         self.register_buffer("out_bias", out_bias.to(dtype=torch.float32))
         self.out_bcast_shape = out_bcast_shape
 
-        if module_device is not None:
-            self.to(device=module_device)
-
     def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
         q = self.quantizer(*inputs)
         if getattr(self.accumulator, "ptq_dequantized_inputs", False):
             q = tuple(t * self.quantizer.input_scale[i] for i, t in enumerate(q))
         acc = self.accumulator(*q)
+        scale, bias = self.out_scale, self.out_bias
         if self.out_bcast_shape is not None:
-            bias = self.out_bias.view(self.out_bcast_shape)
-            out = acc + bias if self.skip_out_scale else self.out_scale.view(self.out_bcast_shape) * acc + bias
-        else:
-            out = acc + self.out_bias if self.skip_out_scale else self.out_scale * acc + self.out_bias
+            scale, bias = scale.view(self.out_bcast_shape), bias.view(self.out_bcast_shape)
+        out = acc + bias if self.skip_out_scale else scale * acc + bias
         return out.to(dtype=inputs[0].dtype)

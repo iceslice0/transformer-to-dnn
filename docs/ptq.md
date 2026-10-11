@@ -49,9 +49,7 @@ fields are:
   unset. The paper's strict configs use `compiled_accumulator_bits=12` for the wider range of squares and sums
   of squares; bit-width sweep configs also test other widths. This override affects only selected compiled
   fixed-affine nodes. It does not change weight precision or the Linear/Conv and MatMul/Hadamard input widths.
-  Quantization is applied once per boundary, at the consuming node's input.
-  `affine_activation_bits` is the deprecated name and
-  is still accepted. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
+  Quantization is applied once per boundary, at the consuming node's input. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
   its own multiplier before the sum, as in an integer Add with per-input multipliers. The strict baseline coefficients
   ([1, 1], [1, -1], [0.5, 0.5], [0.5, -0.5, -0.5]) were exact on the one-scale 8-bit grid before as well.
 - `calibration_seed` (default 0): seed of the global RNGs before the loaders are built, so the calibration batches
@@ -137,7 +135,7 @@ quantizes that boundary once, on its own grid; a second quantizer at the produce
 duplicate the boundary operation. When unary or routing nodes intervene, the next selected node's
 input quantizer follows those operations, as described in the paper's Methods. Integer codes are
 stored in float32 tensors; the storage dtype alone does not change an integer-code mapping.
-See `ptq_activation_bits_for_kind` for group selection and `CalibratedAffinePTQWrapper.forward`
+See `ptq_activation_bits` for group selection and `CalibratedAffinePTQWrapper.forward`
 for quantizer placement.
 
 ## Dequant Fit
@@ -181,9 +179,9 @@ The metadata JSON records:
 - source and output checkpoint paths.
 - selection flags and selected node names.
 - quantization bit widths and per-output-channel setting.
-- calibration batch/example settings, sampled batch indices, and per-node examples by batch.
+- calibration settings (train loader, seed, Brent scaling and its folded `lam` per site).
 - float and PTQ validation accuracy/loss plus deltas.
-- per-node quant/dequant parameters and aggregated calibration debug stats.
+- per-node quant/dequant parameters (input and weight scales, output scale and bias).
 
 ## Reload
 
@@ -195,13 +193,12 @@ are checked through the same path downstream code uses.
 ## Results (Pet, 2026-10-10)
 
 Weights W8; activations A8, except `compiled_accumulator_bits=12` on the compiled accumulators of the strict graph
-(`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (`strict_unary=sigmoid_rsqrt`, no exp and no
+(`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (no exp and no
 log, norm expansion `strict_product="norm"`; final run 2026-10-11, `artifacts/logs/norm_construction_2026-10-10/run_final.log`)
 before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
 sigmoid and rsqrt that a CNN-class NPU runs (paper Table 3). Extended (fast) rows quantize the Jeffreys-distilled graph.
 Per-tensor rows keep the output bias per channel when the weight scale is a scalar, as in standard per-tensor PTQ.
-Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_2026-10-09/`. Results of the
-log-domain strict graph with the old eps are in git history and in `artifacts/backup_eps_2026-10-09/`.
+Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_2026-10-09/`.
 
 | k | graph | nodes | bf16 | PTQ per-channel | Δ | PTQ per-tensor | Δ |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -219,8 +216,8 @@ log-domain strict graph with the old eps are in git history and in `artifacts/ba
 | 197 | extended | 234 | 91.74 | 88.83 | -2.91 | 88.20 | -3.54 |
 
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
-forward hooks on the `NL*` nodes (plus two ReLUs per entry for the log-domain strict LayerNorm). At full support the
-`sigmoid_rsqrt` strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (paper Table 1
+forward hooks on the `NL*` nodes. At full support the
+strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (paper Table 1
 block total) + 76,042 (final LayerNorm). Surgery calibration (tail mass, centroids) uses unseeded augmented train batches,
 so two surgery runs of one config differ by up to 0.5 points (top-k) and 1.5 points (routed).
 

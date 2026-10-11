@@ -16,24 +16,16 @@ from typing import Any, List, Optional, Tuple
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms.functional import to_tensor
 
-from transformer_surgery.internal.util import get_device
+from transformer_surgery.internal.util import make_loaders
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    x = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
-    n_channels = len(img.getbands())
-    x = x.view(img.size[1], img.size[0], n_channels)
-    x = x.permute(2, 0, 1).contiguous().float() / 255.0
-    return x
-
-
 def load_rgb(path: Path) -> torch.Tensor:
     with Image.open(path) as img:
-        img = img.convert("RGB")
-        return pil_to_tensor(img)
+        return to_tensor(img.convert("RGB"))
 
 
 def canonical_sr_stem(path: Path, scale: int) -> str:
@@ -140,67 +132,34 @@ class PairedSRDataset(Dataset):
         return lr, hr
 
 
-def resolve_sr_paths(cfg: Any) -> dict:
-    """HR/LR dirs: explicit cfg fields win, else canonical paths under ``cfg.data_dir``/scale."""
-    from transformer_surgery.models.mambair.download import default_sr_paths
-
-    defaults = default_sr_paths(str(cfg.data_dir), int(cfg.scale))
-    return {key: (getattr(cfg, key, None) or defaults[key]) for key in defaults}
-
-
 def build_mambair_loaders(cfg: Any) -> Tuple[DataLoader, DataLoader]:
     """Train/val paired-SR loaders. Dataset dirs come from explicit cfg fields or, when absent,
     canonical paths under ``cfg.data_dir``; missing datasets are downloaded when ``sr_download``."""
-    device = get_device()
-    scale = int(cfg.scale)
-    workers = int(cfg.workers)
-    pin = device.type == "cuda"
-    persistent = workers > 0
-    paths = resolve_sr_paths(cfg)
+    from transformer_surgery.models.mambair.download import default_sr_paths, ensure_sr_datasets
 
-    missing = [key for key in ("train_hr", "train_lr", "val_hr", "val_lr") if not os.path.isdir(paths[key])]
+    defaults = default_sr_paths(cfg.data_dir, cfg.scale)
+    paths = {key: getattr(cfg, key) or default for key, default in defaults.items()}
+    missing = [key for key, path in paths.items() if not os.path.isdir(path)]
     if missing:
-        if bool(getattr(cfg, "sr_download", True)):
-            from transformer_surgery.models.mambair.download import ensure_sr_datasets
-
-            print(f"MambaIR SR datasets missing ({', '.join(missing)}); downloading into {os.path.abspath(cfg.data_dir)} ...", flush=True)
-            paths = ensure_sr_datasets(str(cfg.data_dir), scale)
-        else:
+        if not cfg.sr_download:
             raise FileNotFoundError(
                 f"MambaIR SR dataset dirs missing: {', '.join(paths[k] for k in missing)} "
                 f"(set sr_download=true to fetch, or point train_hr/train_lr/val_hr/val_lr at existing data)"
             )
+        where = os.path.abspath(cfg.data_dir)
+        print(f"MambaIR SR datasets missing ({', '.join(missing)}); downloading into {where} ...", flush=True)
+        paths = ensure_sr_datasets(cfg.data_dir, cfg.scale)
 
     train_ds = PairedSRDataset(
         paths["train_hr"],
         paths["train_lr"],
-        scale=scale,
+        scale=cfg.scale,
         train=True,
-        patch_size_lq=int(cfg.patch_size),
-        repeat=int(getattr(cfg, "train_repeat", 1)),
-        max_items=getattr(cfg, "max_train_items", None),
+        patch_size_lq=cfg.patch_size,
+        repeat=cfg.train_repeat,
+        max_items=cfg.max_train_items,
     )
     val_ds = PairedSRDataset(
-        paths["val_hr"],
-        paths["val_lr"],
-        scale=scale,
-        train=False,
-        max_items=getattr(cfg, "max_val_items", None),
+        paths["val_hr"], paths["val_lr"], scale=cfg.scale, train=False, max_items=cfg.max_val_items
     )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(cfg.batch_size),
-        shuffle=True,
-        num_workers=workers,
-        pin_memory=pin,
-        persistent_workers=persistent,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=workers,
-        pin_memory=pin,
-        persistent_workers=persistent,
-    )
-    return train_loader, val_loader
+    return make_loaders(train_ds, val_ds, cfg, val_batch_size=1)

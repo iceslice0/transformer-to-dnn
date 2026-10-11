@@ -166,7 +166,7 @@ def profile_checkpoint(path: str, batches: int, warmup: int) -> Dict[str, object
         "checkpoint": os.path.abspath(path),
         "top_k": extra.get("top_k"),
         "support_routing": extra.get("support_routing", "topk"),
-        "strict_unary": extra.get("strict_unary"),
+        "strict_product": extra.get("strict_product"),
         "allow_matmul": extra.get("allow_matmul"),
         "hadamard": bool(extra.get("hadamard", False)),
         "surgery_dtype": extra.get("surgery_dtype"),

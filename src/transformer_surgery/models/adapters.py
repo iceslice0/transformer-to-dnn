@@ -2,14 +2,14 @@
 Model adapter registry for surgery/distillation/PTQ.
 
 The processing code is model-agnostic; concrete adapters own dataset loaders, checkpoint
-construction, surgery-model reconstruction, generic calibration plumbing, and simple replacement
-metadata. Adapter implementations live under ``models/<family>/adapter.py``.
+construction, surgery-model reconstruction, calibration, and task metrics. Adapter implementations
+live under ``models/<family>/adapter.py``.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
@@ -17,34 +17,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from transformer_surgery.internal.calibration import apply_gibbs_tail_calibration
+from transformer_surgery.cli.surgery_config import SurgeryConfig
+from transformer_surgery.internal.calibration import apply_gibbs_tail_calibration, calibrate_reference
 from transformer_surgery.internal.metrics import jeffreys_divergence_dense
 from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
-from transformer_surgery.internal.util import accuracy_and_loss, get_surgery_dtype, set_surgery_dtype
+from transformer_surgery.internal.routing import install_routers_from_state_dict
 from transformer_surgery.internal.util import (
-    DEFAULT_MODEL_KEY,
-    ensure_mapping,
+    accuracy_and_loss,
+    copy_matching_weights,
     get_device,
+    get_surgery_dtype,
     maybe_surgery_cuda_autocast,
-    namespace_from_mapping,
+    set_surgery_dtype,
     torch_dtype_from_name,
 )
-
-
-def _is_set(value: Any) -> bool:
-    return value is not None and str(value).strip() != ""
+from transformer_surgery.ops import GibbsTopKSoftmax, NLGELU, RewrittenLayerNorm, SigmoidGELU
 
 
 class SurgeryModelAdapter:
-    key: str = DEFAULT_MODEL_KEY
+    key: str = ""
     patient_name: str = "unknown"
     dataset_name: str = "unknown"
+    # The DeiT-Tiny graph implements hadamard=True and the norm-expansion strict products.
+    strict_graph_options: bool = False
 
     def reference_checkpoint_path(self, cfg: Any) -> str:
-        path = cfg.reference_checkpoint
-        if not _is_set(path):
+        if not cfg.reference_checkpoint:
             raise ValueError(f"No reference checkpoint configured for model adapter {self.key!r}")
-        return os.path.abspath(str(path))
+        return os.path.abspath(cfg.reference_checkpoint)
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         raise NotImplementedError
@@ -52,71 +52,93 @@ class SurgeryModelAdapter:
     def load_reference_checkpoint(self, path: str) -> nn.Module:
         raise NotImplementedError
 
-    def build_surgery_model(self, cfg: Any) -> nn.Module:
+    def build_surgery_model(self, cfg: SurgeryConfig, extra: Optional[Mapping[str, Any]] = None) -> nn.Module:
+        """Surgery student for ``cfg``; ``extra`` is the checkpoint record when restoring a saved student."""
         raise NotImplementedError
 
-    def build_surgery_model_from_extra(self, extra: Dict[str, Any], cfg: Any) -> nn.Module:
-        raise NotImplementedError
+    def reference_key(self, key: str) -> str:
+        """Reference ``state_dict`` name of a student entry (``RewrittenLayerNorm`` keeps its weights in ``affine``)."""
+        return key.replace(".affine.", ".")
 
     def copy_reference_weights(self, student: nn.Module, reference: nn.Module) -> Dict[str, str]:
-        raise NotImplementedError
+        return copy_matching_weights(student, reference.state_dict(), self.reference_key)
 
     def freeze_surgery_parameters(self, model: nn.Module) -> None:
-        return None
+        """Freeze the calibrated tail mass where the exact runtime tail mass replaces it."""
+        for m in model.modules():
+            if isinstance(m, GibbsTopKSoftmax) and m.use_exact_tail_mass:
+                m.gibbs_tail_prob_eps.requires_grad_(False)
 
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
-        return {}
+    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: SurgeryConfig) -> Dict[str, Any]:
+        return calibrate_reference(reference, loader, cfg)
 
-    def calibrate_after_build(self, model: nn.Module, loader: DataLoader, cfg: Any) -> Dict[str, Any]:
+    def calibrate_after_build(self, model: nn.Module, loader: DataLoader, cfg: SurgeryConfig) -> Dict[str, Any]:
         """Optional Gibbs/LN stats gathered on the built surgery student (e.g. causal LM)."""
         return {}
 
     def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
         return apply_gibbs_tail_calibration(model, calibration)
 
-    def build_module_mapping(self, cfg: Any, model: Optional[nn.Module] = None) -> Dict[str, str]:
-        return {}
+    def build_module_mapping(self, cfg: SurgeryConfig, model: nn.Module) -> Dict[str, str]:
+        """Replacement chosen for each LayerNorm, attention and MLP activation of the surgery student."""
+        if cfg.allow_matmul:
+            graph = "fast"
+        elif cfg.hadamard:
+            graph = "hadamard"
+        else:
+            graph = f"strict, {cfg.strict_product} products"
+        ln = "nn.LayerNorm" if cfg.disable_layernorm_replacement else f"RewrittenLayerNorm({graph})"
+        if cfg.disable_attention_surgery:
+            attn = "dense scaled QK^T softmax @ V"
+        elif cfg.disable_softmax_replacement:
+            attn = f"PairwiseDotBySquare({graph}) + dense softmax @ V"
+        else:
+            tail = "calibrated"
+            if cfg.use_exact_tail_mass:
+                tail = "exact"
+            elif cfg.disable_calib_gibbs_tail_prob:
+                tail = "fixed"
+            attn = f"PairwiseDotBySquare + GibbsTopKSoftmax({tail} tail) + SparseWeightedSumBySquare ({graph})"
+        mapping: Dict[str, str] = {}
+        for name, m in model.named_modules():
+            if isinstance(m, (RewrittenLayerNorm, nn.LayerNorm)):
+                mapping[name] = ln
+            elif hasattr(m, "use_surgery_softmax"):
+                mapping[name] = "AffineMean uniform key-mean @ V" if getattr(m, "uniform", False) else attn
+            elif isinstance(m, (NLGELU, SigmoidGELU)):
+                mapping[name] = type(m).__name__
+        return mapping
 
-    def build_surgery_meta_dict(
-        self,
-        cfg: Any,
-        *,
-        calibration: Dict[str, Any],
-        reference_checkpoint_abs: str,
-        module_mapping: Dict[str, str],
-    ) -> Dict[str, Any]:
+    def _run_record(self, cfg: SurgeryConfig) -> Dict[str, Any]:
         return {
             **asdict(cfg),
             "model_key": self.key,
             "patient": self.patient_name,
             "dataset": self.dataset_name,
+            "reference_checkpoint": self.reference_checkpoint_path(cfg),
+        }
+
+    def build_surgery_meta_dict(
+        self, cfg: SurgeryConfig, *, calibration: Dict[str, Any], module_mapping: Dict[str, str]
+    ) -> Dict[str, Any]:
+        return {
+            **self._run_record(cfg),
             "calibration": dict(calibration),
             "module_mapping": module_mapping,
-            "reference_checkpoint": reference_checkpoint_abs,
             "calibration_legend": CALIBRATION_LEGEND_TEXT,
         }
 
-    def pre_ft_checkpoint_extra(self, cfg: Any, *, mapping: Dict[str, Any], metadata_path: str) -> Dict[str, Any]:
-        ex = asdict(cfg)
-        ex.update(
-            {
-                "model_key": self.key,
-                "patient": self.patient_name,
-                "dataset": self.dataset_name,
-                "reference_checkpoint": self.reference_checkpoint_path(cfg),
-                "meta_ref": os.path.basename(metadata_path),
-                "mapping": mapping,
-                "eps_ln": float(cfg.eps),
-            }
-        )
-        return ex
+    def pre_ft_checkpoint_extra(
+        self, cfg: SurgeryConfig, *, mapping: Dict[str, str], metadata_path: str
+    ) -> Dict[str, Any]:
+        return {**self._run_record(cfg), "meta_ref": os.path.basename(metadata_path), "mapping": mapping}
 
     # -- Task hooks (classification defaults; regression models override) -------------------
     # ``primary`` is a higher-is-better scalar (accuracy for classification, PSNR for SR), so
     # keep-best logic in surgery/distill is task-agnostic.
 
-    def example_model_input(self, cfg: Any = None) -> Optional[torch.Tensor]:
-        """Optional representative input for structure dumps; ``None`` uses the image default."""
+    def example_model_input(self, cfg: SurgeryConfig) -> Optional[torch.Tensor]:
+        """Representative input for structure dumps; ``None`` uses the image default."""
         return None
 
     def primary_metric_name(self) -> str:
@@ -125,10 +147,10 @@ class SurgeryModelAdapter:
     def next_stage_hint(self) -> str:
         return "Next: run the distill stage."
 
-    def evaluate(self, model: nn.Module, val_loader: DataLoader, cfg: Any = None) -> Tuple[float, float, Dict[str, float]]:
+    def evaluate(self, model: nn.Module, val_loader: DataLoader, cfg: Any) -> Tuple[float, float, Dict[str, float]]:
         """Return ``(primary, loss, extra_metrics)`` for a standalone model on ``val_loader``."""
         acc, loss = accuracy_and_loss(model, val_loader, nn.CrossEntropyLoss())
-        return float(acc), float(loss), {}
+        return acc, loss, {}
 
     @torch.no_grad()
     def eval_student_vs_teacher(
@@ -172,51 +194,40 @@ def register_model_adapter(adapter: SurgeryModelAdapter) -> None:
     _ADAPTERS[adapter.key] = adapter
 
 
-def surgery_dtype_from_extra(extra: Any) -> torch.dtype:
-    """Parse ``extra['surgery_dtype']`` written at checkpoint save time (e.g. ``float16``)."""
-    return torch_dtype_from_name(str(ensure_mapping(extra)["surgery_dtype"]))
-
-
 def get_model_adapter(model_key: str) -> SurgeryModelAdapter:
-    key = str(model_key).strip() if _is_set(model_key) else DEFAULT_MODEL_KEY
-    return _ADAPTERS[key]
+    return _ADAPTERS[model_key]
 
 
-def apply_load_cfg_overrides(extra_ns: Any, cfg: Any) -> None:
+def build_surgery_student(
+    extra: Mapping[str, Any], cfg: Any, surgery_dtype: Optional[torch.dtype] = None
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    """Surgery student architecture of a checkpoint record ``extra``; ``cfg.top_k`` / ``cfg.eps`` override it when set.
+
+    Sets the surgery dtype to ``surgery_dtype`` or the checkpoint's. Returns the model (weights not loaded) and the
+    record with the overrides applied.
+    """
+    extra = dict(extra)
     if cfg.top_k is not None:
-        extra_ns.top_k = int(cfg.top_k)
+        extra["top_k"] = int(cfg.top_k)
     if cfg.eps is not None:
-        extra_ns.eps_ln = float(cfg.eps)
+        extra["eps"] = float(cfg.eps)
+    set_surgery_dtype(torch_dtype_from_name(extra["surgery_dtype"]) if surgery_dtype is None else surgery_dtype)
+    extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
+    surgery_cfg = SurgeryConfig(**{f.name: extra[f.name] for f in fields(SurgeryConfig) if f.name in extra})
+    model = get_model_adapter(extra["model_key"]).build_surgery_model(surgery_cfg, extra)
+    return model.to(device=get_device(), dtype=get_surgery_dtype()), extra
 
 
 def load_surgery_student_checkpoint(
-    path: str,
-    cfg: Any,
-    *,
-    adapter: Optional[SurgeryModelAdapter] = None,
-    surgery_dtype: Optional[torch.dtype] = None,
+    path: str, cfg: Any, *, surgery_dtype: Optional[torch.dtype] = None
 ) -> Tuple[nn.Module, Dict[str, Any]]:
-    device = get_device()
-    payload = torch.load(path, map_location=device, weights_only=False)
-    extra_ns = namespace_from_mapping(dict(payload["extra"]))
-    state_dict = payload["model_state_dict"]
-    if surgery_dtype is None:
-        surgery_dtype = surgery_dtype_from_extra(extra_ns)
-    set_surgery_dtype(surgery_dtype)
-    if adapter is None:
-        adapter = get_model_adapter(extra_ns.model_key)
-    apply_load_cfg_overrides(extra_ns, cfg)
-    extra_ns.surgery_dtype = describe_dtype(get_surgery_dtype())
-    model = adapter.build_surgery_model_from_extra(ensure_mapping(extra_ns), cfg).to(
-        device=device, dtype=get_surgery_dtype()
-    )
-    from transformer_surgery.internal.routing import install_routers_from_state_dict
-
-    install_routers_from_state_dict(model, state_dict)
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device=device)
-    adapter.freeze_surgery_parameters(model)
-    return model, ensure_mapping(extra_ns)
+    """Rebuild a surgery student from its checkpoint (see :func:`build_surgery_student`) and load its weights."""
+    payload = torch.load(path, map_location=get_device(), weights_only=False)
+    model, extra = build_surgery_student(payload["extra"], cfg, surgery_dtype)
+    install_routers_from_state_dict(model, payload["model_state_dict"])
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    get_model_adapter(extra["model_key"]).freeze_surgery_parameters(model)
+    return model, extra
 
 
 # Concrete adapters (heavy imports stay lazy inside each adapter's methods).

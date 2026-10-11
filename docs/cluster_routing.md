@@ -40,7 +40,7 @@ Routed checkpoints reload: `load_surgery_student_checkpoint` re-creates the rout
 buffers (`install_routers_from_state_dict`).
 
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
-forward hooks on the `NL*` nodes (plus two ReLUs per entry in the deprecated log-domain LayerNorm). At full
+forward hooks on the `NL*` nodes. At full
 support the strict DeiT-Tiny count with exact GELU is 196,498,438 per image (`topk197_strict_sr`, norm
 expansion) = 12 x 16,368,533 (paper Table 1 block total) + 76,042 (final LayerNorm).
 
@@ -83,7 +83,7 @@ Per block, k=16, 32 centroids:
 
 ## Strict graph with routed support (DeiT-Tiny / Pet, calibrated mode, 32 centroids)
 
-Strict graph without exp and log (`strict_unary=sigmoid_rsqrt`, configs `topk{k}_strict_sr_qc32.json`, `make
+Strict graph without exp and log (configs `topk{k}_strict_sr_qc32.json`, `make
 strict-sr`), with the norm expansion (`strict_product="norm"`, final rerun 2026-10-10 23:07, `run_final.sh`; the polarization runs are in
 `artifacts/backup_polarization_2026-10-10/`), each timed against the bf16 reference in its own run; strict top-k rows
 are the `topk{k}_strict_sr` runs of the same target. Unary evaluations per image from the hook count.
@@ -157,7 +157,7 @@ Per block, k=16, 32 centroids:
 make routing          # 14 DeiT runs (k=8..64 x cal/exact/drop at 32 centroids, k=16 at 8 and 128)
 make pythia-routing   # 8 Pythia runs (k=8..32 x exact/drop at 32 centroids, k=16 at 8 and 128)
 make strict-sr       # strict graph without exp/log: top-k and routed (k=16, 32, 64), exact and sigmoid GELU
-make routing-strict  # superseded log-domain strict runs with routed support (old eps)
+make routing-strict  # strict graph with polarization products, routed support
 make routing-strict-bench  # same-session cost bench, strict and fast graphs
 python scripts/summarize_routing.py   # tables above; writes artifacts/metadata/routing_*_by_k.json
 ```

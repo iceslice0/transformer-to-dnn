@@ -46,7 +46,7 @@ def main() -> None:
     for k in ks:
         for variant, name in (("topk", f"topk{k}_{graph}"), ("routed_qc32", f"topk{k}_{graph}_qc32")):
             run_cfg = SurgeryConfig.load(f"configs/surgery/{name}.json")
-            model, _extra = load_surgery_student_checkpoint(f"artifacts/checkpoints/ts_surgery_{name}.pt", run_cfg, adapter=adapter)
+            model, _extra = load_surgery_student_checkpoint(f"artifacts/checkpoints/ts_surgery_{name}.pt", run_cfg)
             _timed_evaluate(adapter, model, val, run_cfg, device)
             acc, _loss, t, mem, _x = _timed_evaluate(adapter, model, val, run_cfg, device)
             pw = count_pointwise_per_input(model, x_count)

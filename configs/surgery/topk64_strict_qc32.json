@@ -22,7 +22,6 @@
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": false,
-  "strict_unary": "log_exp",
   "strict_product": "polarization",
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk64_strict_qc32.pt",
   "log_dir": "artifacts/logs"

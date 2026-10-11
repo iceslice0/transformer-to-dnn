@@ -6,9 +6,8 @@ batches of 32 after 3 warm-up batches, NVIDIA RTX 4070 Ti SUPER. Times are summe
 Working memory is the peak memory a module call allocates above what is in use when it starts; the table reports
 the largest value over calls. Routed checkpoints (32 query centroids) call `dot.selected`, `gibbs.forward_selected`
 and `router.support` as methods; the script wraps and times them under the Score, Softmax and Routing groups.
-Strict = `strict_unary=sigmoid_rsqrt` (no exp, no log), reference LayerNorm eps 1e-6.
+Strict = the strict graph (no exp, no log), reference LayerNorm eps 1e-6.
 Command: `artifacts/logs/profile_2026-10-10/command.txt`; raw output: `artifacts/logs/profile_2026-10-10/profile_topk16_32_64.json`.
-Earlier profile (log-domain strict, old eps): `artifacts/logs/profile_2026-10-03/`.
 
 - k=16: module totals strict 322.7, strict routed 126.3, extended 54.1, extended routed 63.6 ms/batch; strict adds 268.6 ms over extended, 88.7% in Score and Mix
 - k=32: module totals strict 339.9, strict routed 161.0, extended 50.1, extended routed 67.8 ms/batch; strict adds 289.7 ms over extended, 89.3% in Score and Mix

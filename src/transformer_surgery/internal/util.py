@@ -1,22 +1,22 @@
-"""Device/seed, surgery dtype, namespaces, schedules, checkpoints, and validation metrics (no CLI logging)."""
+"""Device/seed, surgery dtype, model inputs, schedules, checkpoints, weight copy, and validation metrics."""
 
 
 from __future__ import annotations
 
-import os
 import random
-from collections.abc import Mapping
 from contextlib import nullcontext
-from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
-from torch.utils.data import DataLoader
-from torchmetrics.classification import MulticlassAccuracy
+from torch.utils.data import DataLoader, Dataset
+
+DEFAULT_MODEL_KEY = "deit_tiny_pet"
 
 _SURGERY_DTYPE: torch.dtype = torch.bfloat16
+_DEVICE: torch.device = torch.device("cpu")
 
 
 def get_surgery_dtype() -> torch.dtype:
@@ -28,114 +28,90 @@ def set_surgery_dtype(dt: torch.dtype) -> None:
     _SURGERY_DTYPE = dt
 
 
+def get_device() -> torch.device:
+    return _DEVICE
+
+
+def set_default_device(device: torch.device) -> torch.device:
+    global _DEVICE
+    _DEVICE = device
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    return device
+
+
 def maybe_surgery_cuda_autocast(device: torch.device, dt: torch.dtype):
     if device.type == "cuda" and dt in (torch.float16, torch.bfloat16):
         return torch.autocast(device_type="cuda", dtype=dt)
     return nullcontext()
 
 
-DEFAULT_MODEL_KEY = "deit_tiny_pet"
-
-
-def namespace_from_mapping(obj: Any) -> Any:
-    """Recursively turn dict trees into ``types.SimpleNamespace`` (lists preserved element-wise)."""
-    if isinstance(obj, Mapping) and not isinstance(obj, (str, bytes, bytearray)):
-        return SimpleNamespace(**{str(k): namespace_from_mapping(v) for k, v in obj.items()})
-    if isinstance(obj, list):
-        return [namespace_from_mapping(v) for v in obj]
-    return obj
-
-
-def namespace_to_mapping(obj: Any) -> Any:
-    """Inverse of :func:`namespace_from_mapping` for JSON / ``torch.save`` payloads."""
-    if isinstance(obj, SimpleNamespace):
-        return {k: namespace_to_mapping(v) for k, v in vars(obj).items()}
-    if isinstance(obj, list):
-        return [namespace_to_mapping(v) for v in obj]
-    return obj
-
-
-def ensure_mapping(obj: Any) -> Dict[str, Any]:
-    """Shallow ``dict`` from a ``Mapping``, or recursive plain dict from a nested ``SimpleNamespace``."""
-    if isinstance(obj, SimpleNamespace):
-        return namespace_to_mapping(obj)
-    if isinstance(obj, Mapping):
-        return dict(obj)
-    raise TypeError(f"expected Mapping or SimpleNamespace, got {type(obj).__name__}")
+def torch_dtype_from_name(name: str) -> torch.dtype:
+    value = getattr(torch, str(name).strip().replace("torch.", ""), None)
+    if not isinstance(value, torch.dtype):
+        raise ValueError(f"Unknown torch dtype {name!r}")
+    return value
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    try:
-        import numpy as np
-
-        np.random.seed(seed)
-    except ImportError:
-        pass
 
 
-TORCH_DEVICE: torch.device = torch.device("cpu")
+def model_dtype(model: nn.Module) -> torch.dtype:
+    """Dtype of the first parameter; the surgery dtype for a model without parameters."""
+    p = next(model.parameters(), None)
+    return get_surgery_dtype() if p is None else p.dtype
 
 
-def set_default_device(device: torch.device) -> torch.device:
-    global TORCH_DEVICE
-    TORCH_DEVICE = device
-    if TORCH_DEVICE.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    return TORCH_DEVICE
-
-
-def get_device() -> torch.device:
-    return TORCH_DEVICE
-
-
-def torch_dtype_from_name(name: str) -> torch.dtype:
-    key = str(name).strip().replace("torch.", "")
-    try:
-        value = getattr(torch, key)
-    except AttributeError as exc:
-        raise ValueError(f"Unknown torch dtype {name!r}") from exc
-    return value
+def to_model_input(x: torch.Tensor, model: nn.Module) -> torch.Tensor:
+    """Move a batch to the run device; float inputs take the model dtype, token ids stay integer."""
+    device = get_device()
+    dtype = model_dtype(model) if x.is_floating_point() else x.dtype
+    return x.to(device, dtype=dtype, non_blocking=device.type == "cuda")
 
 
 @torch.no_grad()
 def accuracy_and_loss(
     model: nn.Module,
     loader: DataLoader,
-    criterion: nn.Module,
-    num_classes: Optional[int] = None,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
 ) -> Tuple[float, float]:
+    """Top-1 accuracy and the sample mean of ``criterion`` on ``loader``."""
     model.eval()
     device = get_device()
-    use_cuda = device.type == "cuda"
-    acc_metric: Optional[MulticlassAccuracy] = None
-    loss_sum_t = torch.zeros((), device=device, dtype=torch.float64)
-    n_samples = 0
-    try:
-        input_dtype = next(model.parameters()).dtype
-    except StopIteration:
-        input_dtype = torch.float32
-    dt_eval = get_surgery_dtype()
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    n = 0
     for x, y in loader:
-        x = x.to(device, dtype=input_dtype, non_blocking=use_cuda)
-        y = y.to(device, non_blocking=use_cuda)
-        with maybe_surgery_cuda_autocast(device, dt_eval):
+        x = to_model_input(x, model)
+        y = y.to(device, non_blocking=device.type == "cuda")
+        with maybe_surgery_cuda_autocast(device, get_surgery_dtype()):
             logits = model(x)
-        bs = y.size(0)
-        loss_sum_t += criterion(logits, y).double() * bs
-        n_samples += bs
-        if acc_metric is None:
-            nc = int(num_classes) if num_classes is not None else int(logits.shape[-1])
-            acc_metric = MulticlassAccuracy(num_classes=nc, average="micro").to(device)
-        acc_metric.update(logits, y)
-    return float(acc_metric.compute().item()), loss_sum_t.item() / n_samples
+        loss_sum += criterion(logits, y).double() * y.size(0)
+        correct += (logits.argmax(dim=-1) == y).sum()
+        n += y.size(0)
+    return correct.item() / n, loss_sum.item() / n
 
 
 def save_model_checkpoint(path: str, model: nn.Module, extra: Optional[Dict[str, Any]] = None) -> None:
     torch.save({"model_state_dict": model.state_dict(), "extra": extra or {}}, path)
+
+
+def copy_matching_weights(
+    model: nn.Module, reference_state: Mapping[str, torch.Tensor], reference_key: Callable[[str], str]
+) -> Dict[str, str]:
+    """Copy each reference tensor into the ``model`` entry whose mapped name and shape match; returns the name map."""
+    mapping: Dict[str, str] = {}
+    with torch.no_grad():
+        for key, tensor in model.state_dict().items():
+            ref_key = reference_key(key)
+            ref = reference_state.get(ref_key)
+            if ref is not None and ref.shape == tensor.shape:
+                tensor.copy_(ref)
+                mapping[key] = ref_key
+    return mapping
 
 
 def warmup_cosine_scheduler(
@@ -147,13 +123,22 @@ def warmup_cosine_scheduler(
 ) -> LRScheduler:
     """Linear warmup then cosine decay, stepped once per optimizer step."""
     total_steps = max(1, int(total_steps))
-    warmup_steps = max(0, int(warmup_steps))
-    warmup_steps = min(warmup_steps, total_steps)
-    if warmup_steps <= 0:
+    warmup_steps = min(max(0, int(warmup_steps)), total_steps)
+    if warmup_steps == 0:
         return CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
-    if warmup_steps >= total_steps:
-        return LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=total_steps)
-    cosine_steps = max(1, total_steps - warmup_steps)
     warmup = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
-    cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=eta_min)
+    if warmup_steps == total_steps:
+        return warmup
+    cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=eta_min)
     return SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+
+
+def make_loaders(
+    train_set: Dataset, val_set: Dataset, cfg: Any, *, val_batch_size: Optional[int] = None
+) -> Tuple[DataLoader, DataLoader]:
+    """Shuffled train and ordered val loaders with the run's batch size and workers."""
+    kw = dict(num_workers=cfg.workers, pin_memory=get_device().type == "cuda", persistent_workers=cfg.workers > 0)
+    return (
+        DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, **kw),
+        DataLoader(val_set, batch_size=val_batch_size or cfg.batch_size, shuffle=False, **kw),
+    )

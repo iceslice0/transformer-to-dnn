@@ -15,7 +15,6 @@
   "disable_attention_surgery": false,
   "disable_softmax_replacement": false,
   "allow_matmul": false,
-  "strict_unary": "sigmoid_rsqrt",
   "gelu": "sigmoid",
   "hadamard": true,
   "pre_ft_checkpoint": "artifacts/checkpoints/ts_surgery_topk32_hadamard_sr_gs.pt",
