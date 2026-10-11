@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Literal, Optional, Sequence, get_args
 
 from transformer_surgery.cli.common import AdapterRunConfig, parse_cli_config
+
+# Product sites of the strict graph that Brent's operand scaling folds: the value mix and LayerNorm u * inv_std.
+BrentSite = Literal["mix", "layernorm"]
 
 
 @dataclass
@@ -26,7 +29,7 @@ class PTQSurgeryConfig(AdapterRunConfig):
     matmul_activation_bits: Optional[int] = None
     per_output_channel: bool = True
     brent_scaling: bool = False
-    brent_sites: List[str] = field(default_factory=lambda: ["mix", "layernorm"])
+    brent_sites: List[BrentSite] = field(default_factory=lambda: list(get_args(BrentSite)))
     calibration_seed: Optional[int] = 0
     dequant_var_eps: float = 1e-8
     top_k: Optional[int] = None

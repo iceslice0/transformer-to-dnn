@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from dataclasses import asdict, dataclass, replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 
+from transformer_surgery.internal.calibration import TailCalibration, apply_gibbs_tail_calibration
 from transformer_surgery.internal.pointwise import count_pointwise_per_input
 from transformer_surgery.internal.reporting import (
     describe_device,
@@ -30,32 +32,51 @@ if TYPE_CHECKING:
     from transformer_surgery.cli.surgery_config import SurgeryConfig
 
 
-def _log_tail_prob_calibration(cal: Dict[str, Any], configured: float) -> None:
-    def summary(values_key: str, rows_key: str) -> str:
-        values = ", ".join(f"{float(v):.6g}" for v in cal[values_key])
-        rows = cal.get(rows_key) or []
-        rows_text = f"; rows/block min={min(rows)} max={max(rows)}" if rows else ""
-        return f" over {cal['gibbs_tail_calibration_batches']} batch(es){rows_text}: [{values}]"
+@dataclass
+class ValidationRun:
+    """One timed validation pass: the adapter's primary metric and loss, wall time, peak CUDA memory, extra metrics."""
 
-    if cal.get("gibbs_tail_prob_eps_exact_mean_by_block"):
-        mode = "exact runtime" if cal.get("use_exact_tail_mass") else "calibrated"
-        stds = ", ".join(f"{float(v):.6g}" for v in cal.get("gibbs_tail_prob_eps_exact_std_by_block", []))
-        line = summary("gibbs_tail_prob_eps_exact_mean_by_block", "gibbs_tail_prob_eps_exact_rows_by_block")
+    primary: float
+    loss: float
+    wall_time_sec: float
+    peak_gpu_mem_bytes: Optional[int]
+    extra: Dict[str, float]
+
+    def metadata(self, prefix: str) -> Dict[str, float]:
+        """Metadata keys ``{prefix}acc`` (the primary metric), ``{prefix}loss``, ... of this pass."""
+        keys: Dict[str, float] = {f"{prefix}acc": self.primary, f"{prefix}loss": self.loss}
+        keys[f"{prefix}wall_time_sec"] = self.wall_time_sec
+        if self.peak_gpu_mem_bytes is not None:
+            keys[f"{prefix}peak_gpu_mem_bytes"] = self.peak_gpu_mem_bytes
+        keys.update({f"{prefix}{k}": float(v) for k, v in self.extra.items()})
+        return keys
+
+
+def _log_tail_prob_calibration(tail: TailCalibration) -> None:
+    def summary(values: List[float], rows: Optional[List[int]]) -> str:
+        rows_text = f"; rows/block min={min(rows)} max={max(rows)}" if rows else ""
+        listed = ", ".join(f"{v:.6g}" for v in values)
+        return f" over {tail.gibbs_tail_calibration_batches} batch(es){rows_text}: [{listed}]"
+
+    if tail.gibbs_tail_prob_eps_exact_mean_by_block:
+        mode = "exact runtime" if tail.use_exact_tail_mass else "calibrated"
+        stds = ", ".join(f"{v:.6g}" for v in tail.gibbs_tail_prob_eps_exact_std_by_block or [])
+        line = summary(tail.gibbs_tail_prob_eps_exact_mean_by_block, tail.gibbs_tail_prob_eps_exact_rows_by_block)
         log_line(f"Exact gibbs tail mass by block ({mode}){line} std=[{stds}]")
-        if cal.get("use_exact_tail_mass"):
+        if tail.use_exact_tail_mass:
             log_line("use_exact_tail_mass=True: runtime q_tail from centroid partition; calibrated value not applied")
             return
-    if cal.get("gibbs_tail_prob_eps_calibrated_by_block"):
-        line = summary("gibbs_tail_prob_eps_calibrated_by_block", "gibbs_tail_prob_eps_calibration_rows_by_block")
+    if tail.gibbs_tail_prob_eps_calibrated_by_block:
+        line = summary(tail.gibbs_tail_prob_eps_calibrated_by_block, tail.gibbs_tail_prob_eps_calibration_rows_by_block)
         log_line(f"Calibrated gibbs_tail_prob_eps by block{line}")
-    elif cal.get("disable_calib_gibbs_tail_prob"):
+    elif tail.disable_calib_gibbs_tail_prob:
+        configured = tail.gibbs_tail_prob_eps_configured
         log_line(f"gibbs_tail_prob_eps calibration disabled; using configured value {configured:.6g}")
 
 
 def _timed_evaluate(
     adapter: SurgeryModelAdapter, model: nn.Module, val_loader: Any, cfg: Any, device: torch.device
-) -> Tuple[float, float, float, Optional[int], Dict[str, float]]:
-    """``(primary, loss, wall seconds, peak CUDA memory or None, extra metrics)`` of one validation pass."""
+) -> ValidationRun:
     cuda = device.type == "cuda"
     if cuda:
         torch.cuda.synchronize(device)
@@ -66,7 +87,12 @@ def _timed_evaluate(
     if cuda:
         torch.cuda.synchronize(device)
         peak_memory = int(torch.cuda.max_memory_allocated(device))
-    return float(primary), float(loss), time.perf_counter() - t0, peak_memory, dict(extra)
+    return ValidationRun(float(primary), float(loss), time.perf_counter() - t0, peak_memory, dict(extra))
+
+
+def _record(record: Any) -> Dict[str, Any]:
+    """Metadata keys of an optional dataclass record."""
+    return {} if record is None else asdict(record)
 
 
 def surgery(cfg: "SurgeryConfig") -> None:
@@ -100,13 +126,13 @@ def surgery(cfg: "SurgeryConfig") -> None:
     )
     log_wrote(before_log_path)
 
-    ref_acc, ref_loss, ref_time, ref_peak_memory, ref_extra = _timed_evaluate(adapter, ref, val_loader, cfg, device)
+    ref_run = _timed_evaluate(adapter, ref, val_loader, cfg, device)
     log_line(
-        f"Reference model val primary={ref_acc:.4f} loss={ref_loss:.4f} ({adapter.primary_metric_name()}) "
-        f"time={ref_time:.3f}s" + (f" {ref_extra}" if ref_extra else "")
+        f"Reference model val primary={ref_run.primary:.4f} loss={ref_run.loss:.4f} ({adapter.primary_metric_name()}) "
+        f"time={ref_run.wall_time_sec:.3f}s" + (f" {ref_run.extra}" if ref_run.extra else "")
     )
 
-    cal = adapter.calibrate_reference(ref, train_loader, cfg)
+    tail = adapter.calibrate_reference(ref, train_loader, cfg)
 
     log_line(
         "Building surgery model | "
@@ -120,22 +146,23 @@ def surgery(cfg: "SurgeryConfig") -> None:
     mapping = adapter.copy_reference_weights(model, ref)
     adapter.freeze_surgery_parameters(model)
 
-    cal.update(adapter.calibrate_after_build(model, train_loader, cfg))
-    log_line("Calibration: " + json.dumps(cal, indent=2))
-    _log_tail_prob_calibration(cal, cfg.gibbs_tail_prob_eps)
+    tail = adapter.calibrate_after_build(model, train_loader, cfg) or tail
+    if tail is not None:
+        log_line("Calibration: " + json.dumps(asdict(tail), indent=2))
+        _log_tail_prob_calibration(tail)
+    applied = None if tail is None else adapter.apply_calibration(model, tail)
+    if applied is not None:
+        log_line(f"Applied gibbs_tail_prob_eps mean={applied.gibbs_tail_prob_eps_applied_mean:.6g}")
 
-    applied = adapter.apply_calibration(model, cal)
-    cal.update(applied)
-    applied_mean = applied.get("gibbs_tail_prob_eps_applied_mean")
-    if applied_mean is not None:
-        log_line(f"Applied gibbs_tail_prob_eps mean={applied_mean:.6g}")
-
-    routing_stats = calibrate_support_routing(model, train_loader, val_loader, cfg)
-    log_support_routing(routing_stats)
-    cal.update(routing_stats)
-    if routing_stats.get("gibbs_tail_prob_eps_applied_mean") is not None:
-        applied_mean = routing_stats["gibbs_tail_prob_eps_applied_mean"]
-        log_line(f"Applied routed gibbs_tail_prob_eps mean={applied_mean:.6g}")
+    routing = calibrate_support_routing(model, train_loader, val_loader, cfg)
+    if routing is not None:
+        log_support_routing(routing)
+        if not cfg.use_exact_tail_mass and not cfg.disable_calib_gibbs_tail_prob:
+            # The routed support's mean tail mass replaces the top-k one.
+            applied = apply_gibbs_tail_calibration(model, routing.routing_train_tail_routed_by_block)
+            if applied is not None:
+                values = ", ".join(f"{v:.6g}" for v in applied.gibbs_tail_prob_eps_applied_by_block)
+                log_line(f"Applied routed gibbs_tail_prob_eps by block: [{values}]")
 
     after_log_path = traceable_log_path(cfg.log_dir, cfg, "ts-surgery", "model_after_surgery")
     write_model_structure_txt(
@@ -143,47 +170,41 @@ def surgery(cfg: "SurgeryConfig") -> None:
     )
     log_wrote(after_log_path)
 
-    pre_acc, pre_loss, pre_time, pre_peak_memory, pre_extra = _timed_evaluate(adapter, model, val_loader, cfg, device)
-    rel_slowdown = pre_time / ref_time if ref_time > 0 else 0.0
+    pre_run = _timed_evaluate(adapter, model, val_loader, cfg, device)
+    rel_slowdown = pre_run.wall_time_sec / ref_run.wall_time_sec if ref_run.wall_time_sec > 0 else 0.0
     pointwise = count_pointwise_per_input(model, next(iter(val_loader))[0])
-    log_line(f"Pointwise (unary) evaluations per input: {pointwise['pointwise_per_input']:.6g}")
+    log_line(f"Pointwise (unary) evaluations per input: {pointwise.per_input:.6g}")
     log_line(
-        f"Post-transform val primary={pre_acc:.4f} loss={pre_loss:.4f} ({adapter.primary_metric_name()}) "
-        f"time={pre_time:.3f}s slowdown_vs_ref={rel_slowdown:.3f}x" + (f" {pre_extra}" if pre_extra else "")
+        f"Post-transform val primary={pre_run.primary:.4f} loss={pre_run.loss:.4f} ({adapter.primary_metric_name()}) "
+        f"time={pre_run.wall_time_sec:.3f}s slowdown_vs_ref={rel_slowdown:.3f}x"
+        + (f" {pre_run.extra}" if pre_run.extra else "")
     )
 
-    cal.update(
-        {
-            "ref_val_acc": ref_acc,
-            "ref_val_loss": ref_loss,
-            "ref_val_primary_name": adapter.primary_metric_name(),
-            "ref_val_wall_time_sec": ref_time,
-            "student_pre_ft_val_acc": pre_acc,
-            "student_pre_ft_val_loss": pre_loss,
-            "student_pre_ft_val_wall_time_sec": pre_time,
-            "student_pre_ft_val_relative_slowdown_vs_ref": rel_slowdown,
-            "student_pointwise_per_input": pointwise["pointwise_per_input"],
-            "student_pointwise_per_input_by_type": pointwise["pointwise_per_input_by_type"],
-            **{f"ref_val_{k}": float(v) for k, v in ref_extra.items()},
-            **{f"student_pre_ft_val_{k}": float(v) for k, v in pre_extra.items()},
-        }
-    )
-    if ref_peak_memory is not None:
-        cal["ref_val_peak_gpu_mem_bytes"] = ref_peak_memory
-    if pre_peak_memory is not None:
-        cal["student_pre_ft_val_peak_gpu_mem_bytes"] = pre_peak_memory
+    calibration = {
+        **_record(tail),
+        **_record(applied),
+        **_record(routing),
+        **ref_run.metadata("ref_val_"),
+        "ref_val_primary_name": adapter.primary_metric_name(),
+        **pre_run.metadata("student_pre_ft_val_"),
+        "student_pre_ft_val_relative_slowdown_vs_ref": rel_slowdown,
+        "student_pointwise_per_input": pointwise.per_input,
+        "student_pointwise_per_input_by_type": pointwise.by_type,
+    }
 
     pre_path = traceable_artifact_path(cfg.pre_ft_checkpoint, cfg, "ts-surgery", extension=".pt")
-    cfg.pre_ft_checkpoint = pre_path
+    # The run record carries the applied mean tail mass; the state dict holds the per-block values.
+    record = replace(cfg, pre_ft_checkpoint=pre_path)
+    if applied is not None:
+        record = replace(record, gibbs_tail_prob_eps=applied.gibbs_tail_prob_eps_applied_mean)
     meta_path = metadata_path_for_checkpoint(pre_path)
-    # The applied mean replaces the initial tail mass in the run record; the state dict holds the per-block values.
-    tail = {} if applied_mean is None else {"gibbs_tail_prob_eps": float(applied_mean)}
-    mapping_by_module = adapter.build_module_mapping(cfg, model)
-    meta = adapter.build_surgery_meta_dict(cfg, calibration=cal, module_mapping=mapping_by_module)
-    write_json(meta_path, {**meta, **tail})
+    meta = adapter.build_surgery_meta_dict(
+        record, calibration=calibration, module_mapping=adapter.build_module_mapping(record, model)
+    )
+    write_json(meta_path, meta)
     os.makedirs(os.path.dirname(pre_path), exist_ok=True)
-    extra = adapter.pre_ft_checkpoint_extra(cfg, mapping=mapping, metadata_path=meta_path)
-    save_model_checkpoint(pre_path, model, extra={**extra, **tail})
+    extra = adapter.pre_ft_checkpoint_extra(record, mapping=mapping, metadata_path=meta_path)
+    save_model_checkpoint(pre_path, model, extra=extra)
     log_wrote(meta_path)
     log_wrote(pre_path)
     log_line(adapter.next_stage_hint())

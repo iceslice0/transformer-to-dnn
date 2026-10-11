@@ -9,7 +9,7 @@ live under ``models/<family>/adapter.py``.
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
@@ -18,13 +18,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from transformer_surgery.cli.surgery_config import SurgeryConfig
-from transformer_surgery.internal.calibration import apply_gibbs_tail_calibration, calibrate_reference
+from transformer_surgery.internal.calibration import (
+    AppliedTail,
+    TailCalibration,
+    apply_gibbs_tail_calibration,
+    calibrate_reference,
+)
 from transformer_surgery.internal.metrics import jeffreys_divergence_dense
 from transformer_surgery.internal.reporting import CALIBRATION_LEGEND_TEXT, describe_dtype
 from transformer_surgery.internal.routing import install_routers_from_state_dict
 from transformer_surgery.internal.util import (
     accuracy_and_loss,
     copy_matching_weights,
+    dataclass_from_record,
     get_device,
     get_surgery_dtype,
     maybe_surgery_cuda_autocast,
@@ -69,15 +75,19 @@ class SurgeryModelAdapter:
             if isinstance(m, GibbsTopKSoftmax) and m.use_exact_tail_mass:
                 m.gibbs_tail_prob_eps.requires_grad_(False)
 
-    def calibrate_reference(self, reference: nn.Module, loader: DataLoader, cfg: SurgeryConfig) -> Dict[str, Any]:
+    def calibrate_reference(
+        self, reference: nn.Module, loader: DataLoader, cfg: SurgeryConfig
+    ) -> Optional[TailCalibration]:
         return calibrate_reference(reference, loader, cfg)
 
-    def calibrate_after_build(self, model: nn.Module, loader: DataLoader, cfg: SurgeryConfig) -> Dict[str, Any]:
-        """Optional Gibbs/LN stats gathered on the built surgery student (e.g. causal LM)."""
-        return {}
+    def calibrate_after_build(
+        self, model: nn.Module, loader: DataLoader, cfg: SurgeryConfig
+    ) -> Optional[TailCalibration]:
+        """Gibbs/LN statistics gathered on the built surgery student (e.g. causal LM); replaces the reference ones."""
+        return None
 
-    def apply_calibration(self, model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-        return apply_gibbs_tail_calibration(model, calibration)
+    def apply_calibration(self, model: nn.Module, tail: TailCalibration) -> Optional[AppliedTail]:
+        return apply_gibbs_tail_calibration(model, tail.gibbs_tail_prob_eps_calibrated_by_block or [])
 
     def build_module_mapping(self, cfg: SurgeryConfig, model: nn.Module) -> Dict[str, str]:
         """Replacement chosen for each LayerNorm, attention and MLP activation of the surgery student."""
@@ -213,7 +223,7 @@ def build_surgery_student(
         extra["eps"] = float(cfg.eps)
     set_surgery_dtype(torch_dtype_from_name(extra["surgery_dtype"]) if surgery_dtype is None else surgery_dtype)
     extra["surgery_dtype"] = describe_dtype(get_surgery_dtype())
-    surgery_cfg = SurgeryConfig(**{f.name: extra[f.name] for f in fields(SurgeryConfig) if f.name in extra})
+    surgery_cfg = dataclass_from_record(SurgeryConfig, extra)
     model = get_model_adapter(extra["model_key"]).build_surgery_model(surgery_cfg, extra)
     return model.to(device=get_device(), dtype=get_surgery_dtype()), extra
 

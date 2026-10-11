@@ -10,14 +10,20 @@ from __future__ import annotations
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple, get_args
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformer_surgery.cli.ptq_config import BrentSite
 from transformer_surgery.internal.calibration import (
+    ActivationGroup,
+    PTQKind,
+    PTQNodeMeta,
     PTQNodeStats,
+    PTQReloadConfig,
     build_ptq_node_setup,
     build_ptq_wrapper,
     gather_ptq_dequant_moments,
@@ -40,6 +46,7 @@ from transformer_surgery.internal.reporting import (
 )
 from transformer_surgery.internal.util import (
     accuracy_and_loss,
+    dataclass_from_record,
     get_device,
     get_surgery_dtype,
     save_model_checkpoint,
@@ -56,14 +63,79 @@ if TYPE_CHECKING:
     from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
 
 
+@dataclass
+class PTQSelection:
+    wrap_linear_conv: bool
+    wrap_affine: bool
+    wrap_matmul: bool
+    include_names: List[str]
+    exclude_names: List[str]
+    selected_nodes: List[str]
+
+
+@dataclass
+class PTQQuantization:
+    weight_bits: int
+    activation_bits: int
+    compiled_accumulator_bits: int
+    matmul_activation_bits: int
+    per_output_channel: bool
+    dequant_var_eps: float
+
+
+@dataclass
+class PTQCalibration:
+    """Calibration batches and, with ``brent_scaling``, the folded ``lam`` per site and the folded float accuracy."""
+
+    calibration_seed: Optional[int]
+    brent_scaling: bool
+    loader_split: Literal["train"] = "train"
+    mode: Literal["full_train_loader_aggregated"] = "full_train_loader_aggregated"
+    brent_sites: Optional[List[BrentSite]] = None
+    lambda_by_site: Optional[Dict[str, float]] = None
+    fp_val_acc_folded: Optional[float] = None
+    fp_val_loss_folded: Optional[float] = None
+
+
+@dataclass
+class PTQMetrics:
+    fp_val_acc: float
+    fp_val_loss: float
+    ptq_val_acc: float
+    ptq_val_loss: float
+    acc_delta: float = field(init=False)
+    loss_delta: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.acc_delta = self.ptq_val_acc - self.fp_val_acc
+        self.loss_delta = self.ptq_val_loss - self.fp_val_loss
+
+
+@dataclass
+class PTQSummary:
+    """PTQ metadata JSON of one run."""
+
+    source_checkpoint: str
+    output_checkpoint: str
+    selection: PTQSelection
+    quantization: PTQQuantization
+    calibration: PTQCalibration
+    metrics: PTQMetrics
+    ptq_nodes: List[PTQNodeMeta]
+
+
 def _name_matches(name: str, patterns: Sequence[str]) -> bool:
     return any((needle := pattern.strip()) and needle in name for pattern in patterns)
 
 
-def _build_node_selection(model: nn.Module, cfg: "PTQSurgeryConfig") -> Dict[str, str]:
+def _build_node_selection(model: nn.Module, cfg: "PTQSurgeryConfig") -> Dict[str, PTQKind]:
     """PTQ kind of each selected node: by group switch or ``include_names``, minus ``exclude_names``."""
-    wrap = {"linear": cfg.wrap_linear_conv, "affine": cfg.wrap_affine, "matmul": cfg.wrap_matmul}
-    selected: Dict[str, str] = {}
+    wrap: Dict[ActivationGroup, bool] = {
+        "linear": cfg.wrap_linear_conv,
+        "affine": cfg.wrap_affine,
+        "matmul": cfg.wrap_matmul,
+    }
+    selected: Dict[str, PTQKind] = {}
     for name, module in model.named_modules():
         kind = ptq_module_kind(module)
         if not name or kind is None or _name_matches(name, cfg.exclude_names):
@@ -73,7 +145,9 @@ def _build_node_selection(model: nn.Module, cfg: "PTQSurgeryConfig") -> Dict[str
     return selected
 
 
-def _filter_unobserved_nodes(selected: Dict[str, str], stats: Dict[str, PTQNodeStats]) -> Dict[str, str]:
+def _filter_unobserved_nodes(
+    selected: Dict[str, PTQKind], stats: Dict[str, PTQNodeStats]
+) -> Dict[str, PTQKind]:
     """
     Drop selected nodes that never emitted calibration outputs.
 
@@ -97,10 +171,10 @@ def load_ptq_checkpoint(path: str, cfg: Any) -> Tuple[nn.Module, Dict[str, Any]]
     set_inplace_eval(False)
     payload = torch.load(path, map_location=get_device(), weights_only=False)
     model, extra = build_surgery_student(payload["extra"], cfg)
-    for wrapper_cfg in extra["ptq_wrappers"]:
-        name = wrapper_cfg["name"]
-        wrapper = ptq_wrapper_from_reload_config(wrapper_cfg, model.get_submodule(name))
-        model.set_submodule(name, wrapper.to(get_device()))
+    for record in extra["ptq_wrappers"]:
+        reload_config = dataclass_from_record(PTQReloadConfig, record)
+        wrapper = ptq_wrapper_from_reload_config(reload_config, model.get_submodule(reload_config.name))
+        model.set_submodule(reload_config.name, wrapper.to(get_device()))
     model.load_state_dict(payload["model_state_dict"], strict=True)
     return model, extra
 
@@ -111,7 +185,7 @@ def _power_of_two(x: float) -> float:
 
 @torch.no_grad()
 def apply_brent_scaling(
-    model: nn.Module, stats: Dict[str, PTQNodeStats], sites: Sequence[str] = ("mix", "layernorm")
+    model: nn.Module, stats: Dict[str, PTQNodeStats], sites: Sequence[BrentSite] = get_args(BrentSite)
 ) -> Dict[str, float]:
     """Fold Brent's operand scaling into the norm-expansion products of the strict graph, in place.
 
@@ -122,9 +196,9 @@ def apply_brent_scaling(
     ``1/lam^2``. The ranges come from the first calibration pass (inputs of ``sub_vp`` and ``add_u_invstd``); ``lam`` is
     rounded to a power of two, so every folded coefficient is exact in bf16 and the graph computes the same function.
     """
-    unknown = set(sites) - {"mix", "layernorm"}
+    unknown = set(sites) - set(get_args(BrentSite))
     if unknown:
-        raise ValueError(f"unknown brent_sites {sorted(unknown)}; use 'mix' and 'layernorm'")
+        raise ValueError(f"unknown brent_sites {sorted(unknown)}; use any of {get_args(BrentSite)}")
     lams: Dict[str, float] = {}
 
     def fold(node: nn.Module, factors: Sequence[float]) -> None:
@@ -186,7 +260,7 @@ def run_ptq(cfg: "PTQSurgeryConfig") -> None:
     selected = _filter_unobserved_nodes(selected, stats)
     if not selected:
         raise SystemExit("No PTQ node received calibration statistics on the current run.")
-    brent: Dict[str, Any] = {}
+    calibration = PTQCalibration(calibration_seed=cfg.calibration_seed, brent_scaling=cfg.brent_scaling)
     if cfg.brent_scaling:
         lams = apply_brent_scaling(fp_model, stats, cfg.brent_sites)
         if not lams:
@@ -194,12 +268,9 @@ def run_ptq(cfg: "PTQSurgeryConfig") -> None:
         log_line("Brent scaling lam by site: " + ", ".join(f"{n}={v:g}" for n, v in lams.items()))
         folded_acc, folded_loss = _validate(fp_model, val_loader)
         log_line(f"Float model with folded lam val acc={folded_acc:.4f} loss={folded_loss:.4f}")
-        brent = {
-            "brent_sites": list(cfg.brent_sites),
-            "lambda_by_site": lams,
-            "fp_val_acc_folded": folded_acc,
-            "fp_val_loss_folded": folded_loss,
-        }
+        calibration.brent_sites = list(cfg.brent_sites)
+        calibration.lambda_by_site = lams
+        calibration.fp_val_acc_folded, calibration.fp_val_loss_folded = folded_acc, folded_loss
         # The folded coefficients change the ranges of the nodes downstream of a +- b: measure them again.
         stats = gather_ptq_range_moments(fp_model, train_loader, selected, calibration_batches)
         selected = _filter_unobserved_nodes(selected, stats)
@@ -211,8 +282,8 @@ def run_ptq(cfg: "PTQSurgeryConfig") -> None:
         raise SystemExit(f"Calibration dequant statistics missing for selected node(s): {missing_dequant}")
 
     ptq_model = copy.deepcopy(fp_model)
-    node_meta: List[Dict[str, Any]] = []
-    reload_configs: List[Dict[str, Any]] = []
+    node_meta: List[PTQNodeMeta] = []
+    reload_configs: List[PTQReloadConfig] = []
     for name in selected:
         module = ptq_model.get_submodule(name)
         built = build_ptq_wrapper(module, setups[name], stats[name], dequant_var_eps=cfg.dequant_var_eps)
@@ -224,7 +295,11 @@ def run_ptq(cfg: "PTQSurgeryConfig") -> None:
     save_model_checkpoint(
         out_abs,
         ptq_model,
-        extra={**fp_extra, "ptq_meta_path": os.path.basename(meta_abs), "ptq_wrappers": reload_configs},
+        extra={
+            **fp_extra,
+            "ptq_meta_path": os.path.basename(meta_abs),
+            "ptq_wrappers": [asdict(c) for c in reload_configs],
+        },
     )
     write_model_structure_txt(model_log_abs, ptq_model, "PTQ Surgery Model")
     log_wrote(model_log_abs)
@@ -237,41 +312,28 @@ def run_ptq(cfg: "PTQSurgeryConfig") -> None:
     log_line(f"PTQ model val acc={ptq_acc:.4f} loss={ptq_loss:.4f}")
     log_line(f"Delta acc={ptq_acc - fp_acc:+.4f} loss={ptq_loss - fp_loss:+.4f}")
 
-    summary = {
-        "source_checkpoint": os.path.abspath(cfg.fp_checkpoint),
-        "output_checkpoint": out_abs,
-        "selection": {
-            "wrap_linear_conv": cfg.wrap_linear_conv,
-            "wrap_affine": cfg.wrap_affine,
-            "wrap_matmul": cfg.wrap_matmul,
-            "include_names": list(cfg.include_names),
-            "exclude_names": list(cfg.exclude_names),
-            "selected_nodes": list(selected),
-        },
-        "quantization": {
-            "weight_bits": cfg.weight_bits,
-            "activation_bits": ptq_activation_bits("linear", cfg),
-            "compiled_accumulator_bits": ptq_activation_bits("affine_scale", cfg),
-            "matmul_activation_bits": ptq_activation_bits("matmul", cfg),
-            "per_output_channel": cfg.per_output_channel,
-            "dequant_var_eps": cfg.dequant_var_eps,
-        },
-        "calibration": {
-            "loader_split": "train",
-            "mode": "full_train_loader_aggregated",
-            "calibration_seed": cfg.calibration_seed,
-            "brent_scaling": cfg.brent_scaling,
-            **brent,
-        },
-        "metrics": {
-            "fp_val_acc": fp_acc,
-            "fp_val_loss": fp_loss,
-            "ptq_val_acc": ptq_acc,
-            "ptq_val_loss": ptq_loss,
-            "acc_delta": ptq_acc - fp_acc,
-            "loss_delta": ptq_loss - fp_loss,
-        },
-        "ptq_nodes": node_meta,
-    }
-    write_json(meta_abs, summary)
+    summary = PTQSummary(
+        source_checkpoint=os.path.abspath(cfg.fp_checkpoint),
+        output_checkpoint=out_abs,
+        selection=PTQSelection(
+            wrap_linear_conv=cfg.wrap_linear_conv,
+            wrap_affine=cfg.wrap_affine,
+            wrap_matmul=cfg.wrap_matmul,
+            include_names=list(cfg.include_names),
+            exclude_names=list(cfg.exclude_names),
+            selected_nodes=list(selected),
+        ),
+        quantization=PTQQuantization(
+            weight_bits=cfg.weight_bits,
+            activation_bits=ptq_activation_bits("linear", cfg),
+            compiled_accumulator_bits=ptq_activation_bits("affine_scale", cfg),
+            matmul_activation_bits=ptq_activation_bits("matmul", cfg),
+            per_output_channel=cfg.per_output_channel,
+            dequant_var_eps=cfg.dequant_var_eps,
+        ),
+        calibration=calibration,
+        metrics=PTQMetrics(fp_acc, fp_loss, ptq_acc, ptq_loss),
+        ptq_nodes=node_meta,
+    )
+    write_json(meta_abs, asdict(summary))
     log_wrote(meta_abs)

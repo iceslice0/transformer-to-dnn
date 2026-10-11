@@ -1,11 +1,13 @@
-"""Device/seed, surgery dtype, model inputs, schedules, checkpoints, weight copy, and validation metrics."""
+"""Device/seed, surgery dtype, model inputs, schedules, checkpoints, records, weight copy, and validation metrics."""
 
 
 from __future__ import annotations
 
+import functools
 import random
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from dataclasses import fields
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Type, TypeVar
 
 import numpy as np
 import torch
@@ -14,6 +16,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, S
 from torch.utils.data import DataLoader, Dataset
 
 DEFAULT_MODEL_KEY = "deit_tiny_pet"
+
+TRecord = TypeVar("TRecord")
 
 _SURGERY_DTYPE: torch.dtype = torch.bfloat16
 _DEVICE: torch.device = torch.device("cpu")
@@ -95,6 +99,11 @@ def accuracy_and_loss(
     return correct.item() / n, loss_sum.item() / n
 
 
+def dataclass_from_record(cls: Type[TRecord], record: Mapping[str, Any]) -> TRecord:
+    """Dataclass ``cls`` from the record keys that are its fields; the record may carry keys of other records."""
+    return cls(**{f.name: record[f.name] for f in fields(cls) if f.name in record})
+
+
 def save_model_checkpoint(path: str, model: nn.Module, extra: Optional[Dict[str, Any]] = None) -> None:
     torch.save({"model_state_dict": model.state_dict(), "extra": extra or {}}, path)
 
@@ -137,8 +146,10 @@ def make_loaders(
     train_set: Dataset, val_set: Dataset, cfg: Any, *, val_batch_size: Optional[int] = None
 ) -> Tuple[DataLoader, DataLoader]:
     """Shuffled train and ordered val loaders with the run's batch size and workers."""
-    kw = dict(num_workers=cfg.workers, pin_memory=get_device().type == "cuda", persistent_workers=cfg.workers > 0)
+    loader = functools.partial(
+        DataLoader, num_workers=cfg.workers, pin_memory=get_device().type == "cuda", persistent_workers=cfg.workers > 0
+    )
     return (
-        DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, **kw),
-        DataLoader(val_set, batch_size=val_batch_size or cfg.batch_size, shuffle=False, **kw),
+        loader(train_set, batch_size=cfg.batch_size, shuffle=True),
+        loader(val_set, batch_size=val_batch_size or cfg.batch_size, shuffle=False),
     )

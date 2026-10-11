@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Iterator, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -108,6 +108,9 @@ def dense_gibbs(attns: Sequence[nn.Module]) -> Iterator[None]:
 # Gibbs tail mass and LayerNorm rewrite statistics
 # ---------------------------------------------------------------------------
 
+# Source of the scores of a surgery calibration; the Pythia adapter relabels its student calibration.
+CalibrationMode = Literal["reference", "surgery_student", "skipped_no_gibbs_attention", "pythia_surgery_student_causal"]
+
 # Upper clamp of an applied tail mass, so the kept top-k mass 1 - q stays positive.
 _MAX_TAIL = 1.0 - 1e-7
 
@@ -137,19 +140,65 @@ def topk_tail_mass(teacher: torch.Tensor, idx: torch.Tensor, nk: int, k_top: int
     return (1.0 - top_mass).clamp(0.0, 1.0)
 
 
+@dataclass
+class TailCalibration:
+    """Gibbs tail mass and LayerNorm rewrite statistics of a surgery calibration (metadata ``calibration`` keys)."""
+
+    calibration_mode: CalibrationMode
+    disable_calib_gibbs_tail_prob: bool
+    use_exact_tail_mass: bool
+    gibbs_tail_calibration_batches_requested: Optional[int]
+    gibbs_tail_calibration_batches: int
+    gibbs_tail_prob_eps_configured: float
+    gibbs_tail_prob_eps_metric: float
+    calibration_loader_split: Literal["train"] = "train"
+    ln_rewrite_mse_layer0_minibatch: Optional[float] = None
+    ln_rewrite_mse_all_norms_mean: Optional[float] = None
+    # Dense-softmax mass outside the top-k support, per block and pooled; gathered unless tail calibration is off.
+    gibbs_tail_prob_eps_exact_mean_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_exact_std_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_exact_min_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_exact_max_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_exact_rows_by_block: Optional[List[int]] = None
+    gibbs_tail_prob_eps_exact_mean: Optional[float] = None
+    gibbs_tail_prob_eps_exact_std: Optional[float] = None
+    gibbs_tail_prob_eps_exact_min: Optional[float] = None
+    gibbs_tail_prob_eps_exact_max: Optional[float] = None
+    # Calibrated mode (no exact runtime tail, calibration on): the per-block means become the model's tail masses.
+    gibbs_tail_prob_eps_calibrated_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_calibrated_min_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_calibrated_max_by_block: Optional[List[float]] = None
+    gibbs_tail_prob_eps_calibration_rows_by_block: Optional[List[int]] = None
+    gibbs_tail_prob_eps_calibrated_mean: Optional[float] = None
+    # Sparse vs naive top-k Jeffreys on synthetic Gaussian scores of block 0's shape.
+    jeffreys_gibbs_mean_synthetic: Optional[float] = None
+    jeffreys_naive_mean_synthetic: Optional[float] = None
+    jeffreys_improvement_naive_minus_gibbs_synthetic: Optional[float] = None
+
+
+@dataclass
+class _TailBlock:
+    """Running sums of the tail mass of one block."""
+
+    total: float = 0.0
+    total_sq: float = 0.0
+    rows: int = 0
+    min: float = float("inf")
+    max: float = float("-inf")
+
+
 class _TailAndLayerNormStats:
     """Per-block omitted-tail mass of the top-k support and the LayerNorm rewrite error over calibration batches."""
 
     def __init__(self, cfg: "SurgeryConfig") -> None:
         self.cfg = cfg
         self.gather_tail = cfg.use_exact_tail_mass or not cfg.disable_calib_gibbs_tail_prob
-        # Per block: [sum, sum of squares, rows, min, max] of the tail mass.
-        self.blocks: Dict[int, List[float]] = {}
+        self.blocks: Dict[int, _TailBlock] = {}
         self.block0_nk = 0
         self.block0_k = 0
         self.ln_mse_sum = 0.0
         self.ln_count = 0
-        self.stats: Dict[str, Any] = {}
+        self.ln_layer0: Optional[float] = None
 
     def scores(self, block: int, scores: torch.Tensor) -> None:
         if block != 0 and not self.gather_tail:
@@ -159,85 +208,70 @@ class _TailAndLayerNormStats:
             self.block0_nk, self.block0_k = nk, k_top
         if self.gather_tail:
             tail = topk_tail_mass(teacher, idx, nk, k_top)
-            acc = self.blocks.setdefault(block, [0.0, 0.0, 0, float("inf"), float("-inf")])
-            acc[0] += float(tail.mean()) * tail.numel()
-            acc[1] += float(tail.pow(2).sum())
-            acc[2] += tail.numel()
-            acc[3] = min(acc[3], float(tail.min()))
-            acc[4] = max(acc[4], float(tail.max()))
+            acc = self.blocks.setdefault(block, _TailBlock())
+            acc.total += float(tail.mean()) * tail.numel()
+            acc.total_sq += float(tail.pow(2).sum())
+            acc.rows += tail.numel()
+            acc.min = min(acc.min, float(tail.min()))
+            acc.max = max(acc.max, float(tail.max()))
 
     def layernorm(self, rewritten: torch.Tensor, reference: torch.Tensor, layer0: bool) -> None:
         mse = float((rewritten - reference).pow(2).mean().item())
         self.ln_mse_sum += mse
         self.ln_count += 1
-        if layer0:
-            self.stats.setdefault("ln_rewrite_mse_layer0_minibatch", mse)
+        if layer0 and self.ln_layer0 is None:
+            self.ln_layer0 = mse
 
-    def report(self, batches: int, mode: str) -> Dict[str, Any]:
+    def report(self, batches: int, mode: CalibrationMode) -> TailCalibration:
         cfg = self.cfg
-        stats = dict(self.stats)
-        if self.ln_count:
-            stats["ln_rewrite_mse_all_norms_mean"] = self.ln_mse_sum / self.ln_count
-        stats.update(
-            {
-                "disable_calib_gibbs_tail_prob": cfg.disable_calib_gibbs_tail_prob,
-                "use_exact_tail_mass": cfg.use_exact_tail_mass,
-                "gibbs_tail_calibration_batches_requested": cfg.gibbs_tail_calibration_batches,
-                "gibbs_tail_calibration_batches": batches,
-                "gibbs_tail_prob_eps_configured": cfg.gibbs_tail_prob_eps,
-            }
+        out = TailCalibration(
+            calibration_mode=mode,
+            disable_calib_gibbs_tail_prob=cfg.disable_calib_gibbs_tail_prob,
+            use_exact_tail_mass=cfg.use_exact_tail_mass,
+            gibbs_tail_calibration_batches_requested=cfg.gibbs_tail_calibration_batches,
+            gibbs_tail_calibration_batches=batches,
+            gibbs_tail_prob_eps_configured=cfg.gibbs_tail_prob_eps,
+            gibbs_tail_prob_eps_metric=float(cfg.gibbs_tail_prob_eps),
+            ln_rewrite_mse_layer0_minibatch=self.ln_layer0,
+            ln_rewrite_mse_all_norms_mean=self.ln_mse_sum / self.ln_count if self.ln_count else None,
         )
-        metric = cfg.gibbs_tail_prob_eps
         if self.blocks:
-            sums, sum_sqs, counts, mins, maxs = (list(v) for v in zip(*(self.blocks[b] for b in sorted(self.blocks))))
-            s = torch.tensor(sums, dtype=torch.float64)
-            n = torch.tensor(counts, dtype=torch.float64)
-            sq = torch.tensor(sum_sqs, dtype=torch.float64)
+            blocks = [self.blocks[b] for b in sorted(self.blocks)]
+            s = torch.tensor([b.total for b in blocks], dtype=torch.float64)
+            n = torch.tensor([b.rows for b in blocks], dtype=torch.float64)
+            sq = torch.tensor([b.total_sq for b in blocks], dtype=torch.float64)
             means_t = s / n
             means = means_t.tolist()
-            stds = (sq / n - means_t.square()).clamp_min(0.0).sqrt().tolist()
+            mins, maxs, rows = [b.min for b in blocks], [b.max for b in blocks], [b.rows for b in blocks]
             pooled_mean = s.sum() / n.sum()
-            stats.update(
-                {
-                    "gibbs_tail_prob_eps_exact_mean_by_block": means,
-                    "gibbs_tail_prob_eps_exact_std_by_block": stds,
-                    "gibbs_tail_prob_eps_exact_min_by_block": mins,
-                    "gibbs_tail_prob_eps_exact_max_by_block": maxs,
-                    "gibbs_tail_prob_eps_exact_rows_by_block": counts,
-                    "gibbs_tail_prob_eps_exact_mean": float(pooled_mean),
-                    "gibbs_tail_prob_eps_exact_std": float(
-                        (sq.sum() / n.sum() - pooled_mean.square()).clamp_min(0.0).sqrt()
-                    ),
-                    "gibbs_tail_prob_eps_exact_min": min(mins),
-                    "gibbs_tail_prob_eps_exact_max": max(maxs),
-                }
-            )
+            out.gibbs_tail_prob_eps_exact_mean_by_block = means
+            out.gibbs_tail_prob_eps_exact_std_by_block = (sq / n - means_t.square()).clamp_min(0.0).sqrt().tolist()
+            out.gibbs_tail_prob_eps_exact_min_by_block = mins
+            out.gibbs_tail_prob_eps_exact_max_by_block = maxs
+            out.gibbs_tail_prob_eps_exact_rows_by_block = rows
+            out.gibbs_tail_prob_eps_exact_mean = float(pooled_mean)
+            out.gibbs_tail_prob_eps_exact_std = float((sq.sum() / n.sum() - pooled_mean.square()).clamp_min(0.0).sqrt())
+            out.gibbs_tail_prob_eps_exact_min = min(mins)
+            out.gibbs_tail_prob_eps_exact_max = max(maxs)
             if not cfg.disable_calib_gibbs_tail_prob and not cfg.use_exact_tail_mass:
-                stats.update(
-                    {
-                        "gibbs_tail_prob_eps_calibrated_by_block": means,
-                        "gibbs_tail_prob_eps_calibrated_min_by_block": mins,
-                        "gibbs_tail_prob_eps_calibrated_max_by_block": maxs,
-                        "gibbs_tail_prob_eps_calibration_rows_by_block": counts,
-                        "gibbs_tail_prob_eps_calibrated_mean": float(pooled_mean),
-                    }
-                )
-            metric = means[0]
-        stats["gibbs_tail_prob_eps_metric"] = float(metric)
-        stats["calibration_mode"] = mode
+                out.gibbs_tail_prob_eps_calibrated_by_block = means
+                out.gibbs_tail_prob_eps_calibrated_min_by_block = mins
+                out.gibbs_tail_prob_eps_calibrated_max_by_block = maxs
+                out.gibbs_tail_prob_eps_calibration_rows_by_block = rows
+                out.gibbs_tail_prob_eps_calibrated_mean = float(pooled_mean)
+            out.gibbs_tail_prob_eps_metric = float(means[0])
         if self.block0_k > 0:
-            # Sparse vs naive top-k Jeffreys on synthetic Gaussian scores of block 0's shape.
             teacher = torch.randn(4096, self.block0_nk, device=get_device(), dtype=get_surgery_dtype())
             vals, idx = torch.topk(logit_stable_rows(teacher), k=self.block0_k, dim=-1, largest=True, sorted=True)
+            tail_prob = clamp_tail(out.gibbs_tail_prob_eps_metric)
             j_gibbs = jeffreys_distance_sparse_teacher(
-                teacher, vals, idx, self.block0_nk, self.block0_k, gibbs_tail_prob_eps=clamp_tail(metric)
+                teacher, vals, idx, self.block0_nk, self.block0_k, gibbs_tail_prob_eps=tail_prob
             ).mean()
             j_naive = jeffreys_naive_topk(teacher, vals, idx, self.block0_nk, self.block0_k).mean()
-            stats["jeffreys_gibbs_mean_synthetic"] = float(j_gibbs)
-            stats["jeffreys_naive_mean_synthetic"] = float(j_naive)
-            stats["jeffreys_improvement_naive_minus_gibbs_synthetic"] = float(j_naive - j_gibbs)
-        stats["calibration_loader_split"] = "train"
-        return stats
+            out.jeffreys_gibbs_mean_synthetic = float(j_gibbs)
+            out.jeffreys_naive_mean_synthetic = float(j_naive)
+            out.jeffreys_improvement_naive_minus_gibbs_synthetic = float(j_naive - j_gibbs)
+        return out
 
 
 def fused_qkv_attention_qk_scores(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -248,7 +282,7 @@ def fused_qkv_attention_qk_scores(attn: nn.Module, x: torch.Tensor) -> torch.Ten
 
 
 @torch.no_grad()
-def calibrate_reference(reference: nn.Module, loader: DataLoader, cfg: "SurgeryConfig") -> Dict[str, Any]:
+def calibrate_reference(reference: nn.Module, loader: DataLoader, cfg: "SurgeryConfig") -> TailCalibration:
     """Gibbs tail and LayerNorm rewrite statistics from a stock reference, by hooks on its attention and LayerNorms.
 
     Scores are read at each ``nn.Softmax`` with 4-D ``[B, H, Nq, Nk]`` input (MambaIR window attention) and from the
@@ -294,7 +328,7 @@ def calibrate_reference(reference: nn.Module, loader: DataLoader, cfg: "SurgeryC
 
 
 @torch.no_grad()
-def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: "SurgeryConfig") -> Dict[str, Any]:
+def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: "SurgeryConfig") -> TailCalibration:
     """Gibbs tail and LayerNorm rewrite statistics from the surgery student run at full support (the wrapped reference).
 
     Scores are read at each attention's ``mask_scores`` (after the causal mask) or ``dot`` output; tail sampling uses
@@ -324,32 +358,49 @@ def calibrate_surgery_student(model: nn.Module, loader: DataLoader, cfg: "Surger
     return acc.report(processed, "surgery_student")
 
 
-def apply_gibbs_tail_calibration(model: nn.Module, calibration: Mapping[str, Any]) -> Dict[str, Any]:
-    """Copy calibrated per-block tail masses into the Gibbs softmax modules; the last value covers extra blocks."""
-    values = calibration.get("gibbs_tail_prob_eps_calibrated_by_block")
+@dataclass
+class AppliedTail:
+    """Tail masses copied into the Gibbs softmax modules (metadata ``calibration`` keys)."""
+
+    gibbs_tail_prob_eps_applied_by_block: List[float]
+    gibbs_tail_prob_eps_applied_mean: float
+
+
+def apply_gibbs_tail_calibration(model: nn.Module, values: Sequence[float]) -> Optional[AppliedTail]:
+    """Copy per-block tail masses into the Gibbs softmax modules; the last value covers extra blocks."""
     gibbs = [m for m in model.modules() if isinstance(m, GibbsTopKSoftmax)]
-    if calibration.get("use_exact_tail_mass") or calibration.get("disable_calib_gibbs_tail_prob") or not values:
-        return {}
-    if not gibbs:
-        return {}
+    if not gibbs or not values:
+        return None
     applied = [clamp_tail(values[min(i, len(values) - 1)]) for i in range(len(gibbs))]
     with torch.no_grad():
         for g, value in zip(gibbs, applied):
             g.gibbs_tail_prob_eps.fill_(value)
-    return {
-        "gibbs_tail_prob_eps_applied_by_block": applied,
-        "gibbs_tail_prob_eps_applied_mean": sum(applied) / len(applied),
-    }
+    return AppliedTail(applied, sum(applied) / len(applied))
 
 
 # ---------------------------------------------------------------------------
 # PTQ calibration
 # ---------------------------------------------------------------------------
 
-PTQ_LINEAR_KINDS = frozenset({"linear", "conv2d"})
-PTQ_MATMUL_KINDS = frozenset({"matmul", "matmul_hadamard"})
+PTQKind = Literal[
+    "linear",
+    "conv2d",
+    "affine_scale",
+    "affine_scale_bias",
+    "affine_fixed_mix",
+    "affine_contract",
+    "matmul",
+    "matmul_hadamard",
+]
+# Input-code width group of a node kind (``ptq_activation_bits``).
+ActivationGroup = Literal["linear", "affine", "matmul"]
+# Output dequant of a wrapper: Linear/Conv2d scale ``s_in * s_w`` folded into the weight, or the OLS fit.
+OutScaleMode = Literal["analytical_s_in_times_s_w", "ols_affine"]
 
-_PTQ_KIND_BY_TYPE: Tuple[Tuple[type, str], ...] = (
+PTQ_LINEAR_KINDS: FrozenSet[PTQKind] = frozenset({"linear", "conv2d"})
+PTQ_MATMUL_KINDS: FrozenSet[PTQKind] = frozenset({"matmul", "matmul_hadamard"})
+
+_PTQ_KIND_BY_TYPE: Tuple[Tuple[type, PTQKind], ...] = (
     (nn.Linear, "linear"),
     (nn.Conv2d, "conv2d"),
     (AffineScale, "affine_scale"),
@@ -361,7 +412,7 @@ _PTQ_KIND_BY_TYPE: Tuple[Tuple[type, str], ...] = (
 )
 
 # Fixed weight of each accumulator kind; the matmul kinds have none.
-_WEIGHT_ATTR: Dict[str, str] = {
+_WEIGHT_ATTR: Dict[PTQKind, str] = {
     "linear": "weight",
     "conv2d": "weight",
     "affine_scale": "scale",
@@ -371,14 +422,14 @@ _WEIGHT_ATTR: Dict[str, str] = {
 }
 
 
-def ptq_module_kind(module: nn.Module) -> Optional[str]:
+def ptq_module_kind(module: nn.Module) -> Optional[PTQKind]:
     for cls, label in _PTQ_KIND_BY_TYPE:
         if isinstance(module, cls):
             return label
     return None
 
 
-def ptq_activation_group(kind: str) -> str:
+def ptq_activation_group(kind: PTQKind) -> ActivationGroup:
     if kind in PTQ_LINEAR_KINDS:
         return "linear"
     if kind in PTQ_MATMUL_KINDS:
@@ -386,7 +437,7 @@ def ptq_activation_group(kind: str) -> str:
     return "affine"
 
 
-def ptq_activation_bits(kind: str, cfg: "PTQSurgeryConfig") -> int:
+def ptq_activation_bits(kind: PTQKind, cfg: "PTQSurgeryConfig") -> int:
     """Input-code width of a node kind: ``activation_bits`` for Linear/Conv2d; the matmul and the compiled fixed-affine
     groups use ``matmul_activation_bits`` and ``compiled_accumulator_bits`` when set, else ``activation_bits``."""
     group = ptq_activation_group(kind)
@@ -479,7 +530,7 @@ def _channel_axis(acc: torch.Tensor, out: torch.Tensor, channel_axis: Optional[i
 @dataclass
 class PTQNodeStats:
     name: str
-    kind: str
+    kind: PTQKind
     input_arity: int = 0
     input_max_abs: List[torch.Tensor] = field(default_factory=list)
     output_rank: int = 0
@@ -504,7 +555,7 @@ class PTQNodeStats:
 @dataclass
 class PTQNodeSetup:
     name: str
-    kind: str
+    kind: PTQKind
     activation_bits: int
     weight_bits: int
     output_channel_axis: Optional[int]
@@ -521,10 +572,52 @@ class PTQNodeSetup:
 
 
 @dataclass
+class PTQNodeMeta:
+    """Quantization parameters of one wrapped node (PTQ metadata ``ptq_nodes`` entry). Scales, zero points and biases
+    hold one value per tensor or per channel (see ``per_output_channel_weights_effective`` and
+    ``per_channel_output_affine``)."""
+
+    name: str
+    kind: PTQKind
+    activation_group: ActivationGroup
+    activation_bits: int
+    weight_bits: int
+    per_output_channel_weights_config: bool
+    per_output_channel_weights_effective: bool
+    per_channel_output_affine: bool
+    output_channel_axis: Optional[int]
+    input_scale: List[float]
+    input_zero_point: List[float]
+    weight_scale: List[float]
+    weight_zero_point: List[float]
+    out_scale_mode: OutScaleMode
+    out_scale: List[float]
+    out_scale_baked_into_weight: bool
+    out_bias: List[float]
+    stride: Optional[List[int]]
+    padding: Optional[List[int]]
+    dilation: Optional[List[int]]
+    groups: int
+    einsum_equation: Optional[str]
+
+
+@dataclass
+class PTQReloadConfig:
+    """What a PTQ checkpoint needs to rebuild one wrapper skeleton before ``load_state_dict``."""
+
+    name: str
+    kind: PTQKind
+    activation_bits: int
+    out_bcast_shape: Optional[List[int]]
+    skip_out_scale: bool
+    state_shapes: Dict[str, List[int]]
+
+
+@dataclass
 class PTQBuiltWrapper:
     module: CalibratedAffinePTQWrapper
-    metadata: Dict[str, Any]
-    reload_config: Dict[str, Any]
+    metadata: PTQNodeMeta
+    reload_config: PTQReloadConfig
 
 
 def _tensor_hook(fn: Callable[[nn.Module, Tuple[torch.Tensor, ...], torch.Tensor], None]) -> Callable[..., None]:
@@ -540,7 +633,7 @@ def _tensor_hook(fn: Callable[[nn.Module, Tuple[torch.Tensor, ...], torch.Tensor
 
 @torch.no_grad()
 def gather_ptq_range_moments(
-    model: nn.Module, loader: Any, selected: Dict[str, str], batch_indices: Sequence[int]
+    model: nn.Module, loader: Any, selected: Dict[str, PTQKind], batch_indices: Sequence[int]
 ) -> Dict[str, PTQNodeStats]:
     """Input ranges and output layout of each selected node over the calibration batches."""
     stats = {name: PTQNodeStats(name=name, kind=kind) for name, kind in selected.items()}
@@ -557,7 +650,7 @@ def gather_ptq_range_moments(
 def gather_ptq_dequant_moments(
     model: nn.Module,
     loader: Any,
-    selected: Dict[str, str],
+    selected: Dict[str, PTQKind],
     stats: Dict[str, PTQNodeStats],
     setups: Dict[str, PTQNodeSetup],
     batch_indices: Sequence[int],
@@ -628,10 +721,10 @@ def build_ptq_wrapper(
     module: nn.Module, setup: PTQNodeSetup, stats: PTQNodeStats, *, dequant_var_eps: float
 ) -> PTQBuiltWrapper:
     q_weight = None if setup.q_weight is None else setup.q_weight.clone()
-    if setup.kind in PTQ_LINEAR_KINDS:
+    if setup.kind in PTQ_LINEAR_KINDS and q_weight is not None:
         out_scale = _linear_conv_out_scale(setup.input_scale, setup.weight_scale)
         out_bias = stats.bias_fit.bias()
-        out_scale_mode = "analytical_s_in_times_s_w"
+        out_scale_mode: OutScaleMode = "analytical_s_in_times_s_w"
         q_weight = _bake_output_scale_into_weight(q_weight, out_scale)
         out_scale_buf = torch.ones(())
         skip_out_scale = True
@@ -657,74 +750,79 @@ def build_ptq_wrapper(
         skip_out_scale=skip_out_scale,
         out_bcast_shape=out_bcast_shape,
     ).to(device=device)
-    reload_config = {
-        "name": setup.name,
-        "kind": setup.kind,
-        "activation_bits": setup.activation_bits,
-        "out_bcast_shape": None if out_bcast_shape is None else list(out_bcast_shape),
-        "skip_out_scale": skip_out_scale,
-        "state_shapes": {name: list(t.shape) for name, t in wrapper.state_dict().items()},
-    }
+    reload_config = PTQReloadConfig(
+        name=setup.name,
+        kind=setup.kind,
+        activation_bits=setup.activation_bits,
+        out_bcast_shape=None if out_bcast_shape is None else list(out_bcast_shape),
+        skip_out_scale=skip_out_scale,
+        state_shapes={name: list(t.shape) for name, t in wrapper.state_dict().items()},
+    )
     return PTQBuiltWrapper(module=wrapper, metadata=metadata, reload_config=reload_config)
+
+
+def _values(t: torch.Tensor) -> List[float]:
+    """Entries of a scalar or per-channel tensor as a flat list."""
+    return t.detach().flatten().cpu().tolist()
 
 
 def _wrapper_metadata(
     module: nn.Module,
     setup: PTQNodeSetup,
-    out_scale_mode: str,
+    out_scale_mode: OutScaleMode,
     out_scale: torch.Tensor,
     out_bias: torch.Tensor,
     skip_out_scale: bool,
-) -> Dict[str, Any]:
+) -> PTQNodeMeta:
     conv = module if isinstance(module, nn.Conv2d) else None
-    return {
-        "name": setup.name,
-        "kind": setup.kind,
-        "activation_group": ptq_activation_group(setup.kind),
-        "activation_bits": setup.activation_bits,
-        "weight_bits": setup.weight_bits,
-        "per_output_channel_weights_config": setup.per_output_channel_weights_config,
-        "per_output_channel_weights_effective": setup.per_output_channel_weights_effective,
-        "per_channel_output_affine": setup.per_channel_output_affine,
-        "output_channel_axis": setup.output_channel_axis,
-        "input_scale": setup.input_scale.tolist(),
-        "input_zero_point": [0.0] * setup.input_scale.numel(),
-        "weight_scale": setup.weight_scale.tolist(),
-        "weight_zero_point": torch.zeros_like(setup.weight_scale).tolist(),
-        "out_scale_mode": out_scale_mode,
-        "out_scale": out_scale.detach().cpu().tolist(),
-        "out_scale_baked_into_weight": skip_out_scale,
-        "out_bias": out_bias.detach().cpu().tolist(),
-        "stride": None if conv is None else list(conv.stride),
-        "padding": None if conv is None else list(conv.padding),
-        "dilation": None if conv is None else list(conv.dilation),
-        "groups": 1 if conv is None else conv.groups,
-        "einsum_equation": getattr(module, "einsum_equation", None),
-    }
+    return PTQNodeMeta(
+        name=setup.name,
+        kind=setup.kind,
+        activation_group=ptq_activation_group(setup.kind),
+        activation_bits=setup.activation_bits,
+        weight_bits=setup.weight_bits,
+        per_output_channel_weights_config=setup.per_output_channel_weights_config,
+        per_output_channel_weights_effective=setup.per_output_channel_weights_effective,
+        per_channel_output_affine=setup.per_channel_output_affine,
+        output_channel_axis=setup.output_channel_axis,
+        input_scale=_values(setup.input_scale),
+        input_zero_point=[0.0] * setup.input_scale.numel(),
+        weight_scale=_values(setup.weight_scale),
+        weight_zero_point=[0.0] * setup.weight_scale.numel(),
+        out_scale_mode=out_scale_mode,
+        out_scale=_values(out_scale),
+        out_scale_baked_into_weight=skip_out_scale,
+        out_bias=_values(out_bias),
+        stride=None if conv is None else list(conv.stride),
+        padding=None if conv is None else list(conv.padding),
+        dilation=None if conv is None else list(conv.dilation),
+        groups=1 if conv is None else conv.groups,
+        einsum_equation=getattr(module, "einsum_equation", None),
+    )
 
 
-def ptq_wrapper_from_reload_config(config: Dict[str, Any], module: nn.Module) -> CalibratedAffinePTQWrapper:
+def ptq_wrapper_from_reload_config(config: PTQReloadConfig, module: nn.Module) -> CalibratedAffinePTQWrapper:
     """Skeleton wrapper with the saved shapes, ready for ``load_state_dict``."""
-    shapes = config["state_shapes"]
-    attr = _WEIGHT_ATTR.get(config["kind"])
+    shapes = config.state_shapes
+    attr = _WEIGHT_ATTR.get(config.kind)
     if attr is not None:
-        _swap_accumulator_weight(module, config["kind"], torch.zeros(shapes[f"accumulator.{attr}"]))
+        _swap_accumulator_weight(module, config.kind, torch.zeros(shapes[f"accumulator.{attr}"]))
     return CalibratedAffinePTQWrapper(
-        activation_bits=int(config["activation_bits"]),
+        activation_bits=config.activation_bits,
         input_scale=torch.ones(shapes["quantizer.input_scale"]),
         accumulator=module,
         out_scale=torch.ones(shapes["out_scale"]),
         out_bias=torch.zeros(shapes["out_bias"]),
-        skip_out_scale=bool(config["skip_out_scale"]),
-        out_bcast_shape=None if config.get("out_bcast_shape") is None else tuple(config["out_bcast_shape"]),
+        skip_out_scale=config.skip_out_scale,
+        out_bcast_shape=None if config.out_bcast_shape is None else tuple(config.out_bcast_shape),
     )
 
 
 def _accumulator_forward(
-    module: nn.Module, kind: str, q_weight: Optional[torch.Tensor], q_inputs: Sequence[torch.Tensor]
+    module: nn.Module, kind: PTQKind, q_weight: Optional[torch.Tensor], q_inputs: Sequence[torch.Tensor]
 ) -> torch.Tensor:
     """Accumulation of ``module`` on quantized inputs with its quantized weight; ``forward`` skips the hooks."""
-    if kind not in _WEIGHT_ATTR:
+    if kind not in _WEIGHT_ATTR or q_weight is None:
         return module.forward(*q_inputs)
     original = _swap_accumulator_weight(module, kind, q_weight)
     try:
@@ -734,7 +832,7 @@ def _accumulator_forward(
             setattr(module, attr, value)
 
 
-def _swap_accumulator_weight(module: nn.Module, kind: str, q_weight: torch.Tensor) -> Dict[str, Any]:
+def _swap_accumulator_weight(module: nn.Module, kind: PTQKind, q_weight: torch.Tensor) -> Dict[str, Any]:
     """Install the integer weight (and a zero or dropped bias); returns the replaced attributes."""
     attr = _WEIGHT_ATTR[kind]
     old = getattr(module, attr)
@@ -771,7 +869,7 @@ def _symmetric_scale(x: torch.Tensor, bits: int, axis: Optional[int] = None) -> 
     return (max_abs / float(max(qmax, 1))).clamp_min(1e-8).float()
 
 
-def _default_output_channel_axis(kind: str, out: torch.Tensor) -> Optional[int]:
+def _default_output_channel_axis(kind: PTQKind, out: torch.Tensor) -> Optional[int]:
     if out.ndim == 0:
         return None
     if kind == "conv2d":

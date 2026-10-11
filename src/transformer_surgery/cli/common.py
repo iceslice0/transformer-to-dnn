@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Optional, Sequence, Type, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Literal, Optional, Sequence, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import torch
 
 from transformer_surgery.internal.util import (
     DEFAULT_MODEL_KEY,
+    dataclass_from_record,
     set_default_device,
     set_surgery_dtype,
     torch_dtype_from_name,
@@ -39,8 +41,7 @@ class RunConfig:
         path = os.path.abspath(os.path.expanduser(json_path.strip()))
         with open(path, encoding="utf-8") as f:
             values = {**json.load(f), **(overrides or {})}
-        allowed = {f.name for f in fields(cls)} - {"config_json_path"}
-        return cls(**{k: v for k, v in values.items() if k in allowed}, config_json_path=path)
+        return dataclass_from_record(cls, {**values, "config_json_path": path})
 
 
 @dataclass
@@ -94,15 +95,25 @@ def parse_cli_config(
     for f in fields(config_cls):
         if f.name == "config_json_path":
             continue
-        kw: Dict[str, Any] = {"dest": f.name, "default": argparse.SUPPRESS, "help": helps.get(f.name)}
-        flag = "--" + f.name.replace("_", "-")
+        add = functools.partial(
+            parser.add_argument,
+            "--" + f.name.replace("_", "-"),
+            dest=f.name,
+            default=argparse.SUPPRESS,
+            help=helps.get(f.name),
+        )
         tp = _strip_optional(hints[f.name])
+        item = get_args(tp)[0] if get_origin(tp) is list else None
         if tp is bool:
-            parser.add_argument(flag, action=argparse.BooleanOptionalAction if f.default else "store_true", **kw)
+            add(action=argparse.BooleanOptionalAction if f.default else "store_true")
         elif tp in (int, float, str):
-            parser.add_argument(flag, type=tp, **kw)
-        elif get_origin(tp) is list and get_args(tp) == (str,):
-            parser.add_argument(flag, nargs="*", type=str, **kw)
+            add(type=tp)
+        elif get_origin(tp) is Literal:
+            add(choices=get_args(tp))
+        elif item is str:
+            add(nargs="*", type=str)
+        elif get_origin(item) is Literal:
+            add(nargs="*", choices=get_args(item))
         else:
             raise TypeError(f"Unsupported CLI field type {config_cls.__name__}.{f.name}: {tp}")
     args = vars(parser.parse_args(argv))

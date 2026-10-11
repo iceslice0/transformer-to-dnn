@@ -7,7 +7,8 @@ inputs. A basis-level count may classify the same kernel by the operation of tha
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -19,8 +20,16 @@ def _is_unary_module(m: nn.Module) -> bool:
     return type(m).__name__.startswith("NL") and type(m).__module__.startswith("transformer_surgery")
 
 
+@dataclass
+class PointwiseCount:
+    """Unary evaluations per input example, total and by ``NL*`` op type."""
+
+    per_input: float
+    by_type: Dict[str, float]
+
+
 @torch.no_grad()
-def count_pointwise_per_input(model: nn.Module, x: torch.Tensor) -> Dict[str, Any]:
+def count_pointwise_per_input(model: nn.Module, x: torch.Tensor) -> PointwiseCount:
     """Unary evaluations per input example for one batch ``x``, total and by op type."""
     by_type: Dict[str, int] = {}
 
@@ -40,7 +49,4 @@ def count_pointwise_per_input(model: nn.Module, x: torch.Tensor) -> Dict[str, An
         for h in handles:
             h.remove()
     batch = int(x.shape[0])
-    return {
-        "pointwise_per_input": sum(by_type.values()) / batch,
-        "pointwise_per_input_by_type": {k: v / batch for k, v in sorted(by_type.items())},
-    }
+    return PointwiseCount(sum(by_type.values()) / batch, {k: v / batch for k, v in sorted(by_type.items())})

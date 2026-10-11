@@ -143,12 +143,12 @@ class PackageSmokeTests(unittest.TestCase):
                 self.assertTrue(torch.allclose(a.float(), b.float(), atol=1e-5))
         x = torch.cat((torch.randn(2, 50, 3) * 0.01 + 5.0, torch.randn(2, 50, 3) * 0.01 - 5.0), dim=1)
         km = kmeans_per_head(x, 2, 10, torch.Generator().manual_seed(0))
-        self.assertTrue(torch.all(km["relative_inertia"] < 1e-3))
-        self.assertTrue(torch.all(km["empty_clusters"] == 0))
+        self.assertTrue(torch.all(km.relative_inertia < 1e-3))
+        self.assertTrue(torch.all(km.empty_clusters == 0))
         identical = torch.ones(2, 12, 3)
         km_identical = kmeans_per_head(identical, 4, 10, torch.Generator().manual_seed(0))
-        self.assertTrue(torch.isfinite(km_identical["centroids"]).all())
-        self.assertTrue(torch.equal(km_identical["relative_inertia"], torch.zeros(2)))
+        self.assertTrue(torch.isfinite(km_identical.centroids).all())
+        self.assertTrue(torch.equal(km_identical.relative_inertia, torch.zeros(2)))
         with self.assertRaisesRegex(ValueError, "top_k >= 1"):
             GibbsTopKSoftmax(seq_len=6, top_k=0, gibbs_tail_prob_eps=0.0)
 
@@ -367,7 +367,7 @@ class PackageSmokeTests(unittest.TestCase):
         for _ in range(2):
             g = torch.Generator(device=dev)
             g.manual_seed(0)
-            cents.append(kmeans_per_head(x, 8, 10, g)["centroids"])
+            cents.append(kmeans_per_head(x, 8, 10, g).centroids)
         self.assertTrue(torch.equal(cents[0], cents[1]))
 
     def test_affine_combine_keeps_dtype_of_first_input(self) -> None:
@@ -619,17 +619,20 @@ class PackageSmokeTests(unittest.TestCase):
         )
 
     def test_distill_repeat_metadata_helpers(self) -> None:
-        from transformer_surgery.distill import distill_metadata
+        from dataclasses import asdict
+
+        from transformer_surgery.distill import DistillRun, DistillSummary, distill_metadata
         from transformer_surgery.models.adapters import get_model_adapter
 
         runs = [
-            {"run_index": 0, "seed": 42, "val_acc": 0.60, "val_ce_mean": 1.0, "val_jeffreys_mean": 0.3},
-            {"run_index": 1, "seed": 43, "val_acc": 0.80, "val_ce_mean": 0.8, "val_jeffreys_mean": 0.2},
+            DistillRun(42, 0.5, 1.2, 0.4, val_acc=0.60, val_ce_mean=1.0, val_jeffreys_mean=0.3, best_val_epoch=1),
+            DistillRun(43, 0.5, 1.2, 0.4, val_acc=0.80, val_ce_mean=0.8, val_jeffreys_mean=0.2, best_val_epoch=2, run_index=1),
         ]
-        meta = distill_metadata(get_model_adapter("deit_tiny_pet"), runs, runs[1])
+        meta = distill_metadata(get_model_adapter("deit_tiny_pet"), DistillSummary.of(runs))
         cal = meta["calibration"]
         self.assertEqual(meta["patient"], "DeiT-Tiny")
-        self.assertEqual(cal["student_post_distill_runs"], runs)
+        self.assertEqual(cal["student_post_distill_runs"], [asdict(r) for r in runs])
+        self.assertEqual(cal["student_post_distill_best_run_index"], 1)
         self.assertEqual(cal["student_post_distill_best_seed"], 43)
         self.assertEqual(cal["student_post_distill_val_acc"], 0.80)
         self.assertAlmostEqual(cal["student_post_distill_val_acc_mean"], 0.70)
@@ -663,6 +666,8 @@ class PackageSmokeTests(unittest.TestCase):
         import torch.nn as nn
         import torch.nn.functional as F
 
+        from dataclasses import replace
+
         from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.models import DeiTTinySurgeryModel
         from transformer_surgery.internal import calibration as calibration_mod
@@ -690,22 +695,25 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(calibration_mod, "calibrate_reference"))
         self.assertTrue(hasattr(calibration_mod, "fused_qkv_attention_qk_scores"))
 
-        disabled_calibration = DeiTTinySurgeryModel(SurgeryConfig(gibbs_tail_prob_eps=0.1), num_classes=37, depth=1)
-        skipped = adapter.apply_calibration(
-            disabled_calibration,
-            {"disable_calib_gibbs_tail_prob": True, "gibbs_tail_prob_eps_calibrated_by_block": [0.02]},
+        tail = calibration_mod.TailCalibration(
+            calibration_mode="test",
+            disable_calib_gibbs_tail_prob=True,
+            use_exact_tail_mass=False,
+            gibbs_tail_calibration_batches_requested=None,
+            gibbs_tail_calibration_batches=1,
+            gibbs_tail_prob_eps_configured=0.1,
+            gibbs_tail_prob_eps_metric=0.1,
         )
-        self.assertEqual(skipped, {})
+        disabled_calibration = DeiTTinySurgeryModel(SurgeryConfig(gibbs_tail_prob_eps=0.1), num_classes=37, depth=1)
+        self.assertIsNone(adapter.apply_calibration(disabled_calibration, tail))
         self.assertAlmostEqual(
             float(disabled_calibration.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.1, places=2
         )
 
         calibrated = DeiTTinySurgeryModel(SurgeryConfig(gibbs_tail_prob_eps=0.1), num_classes=37, depth=2)
-        applied = adapter.apply_calibration(
-            calibrated,
-            {"gibbs_tail_prob_eps_calibrated_by_block": [0.02, 0.03]},
-        )
-        self.assertEqual(applied["gibbs_tail_prob_eps_applied_by_block"], [0.02, 0.03])
+        tail = replace(tail, disable_calib_gibbs_tail_prob=False, gibbs_tail_prob_eps_calibrated_by_block=[0.02, 0.03])
+        applied = adapter.apply_calibration(calibrated, tail)
+        self.assertEqual(applied.gibbs_tail_prob_eps_applied_by_block, [0.02, 0.03])
         self.assertAlmostEqual(float(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.detach()), 0.02, places=3)
         self.assertTrue(calibrated.blocks[0].attn.gibbs.gibbs_tail_prob_eps.requires_grad)
 
@@ -717,7 +725,7 @@ class PackageSmokeTests(unittest.TestCase):
         from transformer_surgery.cli.surgery_config import SurgeryConfig
         from transformer_surgery.internal.util import get_surgery_dtype, set_surgery_dtype
         from transformer_surgery.models.adapters import build_surgery_student, get_model_adapter
-        from transformer_surgery.models.pythia.surgery_model import PythiaSurgeryModel, arch_dict_from_hf_config
+        from transformer_surgery.models.pythia.surgery_model import PythiaArch, PythiaSurgeryModel
         from transformer_surgery.ops import (
             SurgeryCausalAttention,
             build_causal_attn_mask,
@@ -767,24 +775,12 @@ class PackageSmokeTests(unittest.TestCase):
         cfg = SurgeryConfig(
             model_key="pythia_70m_wikitext2", top_k=16, gibbs_tail_prob_eps=0.0, allow_matmul=True, context_length=16
         )
-        arch = {
-            "vocab_size": 128,
-            "hidden_size": 32,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "intermediate_size": 64,
-            "rotary_pct": 0.25,
-            "rope_theta": 10000.0,
-            "attention_bias": True,
-            "use_parallel_residual": True,
-            "hidden_dropout": 0.0,
-            "attention_dropout": 0.0,
-        }
+        arch = PythiaArch(vocab_size=128, hidden_size=32, num_hidden_layers=2, num_attention_heads=4, intermediate_size=64)
         saved_dtype = get_surgery_dtype()
         try:
             set_surgery_dtype(torch.float32)
             model = PythiaSurgeryModel(cfg, arch)
-            record = {**asdict(cfg), "surgery_dtype": "float32", "arch": arch}
+            record = {**asdict(cfg), "surgery_dtype": "float32", "arch": asdict(arch)}
             rebuilt, _ = build_surgery_student(record, SimpleNamespace(top_k=None, eps=None))
         finally:
             set_surgery_dtype(saved_dtype)
@@ -821,7 +817,7 @@ class PackageSmokeTests(unittest.TestCase):
             allow_matmul=True,
             context_length=16,
         )
-        student = PythiaSurgeryModel(scfg, arch_dict_from_hf_config(hf_cfg)).eval()
+        student = PythiaSurgeryModel(scfg, PythiaArch.from_hf_config(hf_cfg)).eval()
         mapping = adapter.copy_reference_weights(student, ref)
         self.assertEqual(len(mapping), len(ref.state_dict()))
         with torch.no_grad():

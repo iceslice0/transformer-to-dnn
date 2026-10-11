@@ -39,7 +39,8 @@ def main() -> None:
     device = get_device()
     ref = adapter.load_reference_checkpoint(adapter.reference_checkpoint_path(cfg)).to(device=device, dtype=get_surgery_dtype())
     _timed_evaluate(adapter, ref, val, cfg, device)
-    ref_acc, _l, ref_time, ref_mem, _e = _timed_evaluate(adapter, ref, val, cfg, device)
+    ref_run = _timed_evaluate(adapter, ref, val, cfg, device)
+    ref_acc, ref_time, ref_mem = ref_run.primary, ref_run.wall_time_sec, ref_run.peak_gpu_mem_bytes
     del ref
     x_count = next(iter(val))[0][:4]
     rows: List[Dict[str, Any]] = []
@@ -48,7 +49,8 @@ def main() -> None:
             run_cfg = SurgeryConfig.load(f"configs/surgery/{name}.json")
             model, _extra = load_surgery_student_checkpoint(f"artifacts/checkpoints/ts_surgery_{name}.pt", run_cfg)
             _timed_evaluate(adapter, model, val, run_cfg, device)
-            acc, _loss, t, mem, _x = _timed_evaluate(adapter, model, val, run_cfg, device)
+            run = _timed_evaluate(adapter, model, val, run_cfg, device)
+            acc, t, mem = run.primary, run.wall_time_sec, run.peak_gpu_mem_bytes
             pw = count_pointwise_per_input(model, x_count)
             rows.append(
                 {
@@ -58,13 +60,13 @@ def main() -> None:
                     "acc": float(acc),
                     "latency_vs_ref": float(t / ref_time),
                     "peak_mem_bytes": int(mem) if mem is not None else None,
-                    "pointwise_per_image": float(pw["pointwise_per_input"]),
-                    "pointwise_by_type": pw["pointwise_per_input_by_type"],
+                    "pointwise_per_image": pw.per_input,
+                    "pointwise_by_type": pw.by_type,
                 }
             )
             print(
                 f"k={k:3d} {variant:12s} acc={100 * acc:6.2f} latency={t / ref_time:5.2f}x "
-                f"mem={(mem or 0) / 2**20:7.0f} MB pointwise/img={pw['pointwise_per_input']:.4g}",
+                f"mem={(mem or 0) / 2**20:7.0f} MB pointwise/img={pw.per_input:.4g}",
                 flush=True,
             )
             del model

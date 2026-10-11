@@ -23,34 +23,27 @@ except ImportError as exc:  # pragma: no cover - optional MambaIR path
         "See README 'MambaIR (optional)'."
     ) from exc
 
-# Hyperparameters matching the released ``mambairv2_lightSR_x{2,4}.pth`` weights
-# (from mambal/softmax/softmax_surgery.py build_model). These differ from the class defaults
-# (depths (6,6,6,6) / mlp_ratio 2.0), so keep them explicit.
-MAMBAIR_LIGHTSR_PRESET = dict(
-    img_size=64,
-    embed_dim=48,
-    d_state=8,
-    depths=[5, 5, 5, 5],
-    num_heads=[4, 4, 4, 4],
-    window_size=16,
-    inner_rank=32,
-    num_tokens=64,
-    convffn_kernel_size=5,
-    img_range=1.0,
-    mlp_ratio=1.0,
-    upsampler="pixelshuffledirect",
-    resi_connection="1conv",
-)
-
 
 def build_mambair_lightsr(scale: int) -> MambaIRv2Light:
-    """Build MambaIRv2 Light SR at the given upscale factor (weights match the released .pth)."""
-    return MambaIRv2Light(upscale=int(scale), **MAMBAIR_LIGHTSR_PRESET)
+    """MambaIRv2 Light SR at the given upscale factor with the hyperparameters of the released
+    ``mambairv2_lightSR_x{2,4}.pth`` weights (from mambal/softmax/softmax_surgery.py ``build_model``; they differ from
+    the class defaults, depths (6,6,6,6) and mlp_ratio 2.0)."""
+    return MambaIRv2Light(
+        upscale=int(scale),
+        img_size=64,
+        embed_dim=48,
+        d_state=8,
+        depths=[5, 5, 5, 5],
+        num_heads=[4, 4, 4, 4],
+        window_size=16,
+        inner_rank=32,
+        num_tokens=64,
+        convffn_kernel_size=5,
+        img_range=1.0,
+        mlp_ratio=1.0,
+        upsampler="pixelshuffledirect",
+        resi_connection="1conv",
+    )
 
 
-__all__ = [
-    "MambaIRv2Light",
-    "WindowAttention",
-    "MAMBAIR_LIGHTSR_PRESET",
-    "build_mambair_lightsr",
-]
+__all__ = ["MambaIRv2Light", "WindowAttention", "build_mambair_lightsr"]

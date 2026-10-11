@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, Literal, Optional, Sequence
 
 from transformer_surgery.cli.common import AdapterRunConfig, parse_cli_config
+
+# Products of two activations in the DeiT-Tiny strict graph (see FIELD_HELP_SURGERY).
+StrictProduct = Literal["norm", "polarization"]
+# MLP activation: exact GELU or x*sigmoid(1.702x).
+GeluMode = Literal["exact", "sigmoid"]
+# Sparse support: top-k exact scores or the top-k keys of the nearest fixed query centroid.
+SupportRouting = Literal["topk", "query_centroids"]
 
 
 @dataclass
@@ -25,10 +32,10 @@ class SurgeryConfig(AdapterRunConfig):
     gibbs_tail_calibration_batches: Optional[int] = 10
     disable_calib_gibbs_tail_prob: bool = False
     use_exact_tail_mass: bool = False
-    gelu: str = "exact"
+    gelu: GeluMode = "exact"
     hadamard: bool = False
-    strict_product: str = "norm"
-    support_routing: str = "topk"
+    strict_product: StrictProduct = "norm"
+    support_routing: SupportRouting = "topk"
     routing_clusters: int = 32
     routing_calibration_batches: Optional[int] = 20
     routing_max_samples: int = 65536

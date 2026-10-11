@@ -6,8 +6,8 @@ import copy
 import os
 import statistics
 import time
-from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,52 @@ if TYPE_CHECKING:
     from transformer_surgery.models.adapters import SurgeryModelAdapter
 
 
+@dataclass
+class DistillRun:
+    """Validation of one distillation run before training (baseline) and of its kept student."""
+
+    seed: int
+    baseline_val_acc: float
+    baseline_val_ce_mean: float
+    baseline_val_jeffreys_mean: float
+    val_acc: float
+    val_ce_mean: float
+    val_jeffreys_mean: float
+    best_val_epoch: Optional[int]
+    run_index: int = 0
+
+
+@dataclass
+class DistillSummary:
+    """The best of several distillation runs and the spread of their accuracy (distill metadata ``calibration``)."""
+
+    student_post_distill_val_acc: float
+    student_post_distill_mean_ce: float
+    student_post_distill_mean_jeffreys: float
+    student_post_distill_runs: List[DistillRun]
+    student_post_distill_val_acc_mean: float
+    student_post_distill_val_acc_std: float
+    student_post_distill_num_trainings: int
+    student_post_distill_best_run_index: int
+    student_post_distill_best_seed: int
+
+    @classmethod
+    def of(cls, runs: Sequence[DistillRun]) -> "DistillSummary":
+        best = max(runs, key=lambda r: r.val_acc)
+        accs = [r.val_acc for r in runs]
+        return cls(
+            student_post_distill_val_acc=best.val_acc,
+            student_post_distill_mean_ce=best.val_ce_mean,
+            student_post_distill_mean_jeffreys=best.val_jeffreys_mean,
+            student_post_distill_runs=list(runs),
+            student_post_distill_val_acc_mean=statistics.mean(accs),
+            student_post_distill_val_acc_std=statistics.stdev(accs) if len(accs) > 1 else 0.0,
+            student_post_distill_num_trainings=len(accs),
+            student_post_distill_best_run_index=best.run_index,
+            student_post_distill_best_seed=best.seed,
+        )
+
+
 def distill_student_from_teacher(
     student: nn.Module,
     teacher: nn.Module,
@@ -49,7 +95,7 @@ def distill_student_from_teacher(
     seed: int,
     baseline: Tuple[float, float, float],
     log_prefix: str = "distill",
-) -> Dict[str, Any]:
+) -> DistillRun:
     """Train a student with a task-defined hard loss mixed with teacher matching.
 
     ``adapter`` supplies ``(hard_loss, match_loss)`` per step and ``(primary, loss, match)`` for
@@ -135,37 +181,25 @@ def distill_student_from_teacher(
             student.load_state_dict(master.state_dict())
         log_line(f"  {log_prefix} kept best val acc={best_acc:.4f} (epoch {best_ep}/{cfg.epochs})")
     baseline_acc, baseline_ce, baseline_j = baseline
-    return {
-        "baseline_val_acc": float(baseline_acc),
-        "baseline_val_ce_mean": float(baseline_ce),
-        "baseline_val_jeffreys_mean": float(baseline_j),
-        "val_acc": float(best_acc),
-        "val_ce_mean": float(best_ce),
-        "val_jeffreys_mean": float(best_j),
-        "best_val_epoch": best_ep if cfg.keep_best else None,
-    }
+    return DistillRun(
+        seed=seed,
+        baseline_val_acc=float(baseline_acc),
+        baseline_val_ce_mean=float(baseline_ce),
+        baseline_val_jeffreys_mean=float(baseline_j),
+        val_acc=float(best_acc),
+        val_ce_mean=float(best_ce),
+        val_jeffreys_mean=float(best_j),
+        best_val_epoch=best_ep if cfg.keep_best else None,
+    )
 
 
-def distill_metadata(
-    adapter: "SurgeryModelAdapter", runs: List[Dict[str, Any]], best_run: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Metadata of a distillation: the best run's validation metrics, every run, and the accuracy spread."""
-    accs = [run["val_acc"] for run in runs]
+def distill_metadata(adapter: "SurgeryModelAdapter", summary: DistillSummary) -> Dict[str, Any]:
+    """Distill metadata JSON: patient and dataset, the run summary as the ``calibration`` block."""
     return {
         "model_key": adapter.key,
         "patient": adapter.patient_name,
         "dataset": adapter.dataset_name,
-        "calibration": {
-            "student_post_distill_val_acc": best_run["val_acc"],
-            "student_post_distill_mean_ce": best_run["val_ce_mean"],
-            "student_post_distill_mean_jeffreys": best_run["val_jeffreys_mean"],
-            "student_post_distill_runs": runs,
-            "student_post_distill_val_acc_mean": statistics.mean(accs),
-            "student_post_distill_val_acc_std": statistics.stdev(accs) if len(accs) > 1 else 0.0,
-            "student_post_distill_num_trainings": len(accs),
-            "student_post_distill_best_run_index": best_run["run_index"],
-            "student_post_distill_best_seed": best_run["seed"],
-        },
+        "calibration": asdict(summary),
         "calibration_legend": CALIBRATION_LEGEND_TEXT,
     }
 
@@ -197,8 +231,8 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     log_line(f"baseline val primary={baseline[0]:.4f} loss={baseline[1]:.4f} match={baseline[2]:.4f}")
     del probe_student, baseline_val_loader
 
-    runs: List[Dict[str, Any]] = []
-    best_run: Optional[Dict[str, Any]] = None
+    runs: List[DistillRun] = []
+    best_run: Optional[DistillRun] = None
     best_state: Optional[Dict[str, torch.Tensor]] = None
     for run_index in range(cfg.num_trainings):
         seed = cfg.base_seed + run_index
@@ -207,7 +241,7 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         set_seed(seed)
         student, _ = load_surgery_student_checkpoint(pre_path, cfg)
         train_loader, val_loader = adapter.build_loaders(cfg)
-        result = distill_student_from_teacher(
+        run = distill_student_from_teacher(
             student,
             teacher,
             train_loader,
@@ -218,24 +252,23 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
             baseline=baseline,
             log_prefix=f"distill[{run_number}/{cfg.num_trainings}]",
         )
-        result.update(
-            {"run_index": run_index, "run_number": run_number, "num_trainings": cfg.num_trainings, "seed": seed}
-        )
-        runs.append(result)
+        run = replace(run, run_index=run_index)
+        runs.append(run)
         log_line(
-            f"run {run_number}/{cfg.num_trainings} seed={seed} final val acc={result['val_acc']:.4f} "
-            f"ce={result['val_ce_mean']:.4f} jeffreys={result['val_jeffreys_mean']:.4f}"
-            + (f" best_epoch={result['best_val_epoch']}" if result["best_val_epoch"] is not None else "")
+            f"run {run_number}/{cfg.num_trainings} seed={seed} final val acc={run.val_acc:.4f} "
+            f"ce={run.val_ce_mean:.4f} jeffreys={run.val_jeffreys_mean:.4f}"
+            + (f" best_epoch={run.best_val_epoch}" if run.best_val_epoch is not None else "")
         )
-        if best_run is None or result["val_acc"] > best_run["val_acc"]:
-            best_run = result
+        if best_run is None or run.val_acc > best_run.val_acc:
+            best_run = run
             best_state = {name: t.detach().cpu().clone() for name, t in student.state_dict().items()}
-    meta = distill_metadata(adapter, runs, best_run)
-    cal = meta["calibration"]
+    if best_run is None or best_state is None:
+        raise ValueError("num_trainings must be at least 1")
+    summary = DistillSummary.of(runs)
     log_line(
         f"validation accuracy over {cfg.num_trainings} training run(s): "
-        f"mean={cal['student_post_distill_val_acc_mean']:.4f} std={cal['student_post_distill_val_acc_std']:.4f}; "
-        f"best run={best_run['run_number']} seed={best_run['seed']} acc={best_run['val_acc']:.4f}"
+        f"mean={summary.student_post_distill_val_acc_mean:.4f} std={summary.student_post_distill_val_acc_std:.4f}; "
+        f"best run={best_run.run_index + 1} seed={best_run.seed} acc={best_run.val_acc:.4f}"
     )
 
     best_student, _ = load_surgery_student_checkpoint(pre_path, cfg)
@@ -247,12 +280,12 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
         "distill_config": asdict(cfg),
         "teacher_checkpoint": teacher_path,
         "student_pre_checkpoint": pre_path,
-        "distill_runs": runs,
-        "distill_val_acc_mean": cal["student_post_distill_val_acc_mean"],
-        "distill_val_acc_std": cal["student_post_distill_val_acc_std"],
-        "best_distill_run": best_run,
+        "distill_runs": [asdict(r) for r in runs],
+        "distill_val_acc_mean": summary.student_post_distill_val_acc_mean,
+        "distill_val_acc_std": summary.student_post_distill_val_acc_std,
+        "best_distill_run": asdict(best_run),
     }
     save_model_checkpoint(out_abs, best_student, extra=out_extra)
     log_wrote(out_abs)
-    write_json(meta_abs, meta)
+    write_json(meta_abs, distill_metadata(adapter, summary))
     log_wrote(meta_abs)

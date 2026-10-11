@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, get_args
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath as _TimmDropPath
 
+from transformer_surgery.cli.surgery_config import GeluMode, StrictProduct
 from transformer_surgery.internal.util import get_surgery_dtype
 
 if TYPE_CHECKING:
@@ -191,7 +192,7 @@ class NLGELU(nn.Module):
         return F.gelu(x)
 
 
-GELU_MODES = ("exact", "sigmoid")
+GELU_MODES = get_args(GeluMode)
 
 
 # Products of two activations in the strict graph.
@@ -200,16 +201,15 @@ GELU_MODES = ("exact", "sigmoid")
 # ( sum_k (v^2 - (v-p)^2) + sum_k p^2 ) / 2 with the two close squares subtracted per term before the sum over keys,
 # LayerNorm ((u+a)^2 - u^2 - a^2)/2 with u^2 from the variance, and the exact tail term. Polarization stays where it
 # is cheaper (isolated products: softmax, the GELU approximation).
-# "polarization": every product as ((a+b)^2-(a-b)^2)/4, kept to reload and reproduce earlier runs.
-STRICT_PRODUCTS = ("norm", "polarization")
+# "polarization": every product as ((a+b)^2-(a-b)^2)/4 (the Table 2 baseline, make strict-pol).
+STRICT_PRODUCTS = get_args(StrictProduct)
 
 
-def check_strict_product(strict_product: str, *, allow_matmul: bool, hadamard: bool = False) -> str:
+def check_strict_product(strict_product: StrictProduct, *, allow_matmul: bool, hadamard: bool = False) -> StrictProduct:
     """The product rule of the strict graph; graphs with activation-activation products ignore it."""
-    value = str(strict_product)
-    if value not in STRICT_PRODUCTS:
-        raise ValueError(f"strict_product must be one of {STRICT_PRODUCTS}, got {value!r}")
-    return "polarization" if (allow_matmul or hadamard) else value
+    if strict_product not in STRICT_PRODUCTS:
+        raise ValueError(f"strict_product must be one of {STRICT_PRODUCTS}, got {strict_product!r}")
+    return "polarization" if (allow_matmul or hadamard) else strict_product
 
 
 def check_hadamard(hadamard: bool, *, allow_matmul: bool) -> bool:
@@ -508,7 +508,7 @@ class RewrittenLayerNorm(nn.Module):
         *,
         allow_matmul: bool = False,
         hadamard: bool = False,
-        strict_product: str = "norm",
+        strict_product: StrictProduct = "norm",
     ) -> None:
         super().__init__()
         self.normalized_shape = (normalized_shape,)
@@ -569,7 +569,12 @@ class PairwiseDotBySquare(nn.Module):
     """
 
     def __init__(
-        self, head_dim: int, *, allow_matmul: bool = False, hadamard: bool = False, strict_product: str = "norm"
+        self,
+        head_dim: int,
+        *,
+        allow_matmul: bool = False,
+        hadamard: bool = False,
+        strict_product: StrictProduct = "norm",
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -865,7 +870,9 @@ class SparseWeightedSumBySquare(nn.Module):
     mixed by one dense ``[Nq,Nk] @ [Nk,D]`` product, the same sum without a gathered ``[Nq,K,D]`` tensor.
     """
 
-    def __init__(self, *, allow_matmul: bool = False, hadamard: bool = False, strict_product: str = "norm") -> None:
+    def __init__(
+        self, *, allow_matmul: bool = False, hadamard: bool = False, strict_product: StrictProduct = "norm"
+    ) -> None:
         super().__init__()
         self.allow_matmul = allow_matmul
         # Hadamard graph: ``p * v`` as elementwise products, then a fixed sum over the support.
@@ -946,7 +953,7 @@ def dense_softmax_mix(
     return (RoutingUnsqueeze(attn, -1) * RoutingExpand(RoutingUnsqueeze(v, 2), -1, -1, nq, nk, -1)).sum(dim=3)
 
 
-def graph_options(cfg: "SurgeryConfig") -> Tuple[bool, str]:
+def graph_options(cfg: "SurgeryConfig") -> Tuple[bool, StrictProduct]:
     """Validated ``(hadamard, strict_product)`` of a surgery config."""
     hadamard = check_hadamard(cfg.hadamard, allow_matmul=cfg.allow_matmul)
     return hadamard, check_strict_product(cfg.strict_product, allow_matmul=cfg.allow_matmul, hadamard=hadamard)

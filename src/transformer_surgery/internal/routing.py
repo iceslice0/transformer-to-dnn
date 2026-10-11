@@ -18,19 +18,20 @@ the exact top-k support of the same size on rows with more valid keys than ``top
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any, Dict, List, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, get_args
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from transformer_surgery.internal.calibration import (
-    apply_gibbs_tail_calibration,
     calibration_batch_indices,
     dense_gibbs,
     gibbs_attention_modules,
     run_hooked,
 )
+from transformer_surgery.cli.surgery_config import SupportRouting
 from transformer_surgery.internal.reporting import log_line
 from transformer_surgery.internal.util import get_device
 from transformer_surgery.ops import QueryCentroidRouter
@@ -38,13 +39,64 @@ from transformer_surgery.ops import QueryCentroidRouter
 if TYPE_CHECKING:
     from transformer_surgery.cli.surgery_config import SurgeryConfig
 
-SUPPORT_ROUTINGS = ("topk", "query_centroids")
+SUPPORT_ROUTINGS = get_args(SupportRouting)
+
+
+@dataclass
+class KMeansFit:
+    """Per-head k-means result: centroids [H, C, D], inertia relative to the mean squared query norm, empty clusters."""
+
+    centroids: torch.Tensor
+    relative_inertia: torch.Tensor
+    empty_clusters: torch.Tensor
+
+
+@dataclass
+class CentroidFit:
+    """Fit quality of one block's centroids (metadata ``routing_fit_by_block`` entry)."""
+
+    samples_per_head: int
+    relative_inertia_by_head: List[float]
+    empty_clusters_by_head: List[int]
+
+
+@dataclass
+class SupportSummary:
+    """Routed vs exact top-k support of one block over rows with more valid keys than ``top_k``."""
+
+    rows: int
+    mass_topk: float
+    mass_routed: float
+    recall: float
+    tail_routed: float
+    tail_routed_std_by_head: List[float]
+    mass_topk_by_head: List[float]
+    mass_routed_by_head: List[float]
+    recall_by_head: List[float]
+    mass_ratio_min_head: float
+
+
+@dataclass
+class RoutingCalibration:
+    """Query-centroid routing fit and support diagnostics (metadata ``calibration`` keys)."""
+
+    support_routing: Literal["query_centroids"]
+    routing_clusters: int
+    routing_fit_batches: int
+    routing_fit_by_block: List[CentroidFit]
+    routing_train_batches: int
+    routing_val_batches: int
+    routing_train_by_block: List[SupportSummary]
+    routing_val_by_block: List[SupportSummary]
+    routing_val_mass_topk: float
+    routing_val_mass_routed: float
+    routing_val_recall: float
+    # Mean tail mass of the routed support per block: the calibrated tail masses of the routed model.
+    routing_train_tail_routed_by_block: List[float]
 
 
 @torch.no_grad()
-def kmeans_per_head(
-    x: torch.Tensor, clusters: int, iters: int, generator: torch.Generator
-) -> Dict[str, torch.Tensor]:
+def kmeans_per_head(x: torch.Tensor, clusters: int, iters: int, generator: torch.Generator) -> KMeansFit:
     """k-means++ then Lloyd iterations, batched over heads. ``x``: [H, n, D] float32."""
     h, n, _ = x.shape
     c_count = min(int(clusters), n)
@@ -76,11 +128,7 @@ def kmeans_per_head(
     counts = torch.nn.functional.one_hot(dist.argmin(-1), c_count).to(x.dtype).sum(1)
     q_sq = x_sq.squeeze(-1).mean(-1)
     inertia = dist.min(-1).values.clamp_min(0.0).mean(-1)
-    return {
-        "centroids": cent,
-        "relative_inertia": inertia / q_sq.clamp_min(1e-30),
-        "empty_clusters": (counts == 0).sum(-1),
-    }
+    return KMeansFit(cent, inertia / q_sq.clamp_min(1e-30), (counts == 0).sum(-1))
 
 
 def _collect_queries(
@@ -143,25 +191,24 @@ class _SupportStats:
         self.recall += (recall * rows).sum(dims).cpu()
         self.tail_routed_sq += (tail_r.pow(2) * rows).sum(dims).cpu()
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> SupportSummary:
         n = self.rows.clamp_min(1.0)
         mass_o = self.mass_topk / n
         mass_r = self.mass_routed / n
-        tail_mean = 1.0 - mass_r
-        tail_var = (self.tail_routed_sq / n - tail_mean.pow(2)).clamp_min(0.0)
+        tail_var = (self.tail_routed_sq / n - (1.0 - mass_r).pow(2)).clamp_min(0.0)
         total = float(self.rows.sum().clamp_min(1.0))
-        return {
-            "rows": int(self.rows.sum()),
-            "mass_topk": float(self.mass_topk.sum()) / total,
-            "mass_routed": float(self.mass_routed.sum()) / total,
-            "recall": float(self.recall.sum()) / total,
-            "tail_routed": 1.0 - float(self.mass_routed.sum()) / total,
-            "tail_routed_std_by_head": [float(v) for v in tail_var.sqrt()],
-            "mass_topk_by_head": [float(v) for v in mass_o],
-            "mass_routed_by_head": [float(v) for v in mass_r],
-            "recall_by_head": [float(v) for v in self.recall / n],
-            "mass_ratio_min_head": float((mass_r / mass_o.clamp_min(1e-30)).min()),
-        }
+        return SupportSummary(
+            rows=int(self.rows.sum()),
+            mass_topk=float(self.mass_topk.sum()) / total,
+            mass_routed=float(self.mass_routed.sum()) / total,
+            recall=float(self.recall.sum()) / total,
+            tail_routed=1.0 - float(self.mass_routed.sum()) / total,
+            tail_routed_std_by_head=tail_var.sqrt().tolist(),
+            mass_topk_by_head=mass_o.tolist(),
+            mass_routed_by_head=mass_r.tolist(),
+            recall_by_head=(self.recall / n).tolist(),
+            mass_ratio_min_head=float((mass_r / mass_o.clamp_min(1e-30)).min()),
+        )
 
 
 def _support_stats_pass(
@@ -171,7 +218,7 @@ def _support_stats_pass(
     loader: DataLoader,
     batch_indices: Sequence[int],
     top_k: int,
-) -> List[Dict[str, Any]]:
+) -> List[SupportSummary]:
     acc = [_SupportStats(a.num_heads) for a in attns]
     stash: Dict[int, Any] = {}
 
@@ -198,26 +245,26 @@ def install_routers_from_state_dict(model: nn.Module, state_dict: Dict[str, Any]
             m.router = QueryCentroidRouter(torch.zeros(state_dict[key].shape))
 
 
-def _pooled(blocks: Sequence[Dict[str, Any]], key: str) -> float:
-    rows = sum(b["rows"] for b in blocks)
-    return sum(b[key] * b["rows"] for b in blocks) / max(1, rows)
+def _pooled(blocks: Sequence[SupportSummary], values: Sequence[float]) -> float:
+    """Row-weighted mean over blocks."""
+    return sum(v * b.rows for b, v in zip(blocks, values)) / max(1, sum(b.rows for b in blocks))
 
 
 @torch.no_grad()
 def calibrate_support_routing(
     model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, cfg: "SurgeryConfig"
-) -> Dict[str, Any]:
-    """Fit query centroids, install routers, and (calibrated mode) apply the routed tail mass."""
+) -> Optional[RoutingCalibration]:
+    """Fit query centroids and install the routers; None for ``support_routing="topk"``."""
     if cfg.support_routing not in SUPPORT_ROUTINGS:
         raise ValueError(f"support_routing must be one of {SUPPORT_ROUTINGS}, got {cfg.support_routing!r}")
     if cfg.support_routing == "topk":
-        return {}
+        return None
     attns = [a for a in gibbs_attention_modules(model) if hasattr(a, "router")]
     if not attns:
         raise ValueError("support_routing needs surgery attention with the surgery softmax")
     device = get_device()
     cpu_gen = torch.Generator().manual_seed(cfg.routing_seed)
-    fit: List[Dict[str, Any]] = []
+    fit: List[CentroidFit] = []
     routers: List[nn.Module] = []
     with dense_gibbs(attns):
         fit_batches = calibration_batch_indices(
@@ -227,64 +274,43 @@ def calibrate_support_routing(
         for bi, xq in enumerate(queries):
             dev_gen = torch.Generator(device=device).manual_seed(cfg.routing_seed + 1000 * (bi + 1))
             km = kmeans_per_head(xq.to(device), cfg.routing_clusters, cfg.routing_kmeans_iters, dev_gen)
-            routers.append(QueryCentroidRouter(km["centroids"]).to(device))
-            fit.append(
-                {
-                    "samples_per_head": int(xq.shape[1]),
-                    "relative_inertia_by_head": [float(v) for v in km["relative_inertia"]],
-                    "empty_clusters_by_head": [int(v) for v in km["empty_clusters"]],
-                }
-            )
+            routers.append(QueryCentroidRouter(km.centroids).to(device))
+            fit.append(CentroidFit(int(xq.shape[1]), km.relative_inertia.tolist(), km.empty_clusters.tolist()))
         cal_batches = calibration_batch_indices(len(train_loader), cfg.gibbs_tail_calibration_batches)
         train_blocks = _support_stats_pass(model, attns, routers, train_loader, cal_batches, cfg.top_k)
         val_batches = calibration_batch_indices(len(val_loader), cfg.routing_eval_batches)
         val_blocks = _support_stats_pass(model, attns, routers, val_loader, val_batches, cfg.top_k)
     for a, r in zip(attns, routers):
         a.router = r
-
-    stats: Dict[str, Any] = {
-        "support_routing": cfg.support_routing,
-        "routing_clusters": cfg.routing_clusters,
-        "routing_fit_batches": len(fit_batches),
-        "routing_fit_by_block": fit,
-        "routing_train_batches": len(cal_batches),
-        "routing_val_batches": len(val_batches),
-        "routing_train_by_block": train_blocks,
-        "routing_val_by_block": val_blocks,
-        "routing_val_mass_topk": _pooled(val_blocks, "mass_topk"),
-        "routing_val_mass_routed": _pooled(val_blocks, "mass_routed"),
-        "routing_val_recall": _pooled(val_blocks, "recall"),
-        "routing_train_tail_routed_by_block": [b["tail_routed"] for b in train_blocks],
-    }
-    # Calibrated mode: the routed support's mean tail mass replaces the top-k one.
-    routed_tail = {
-        "use_exact_tail_mass": cfg.use_exact_tail_mass,
-        "disable_calib_gibbs_tail_prob": cfg.disable_calib_gibbs_tail_prob,
-        "gibbs_tail_prob_eps_calibrated_by_block": stats["routing_train_tail_routed_by_block"],
-    }
-    stats.update(apply_gibbs_tail_calibration(model, routed_tail))
-    return stats
-
-
-def log_support_routing(stats: Dict[str, Any]) -> None:
-    if not stats:
-        return
-    log_line(
-        f"Support routing={stats['support_routing']} clusters={stats['routing_clusters']} "
-        f"fit_batches={stats['routing_fit_batches']} val_batches={stats['routing_val_batches']}"
+    return RoutingCalibration(
+        support_routing="query_centroids",
+        routing_clusters=cfg.routing_clusters,
+        routing_fit_batches=len(fit_batches),
+        routing_fit_by_block=fit,
+        routing_train_batches=len(cal_batches),
+        routing_val_batches=len(val_batches),
+        routing_train_by_block=train_blocks,
+        routing_val_by_block=val_blocks,
+        routing_val_mass_topk=_pooled(val_blocks, [b.mass_topk for b in val_blocks]),
+        routing_val_mass_routed=_pooled(val_blocks, [b.mass_routed for b in val_blocks]),
+        routing_val_recall=_pooled(val_blocks, [b.recall for b in val_blocks]),
+        routing_train_tail_routed_by_block=[b.tail_routed for b in train_blocks],
     )
-    for bi, (b, f) in enumerate(zip(stats["routing_val_by_block"], stats["routing_fit_by_block"])):
-        inertia = sum(f["relative_inertia_by_head"]) / max(1, len(f["relative_inertia_by_head"]))
+
+
+def log_support_routing(routing: RoutingCalibration) -> None:
+    log_line(
+        f"Support routing={routing.support_routing} clusters={routing.routing_clusters} "
+        f"fit_batches={routing.routing_fit_batches} val_batches={routing.routing_val_batches}"
+    )
+    for bi, (b, f) in enumerate(zip(routing.routing_val_by_block, routing.routing_fit_by_block)):
+        inertia = sum(f.relative_inertia_by_head) / max(1, len(f.relative_inertia_by_head))
         log_line(
-            f"  block {bi}: val mass topk={b['mass_topk']:.4f} routed={b['mass_routed']:.4f} "
-            f"recall={b['recall']:.4f} min_head_ratio={b['mass_ratio_min_head']:.4f} "
+            f"  block {bi}: val mass topk={b.mass_topk:.4f} routed={b.mass_routed:.4f} "
+            f"recall={b.recall:.4f} min_head_ratio={b.mass_ratio_min_head:.4f} "
             f"rel_inertia={inertia:.4f}"
         )
     log_line(
-        f"Support routing val pooled: mass topk={stats['routing_val_mass_topk']:.4f} "
-        f"routed={stats['routing_val_mass_routed']:.4f} recall={stats['routing_val_recall']:.4f}"
+        f"Support routing val pooled: mass topk={routing.routing_val_mass_topk:.4f} "
+        f"routed={routing.routing_val_mass_routed:.4f} recall={routing.routing_val_recall:.4f}"
     )
-    applied = stats.get("gibbs_tail_prob_eps_applied_by_block")
-    if applied:
-        values = ", ".join(f"{v:.6g}" for v in applied)
-        log_line(f"Routed calibrated gibbs_tail_prob_eps by block: [{values}]")
