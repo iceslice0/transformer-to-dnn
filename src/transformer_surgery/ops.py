@@ -88,6 +88,14 @@ class AffineScale(nn.Module):
         return x * self.scale.to(device=x.device, dtype=x.dtype)
 
 
+class OutputIdentity(AffineScale):
+    """Identity at the model output. PTQ adds it (``quantize_output``) so that its input quantizer, the output
+    quantizer of the last node, quantizes the model output; it is not part of the surgery graph."""
+
+    def __init__(self) -> None:
+        super().__init__(1.0)
+
+
 class AffineHadamard(nn.Module):
     """Elementwise / broadcast product ``a * b``; both operands are tensors (bilinear, no ``@``)."""
 
@@ -1252,6 +1260,22 @@ def ptq_quantize_proxy(x: torch.Tensor, scale: torch.Tensor, bits: int) -> torch
     return torch.clamp(torch.round(x.to(dtype=torch.float32) / s), qmin, qmax)
 
 
+# fp32 holds every integer of magnitude at most 2^24 exactly, so an integer sum whose partial sums stay within it is
+# exact.
+PTQ_FP32_EXACT_INT = float(2**24)
+
+
+def ptq_check_fp32(where: str, *tensors: torch.Tensor) -> None:
+    """The PTQ simulation evaluates every unit in fp32 with autocast off: integer codes and their sums stay exact, and
+    no producer output is rounded to a narrower float format before the next quantizer."""
+    for device_type in ("cuda", "cpu"):
+        if torch.is_autocast_enabled(device_type):
+            raise RuntimeError(f"PTQ {where}: {device_type} autocast is on; the PTQ simulation runs in fp32")
+    for t in tensors:
+        if t.dtype != torch.float32:
+            raise RuntimeError(f"PTQ {where}: dtype {t.dtype}; the PTQ simulation runs in fp32")
+
+
 class PTQInputQuantizer(nn.Module):
     """Signed integer codes of each input on its own grid ``input_scale[i]`` at this node's width."""
 
@@ -1263,6 +1287,7 @@ class PTQInputQuantizer(nn.Module):
         self.register_buffer("input_inv_scale", input_scale.reciprocal().to(dtype=torch.float32))
 
     def forward(self, *inputs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        ptq_check_fp32("quantizer input", *inputs)
         return tuple(
             torch.clamp(torch.round(x.float() * self.input_inv_scale[i]), self._qmin, self._qmax)
             for i, x in enumerate(inputs)
@@ -1270,10 +1295,15 @@ class PTQInputQuantizer(nn.Module):
 
 
 class CalibratedAffinePTQWrapper(nn.Module):
-    """Forward-only PTQ proxy: quantize the inputs, accumulate, dequantize the output.
+    """Forward-only PTQ simulation: quantize the inputs to integer codes, accumulate, apply the output map.
 
     Each producer/consumer boundary is quantized once, at the selected consumer, with that consumer's width and input
-    scale; unary and routing nodes in between run in floating point. Integer codes are stored in float32 tensors.
+    scale, so it is also the producer's output quantizer. ``activation_bits`` is that input-code width, not an
+    accumulator width. The graph between two quantizers (this wrapper's output map, then any unary, routing, sum or
+    mean nodes) is a unit with integer inputs and integer outputs; the simulation evaluates it in fp32, with integer
+    codes held in float32 tensors (``ptq_check_fp32``). Checkpoints written before 2026-10-17 fold the Linear/Conv2d
+    output scale into the weight (``skip_out_scale``); newer ones keep integer weight codes, so the accumulation of
+    integer codes is an exact integer sum.
     """
 
     def __init__(
@@ -1300,8 +1330,8 @@ class CalibratedAffinePTQWrapper(nn.Module):
         if getattr(self.accumulator, "ptq_dequantized_inputs", False):
             q = tuple(t * self.quantizer.input_scale[i] for i, t in enumerate(q))
         acc = self.accumulator(*q)
+        ptq_check_fp32("accumulation", acc)
         scale, bias = self.out_scale, self.out_bias
         if self.out_bcast_shape is not None:
             scale, bias = scale.view(self.out_bcast_shape), bias.view(self.out_bcast_shape)
-        out = acc + bias if self.skip_out_scale else scale * acc + bias
-        return out.to(dtype=inputs[0].dtype)
+        return acc + bias if self.skip_out_scale else scale * acc + bias

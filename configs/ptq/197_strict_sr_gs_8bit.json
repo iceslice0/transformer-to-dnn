@@ -17,7 +17,8 @@
   "exclude_names": [],
   "weight_bits": 8,
   "activation_bits": 8,
-  "compiled_accumulator_bits": 12,
+  "compiled_affine_input_bits": 12,
   "matmul_activation_bits": 8,
-  "per_output_channel": true
+  "per_output_channel": true,
+  "quantize_output": true
 }

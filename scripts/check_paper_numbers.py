@@ -62,7 +62,8 @@ def check_tables(PAPER: str, REPO: str, M: str) -> int:
             s = S(n)
             cmp(f"T2 k={k} {n} acc", num(cells[off])[0], 100*s["student_pre_ft_val_acc"], 0.005)
             cmp(f"T2 k={k} {n} lat", num(cells[off+1])[0], s["student_pre_ft_val_relative_slowdown_vs_ref"], 0.005)
-            cmp(f"T2 k={k} {n} mem", num(cells[off+2])[0], s["student_pre_ft_val_peak_gpu_mem_bytes"]/1e6, 0.5)
+            mr = s["student_pre_ft_val_peak_gpu_mem_bytes"] / s["ref_val_peak_gpu_mem_bytes"]
+            cmp(f"T2 k={k} {n} mem", num(cells[off+2])[0], mr, 0.005 if mr < 10 else 0.05)
     # Table 3
     for cells in table_rows("tab:ptq"):
         k = int(cells[0]); g = cells[2]
@@ -139,6 +140,26 @@ def check_tables(PAPER: str, REPO: str, M: str) -> int:
             v = by[f"topk16_{m}"].get(g)
             cmp(f"S4 {g} {m} ms", None if cells[1+i] == "--" else float(cells[1+i]), v["ms_per_batch"] if v else None, 0.05)
             cmp(f"S4 {g} {m} MiB", None if cells[6+i] == "--" else float(cells[6+i]), v["peak_extra_mib"] if v else None, 0.5)
+    # Table S9: bf16 against fp32 with all keys (make dtype-check)
+    dt = {(r["network"], r["model"], r["variant"]): r for r in json.load(open(f"{REPO}/artifacts/logs/dtype_check_2026-10-17/dtype_check.json"))}
+    net_of = {"DeiT-Tiny, Pet": ("DeiT-Tiny / Pet", 100, 2), "DeiT-Tiny, ImageNet-1k": ("DeiT-Tiny / ImageNet-1k", 100, 2),
+              "MambaIRv2-Light $\\times2$, Set5": ("MambaIRv2-Light x2 / Set5", 1, 3),
+              "MambaIRv2-Light $\\times4$, Set5": ("MambaIRv2-Light x4 / Set5", 1, 3),
+              "Pythia-70M, WikiText-2": ("Pythia-70M / WikiText-2", 1, 3)}
+    net = None
+    for cells in table_rows("tab:s-dtype"):
+        if cells[0]: net = net_of[cells[0]]
+        name, scale, nd = net
+        model = cells[1].replace("sigmoid GELU", "sigmoid GELU")
+        val = lambda r: scale * r.get("nll", r["primary"])
+        if model == "reference":
+            b, f = val(dt[(name, model, "bf16")]), val(dt[(name, model, "fp32")])
+        else:
+            b, f = val(dt[(name, model, "checkpoint bf16")]), val(dt[(name, model, "rebuild fp32")])
+        tol = 0.5 * 10 ** -nd + 1e-9
+        cmp(f"S9 {name} {model} bf16", float(cells[2]), round(b, nd), tol)
+        cmp(f"S9 {name} {model} fp32", float(cells[3]), round(f, nd), tol)
+        cmp(f"S9 {name} {model} diff", num(cells[4])[0], round(b - f, nd), tol)
     print(f"tables: checked {checked} cells, {bad} mismatches")
     return bad
 
@@ -181,24 +202,40 @@ def check_text(P: str, M: str) -> int:
         print(("OK  " if ok else "BAD ") + desc + (f"  [{detail}]" if detail else ""))
     def has(s, where=ALL): return s in where
     # models match
-    claim("Pet 91.74 vs 91.52", has("$91.74\\%$ against $91.52\\%$") and f"{acc('topk197_fast'):.2f}" == "91.74" and f"{100*S('topk197_fast')['ref_val_acc']:.2f}" == "91.52")
-    claim("ImageNet 72.02 vs 72.02", f"{acc('topk197_fast_imagenet'):.2f}" == "72.02" and f"{100*S('topk197_fast_imagenet')['ref_val_acc']:.2f}" == "72.02")
+    claim("Pet 91.66 vs 91.52", has("$91.66\\%$ against $91.52\\%$") and f"{acc('topk197_fast'):.2f}" == "91.66" and f"{100*S('topk197_fast')['ref_val_acc']:.2f}" == "91.52")
+    claim("ImageNet 72.01 vs 72.02", has("$72.01\\%$ against $72.02\\%$") and f"{acc('topk197_fast_imagenet'):.2f}" == "72.01" and f"{100*S('topk197_fast_imagenet')['ref_val_acc']:.2f}" == "72.02")
     mb4 = {r["k"]: r for r in json.load(open(f"{M}/mambair_x4_set5_by_k.json"))["rows"]}
     mbe = {r["k"]: r for r in json.load(open(f"{M}/mambair_x4_exact_set5_by_k.json"))["rows"]}
     mbd = {r["k"]: r for r in json.load(open(f"{M}/mambair_x4_tailmass0_set5_by_k.json"))["rows"]}
     claim("Set5 32.51 vs 32.51", f"{mb4[256]['pre_psnr']:.2f}" == "32.51" and f"{mb4[256]['ref_psnr']:.2f}" == "32.51", f"{mb4[256]['pre_psnr']:.3f}/{mb4[256]['ref_psnr']:.3f}")
     py = S("pythia_70m_topk128_fast_tailmass_exact"); claim("Pythia NLL 4.5496 vs 4.5496", f"{py['student_pre_ft_val_loss']:.4f}" == "4.5496" and f"{py['ref_val_loss']:.4f}" == "4.5496")
     gap = max(abs(acc(f"topk{k}_strict_sr") - acc(f"topk{k}_fast")) for k in (16, 32, 64, 197)); claim("strict within 1.6 of extended (Table 2)", gap <= 1.6, f"{gap:.2f}")
-    le = [lat(f"topk{k}_fast") for k in KS]; claim("extended latency 0.94..1.01", f"{min(le):.2f}" == "0.94" and f"{max(le):.2f}" == "1.01", f"{min(le):.3f}..{max(le):.3f}")
+    le = [lat(f"topk{k}_fast") for k in KS] + [lat(f"topk{k}_fast_qc32") for k in (16, 32, 64)]; claim("extended latency 0.90..1.04, both supports", f"{min(le):.2f}" == "0.90" and f"{max(le):.2f}" == "1.04" and has("$0.90$ to $1.04$ times the reference latency in every row"), f"{min(le):.3f}..{max(le):.3f}")
+    lh = [lat(f"topk{k}_hadamard_sr_gs{s}") for k in (16, 32, 64) for s in ("", "_qc32")]; claim("intro: Hadamard 1.0..1.1x for k<=64, both supports", f"{min(lh):.1f}" == "1.0" and f"{max(lh):.1f}" == "1.1" and has("$1.0$ to $1.1$ times the reference latency for $k\\le64$"), f"{min(lh):.3f}..{max(lh):.3f}")
     ls = [lat(f"topk{k}_strict_sr_gs") for k in (16, 32, 64, 197)]; claim("strict 1.1..2.8x", f"{min(ls):.1f}" == "1.1" and f"{max(ls):.1f}" == "2.8", f"{min(ls):.3f}..{max(ls):.3f}")
-    claim("2.3x memory at k=64", f"{mem('topk64_strict_sr_gs')/mem('topk64_fast'):.1f}" == "2.3")
-    claim("strict 90.54 / ext 91.74 all keys", f"{acc('topk197_strict_sr_gs'):.2f}" == "90.54")
+    claim("2.3x memory at top-64", f"{mem('topk64_strict_sr_gs')/mem('topk64_fast'):.1f}" == "2.3" and has("at top-$64$ it uses $2.3$ times the peak memory"))
+    claim("strict 90.54 / ext 91.66 all keys", f"{acc('topk197_strict_sr_gs'):.2f}" == "90.54" and f"{acc('topk197_fast'):.2f}" == "91.66")
     g = [acc(f"topk{k}_strict_sr") - acc(f"topk{k}_strict_sr_gs") for k in (16, 32, 64, 197)]; claim("GELU costs strict 0.7..2.0", f"{min(g):.1f}" == "0.7" and f"{max(g):.1f}" == "2.0" and has("strict graph $0.7$ to $2.0$ points"), ", ".join(f"{x:.2f}" for x in g))
     # PTQ ranges
     def pt(k, m): x = json.load(open(f"{M}/ts_ptq_{k}_{m}_8bit.json"))["metrics"]; return 100*(x["ptq_val_acc"] - x["fp_val_acc"])
-    for m, lo, hi in (("strict_sr_gs", "-0.68", "-0.03"), ("strict_sr_gs_pertensor", "-1.88", "+0.03"), ("strict_sr", "-0.84", "-0.41"), ("strict_sr_pertensor", "-0.84", "+0.03")):
-        d = [pt(k, m) for k in (16, 32, 64, 197)]; claim(f"PTQ {m} {lo}..{hi}", f"{min(d):+.2f}" == lo and f"{max(d):+.2f}" == hi, ", ".join(f"{x:+.2f}" for x in d))
-    d = [pt(k, m) for k in (16, 32, 64, 197) for m in ("fast_jeffreys", "fast_jeffreys_pertensor")]; claim("PTQ extended -2.9..-4.0", f"{max(d):.1f}" == "-2.9" and f"{min(d):.1f}" == "-4.0", f"{min(d):.2f}..{max(d):.2f}")
+    # PTQ (2026-10-17 rerun: fp32 simulation, bf16 reference, 8-bit logits)
+    for m, lo, hi, text in (
+        ("strict_sr_gs", "-1.06", "-0.03", "strict graph by $-1.06$ to $-0.03$ points with per-channel"),
+        ("strict_sr_gs_pertensor", "-0.57", "+0.11", "and by $-0.57$ to $+0.11$ with one scale per weight tensor"),
+        ("strict_sr", "-1.14", "+0.00", "by $-1.14$ to $0.00$ points with per-channel weight scales"),
+        ("strict_sr_pertensor", "-0.87", "-0.60", "and by $-0.87$ to $-0.60$ points with per-tensor scales"),
+    ):
+        d = [pt(k, m) for k in (16, 32, 64, 197)]
+        claim(f"PTQ {m} {lo}..{hi}", f"{min(d):+.2f}" == lo and f"{max(d):+.2f}" == hi and has(text), ", ".join(f"{x:+.2f}" for x in d))
+    d = [pt(k, m) for k in (16, 32, 64, 197) for m in ("fast_jeffreys", "fast_jeffreys_pertensor")]
+    claim("PTQ extended -2.8..-3.8", f"{max(d):.1f}" == "-2.8" and f"{min(d):.1f}" == "-3.8" and has("changes accuracy by $-2.8$ to $-3.8$ points"), f"{min(d):.2f}..{max(d):.2f}")
+    ptq_runs = [json.load(open(f"{M}/ts_ptq_{k}_{m}_8bit.json")) for k in (16, 32, 64, 197)
+                for m in ("strict_sr_gs", "strict_sr_gs_pertensor", "fast_jeffreys", "fast_jeffreys_pertensor", "strict_sr", "strict_sr_pertensor")]
+    oq = [100*(r["metrics"]["ptq_val_acc"] - r["metrics"]["ptq_val_acc_unquantized_output"]) for r in ptq_runs]
+    claim("8-bit logits change accuracy by -0.22..+0.19", f"{min(oq):+.2f}" == "-0.22" and f"{max(oq):+.2f}" == "+0.19" and has("Quantizing the logits changes accuracy by $-0.22$ to $+0.19$ points"), f"{min(oq):+.2f}..{max(oq):+.2f}")
+    bound = max(n["integer_sum_bound"] or 0 for r in ptq_runs for n in r["ptq_nodes"])
+    claim("integer sums below 4.5e6 < 2^24", bound < 4.5e6 and has("stays below $4.5\\times10^{6}$"), f"{bound:.4g}")
+    claim("all PTQ runs fp32, 8-bit logits", all(r["quantization"]["simulation_dtype"] == "float32" and r["quantization"]["quantize_output"] and r["quantization"]["output_bits"] == 8 for r in ptq_runs))
     # tail mass text
     dj = lambda k: D(k, "jeffreys")["student_post_distill_runs"][0]["baseline_val_jeffreys_mean"]
     claim("DJ 0.97 k=8, 0.045 k=64, 2e-4 k=197", f"{dj(8):.2f}" == "0.97" and f"{dj(64):.3f}" == "0.045" and f"{dj(197):.0e}" == "2e-04", f"{dj(8):.4f} {dj(64):.5f} {dj(197):.2e}")
@@ -227,9 +264,11 @@ def check_text(P: str, M: str) -> int:
     claim("Pythia k=16,32 exact within 0.002 of drop at 2k", all(abs(pn(k, "tailmass_exact") - pn(2*k, "tailmass0")) <= 0.002 for k in (16, 32)), ", ".join(f"{pn(k,'tailmass_exact') - pn(2*k,'tailmass0'):+.4f}" for k in (16, 32)))
     # clustered
     pw = lambda n: S(n)["student_pointwise_per_input"]
-    claim("routed k=16: 148 vs 548 MB, 78.47 vs 83.97, latency 1.2x", f"{lat('topk16_strict_sr_gs_qc32'):.1f}" == "1.2" and f"{mem('topk16_strict_sr_gs_qc32'):.0f}" == "148" and f"{mem('topk16_strict_sr_gs'):.0f}" == "548" and f"{acc('topk16_strict_sr_gs_qc32'):.2f}" == "78.47" and f"{acc('topk16_strict_sr_gs'):.2f}" == "83.97")
+    rm = lambda n: S(n)["student_pre_ft_val_peak_gpu_mem_bytes"]/S(n)["ref_val_peak_gpu_mem_bytes"]
+    claim("routed k=16: 2.1x vs 7.9x reference memory, 78.47 vs 83.97, latency 1.2x", f"{lat('topk16_strict_sr_gs_qc32'):.1f}" == "1.2" and f"{rm('topk16_strict_sr_gs_qc32'):.1f}" == "2.1" and f"{rm('topk16_strict_sr_gs'):.1f}" == "7.9" and has("uses $2.1\\times$ instead of $7.9\\times$ the reference memory") and f"{acc('topk16_strict_sr_gs_qc32'):.2f}" == "78.47" and f"{acc('topk16_strict_sr_gs'):.2f}" == "83.97")
     claim("unary 2.4e7 vs 1.1e8", f"{pw('topk16_strict_sr_gs_qc32'):.1e}" == "2.4e+07" and f"{pw('topk16_strict_sr_gs'):.1e}" == "1.1e+08")
     claim("k=32 routed 86.18 >= exact top-16 83.97; 37% unary; 42% memory", acc("topk32_strict_sr_gs_qc32") >= acc("topk16_strict_sr_gs") and round(pw("topk32_strict_sr_gs_qc32")/pw("topk16_strict_sr_gs"), 2) == 0.37 and round(mem("topk32_strict_sr_gs_qc32")/mem("topk16_strict_sr_gs"), 2) == 0.42, f"unary ratio {pw('topk32_strict_sr_gs_qc32')/pw('topk16_strict_sr_gs'):.3f} mem ratio {mem('topk32_strict_sr_gs_qc32')/mem('topk16_strict_sr_gs'):.3f}")
+    cut = 1 - mem("topk16_hadamard_sr_gs_qc32")/mem("topk16_hadamard_sr_gs"); claim("routing cuts Hadamard memory by 73% at k=16", f"{100*cut:.0f}" == "73" and has("memory by $73\\%$ at $k=16$"), f"{100*cut:.1f}%")
     print(f"text: {bad} claims failed")
     return bad
 

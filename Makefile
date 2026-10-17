@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -165,8 +165,15 @@ mix-precision: artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/ch
 	mkdir -p $(MIX_PRECISION_LOG)
 	$(PYTHON) scripts/mix_precision.py 16 197 | tee $(MIX_PRECISION_LOG)/mix_precision.log
 
-# Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit inputs of the compiled
-# affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).
+# bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph (paper
+# Supplementary). Reads the existing k = N surgery checkpoints; no prerequisites, so it never rebuilds them.
+DTYPE_CHECK_LOG := artifacts/logs/dtype_check_2026-10-17
+dtype-check:
+	mkdir -p $(DTYPE_CHECK_LOG)
+	$(PYTHON) scripts/dtype_check.py $(DTYPE_CHECK_LOG)/dtype_check.json | tee $(DTYPE_CHECK_LOG)/dtype_check.log
+
+# Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit input codes of the
+# compiled affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).
 PTQ_BALANCE_LOG := artifacts/logs/ptq_balance_2026-10-11
 ptq-balance-check: artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr_gs.pt
 	mkdir -p $(PTQ_BALANCE_LOG)
@@ -217,6 +224,7 @@ help:
 	@echo "  make exact-fp64   # float64 end-to-end check of exact compilation (k=197)"
 	@echo "  make strict-sr    # strict graph without exp/log (+GELU approx) and routed strict"
 	@echo "  make ptq-strict-sr # 8-bit PTQ of the new strict graphs"
+	@echo "  make dtype-check   # bf16 vs fp32 at k = N, all networks (reference and compiled graphs)"
 	@echo "  make hadamard-sr  # Hadamard graph: elementwise products instead of polarization (sigmoid, rsqrt)"
 	@echo "  make exact-fp64-hadamard # float64 check of the Hadamard graph (k=197)"
 	@echo "  make profile-hadamard # per-module GPU profile of the Hadamard graph (k=16,32,64)"
@@ -286,7 +294,8 @@ $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_pertensor_8bit,ts_sur
 $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_8bit,ts_surgery_topk$(k)_strict_sr_gs)))
 $(foreach k,$(SR_KS),$(eval $(call PTQ_RULE,$(k)_strict_sr_gs_pertensor_8bit,ts_surgery_topk$(k)_strict_sr_gs)))
 # Brent scaling at model level (seeded PTQ calibration): strict graph with GELU ~ x*sigmoid(1.702x), k = 16, 64, 197,
-# compiled accumulators of 12 or 10 bits, without and with brent_scaling, per-channel first, then per-tensor.
+# 12- or 10-bit input codes on the compiled fixed affine nodes (compiled_affine_input_bits; "acc12"/"acc10" in the
+# config names), without and with brent_scaling, per-channel first, then per-tensor.
 PTQ_BRENT_NAMES := \
 	16_strict_sr_gs_acc12_8bit 16_strict_sr_gs_acc12_brent_8bit 16_strict_sr_gs_acc10_8bit 16_strict_sr_gs_acc10_brent_8bit \
 	64_strict_sr_gs_acc12_8bit 64_strict_sr_gs_acc12_brent_8bit 64_strict_sr_gs_acc10_8bit 64_strict_sr_gs_acc10_brent_8bit \

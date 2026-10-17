@@ -39,15 +39,16 @@ fields are:
 - calibration uses the full training loader (aggregated streaming statistics; no sampled-batch cache).
 - selection fields: `wrap_linear_conv`, `wrap_affine`, `wrap_matmul`, `include_names`,
   `exclude_names`.
-- quantization fields: `weight_bits`, `activation_bits`, `compiled_accumulator_bits`,
+- quantization fields: `weight_bits`, `activation_bits`, `compiled_affine_input_bits`,
   `matmul_activation_bits`, `per_output_channel`, `dequant_var_eps`.
   Bit widths of the integer codes entering each quantized node, in three groups: `activation_bits` for the
-  `Linear`/`Conv2d` layers inherited from the source model; `compiled_accumulator_bits` for the compiled
-  accumulators, the fixed affine nodes (`AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` and its
-  subclasses) that compilation introduces when it splits LayerNorm, softmax and attention; and
-  `matmul_activation_bits` for `AffineMatMul`/`AffineHadamard`. The last two fall back to `activation_bits` when
-  unset. The paper's strict configs use `compiled_accumulator_bits=12` for the wider range of squares and sums
-  of squares; bit-width sweep configs also test other widths. This override affects only selected compiled
+  `Linear`/`Conv2d` layers inherited from the source model; `compiled_affine_input_bits` for the fixed affine nodes
+  (`AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` and its subclasses): the nodes that
+  compilation adds when it splits LayerNorm, softmax and attention, and the residual and position-embedding
+  additions; and `matmul_activation_bits` for `AffineMatMul`/`AffineHadamard`.
+  The last two fall back to `activation_bits` when unset. Every width is an input-code width; no field sets the
+  width of an accumulator. The paper's strict configs use `compiled_affine_input_bits=12`, since the inputs of these
+  nodes include squares and sums of squares; bit-width sweep configs also test other widths. This override affects only selected compiled
   fixed-affine nodes. It does not change weight precision or the Linear/Conv and MatMul/Hadamard input widths.
   Quantization is applied once per boundary, at the consuming node's input. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
   its own multiplier before the sum, as in an integer Add with per-input multipliers. The strict baseline coefficients
@@ -78,8 +79,10 @@ Supported node kinds:
 - `AffineScale`, `AffineScaleBias`, `AffineFixedMix`, `AffineContract` when `wrap_affine=true`.
 - `AffineMatMul`, `AffineHadamard` when `wrap_matmul=true`.
 
-Routing ops, nonlinear unary ops, top-k/gather wiring, dropout, and other non-affine modules are
-not PTQ-wrapped.
+Routing ops, nonlinear unary ops, plain sums and means (`AffineSum`, `AffineMean`), top-k/gather wiring, dropout,
+and other non-affine modules have no quantizer of their own; they sit inside the integer units described below.
+A plain sum or mean adds integer codes with fixed scales (or their squares), so its result is an integer with a fixed
+scale. It keeps its full integer range and is not rounded to a specific bit width; the next quantizer sets the width.
 
 ## Calibration
 
@@ -94,8 +97,37 @@ Per node:
 - running residual or OLS moments for dequantization;
 - aggregated example counts.
 
-The float validation pass reports `fp_val_acc` and `fp_val_loss`. If any selected node receives no
-statistics on the calibration passes, PTQ stops before writing a wrapped checkpoint.
+The float validation pass reports `fp_val_acc` and `fp_val_loss`. The float model is the reference: it keeps the
+checkpoint's surgery dtype (bf16 under autocast, as in every other experiment) through both calibration passes, so the
+ranges come from its activations and the output maps are fitted against its outputs. Inside each calibration hook the
+node's quantized accumulation runs in fp32 with autocast off. Only the copy that becomes the PTQ model moves to fp32. If
+any selected node receives no statistics on the calibration passes, PTQ stops before writing a wrapped checkpoint.
+
+### fp32 simulation and its checks (since 2026-10-17)
+
+Before 2026-10-17 the PTQ runs used the checkpoint's bf16 autocast. Autocast runs `einsum`, `linear`, `matmul` and
+`conv` in bf16, which holds integers exactly only up to 256: it rounded 12-bit input codes inside the fixed affine
+nodes, and every wrapper cast its output back to bf16 before the next quantizer. The quantized model and the quantized
+accumulations of calibration now run in fp32, which holds every integer up to 2^24, and this is checked at run time
+(`ops.ptq_check_fp32`); the float reference stays bf16:
+
+- every quantizer input and every accumulation is a float32 tensor, with CPU and CUDA autocast off;
+- every floating parameter and buffer of the PTQ model is float32 (`ptq.to_fp32_simulation`);
+- the calibration pass records, per node with integer inputs, the largest `sum_i |q_i| |w_i|` over the data
+  (`integer_sum_bound` in the metadata), which bounds every partial sum of the integer accumulation; PTQ stops if it
+  exceeds 2^24 (`check_ptq_integer_sums`). `AffineCombine` rescales its codes before the sum (an integer Add with
+  per-input multipliers) and has no bound.
+
+## Model output
+
+With `quantize_output=true`, PTQ routes the model output through an identity node `ptq_output` (`OutputIdentity`,
+added by a forward hook at PTQ time, so the surgery checkpoint is unchanged). Its input quantizer is the output
+quantizer of the last node: the model output (the logits of DeiT-Tiny) becomes `output_bits` codes (default
+`activation_bits`) with one symmetric scale, and the identity's output map returns them as a fixed affine map of these
+codes. The run also validates the reloaded PTQ model with the identity bypassed and records it as
+`ptq_val_acc_unquantized_output`, so the cost of quantizing the output is measured in the same run. Without it, the last
+node's output map applied to its integer sum is the model output, as in the PTQ protocols that quantize the weights
+and inputs of every linear layer (QDrop, PTQ4ViT, RepQ-ViT).
 
 ## Quantization
 
@@ -114,18 +146,22 @@ Weights use the same signed symmetric estimator. For `Linear` and `Conv2d`,
 `per_output_channel=false`, one global scale is used. Affine coefficient tensors always use one
 global scale. `AffineMatMul` and `AffineHadamard` have no stored weight tensor.
 
-The wrapper forward path quantizes inputs with proxy integer tensors, runs its explicit accumulator
-submodule, then dequantizes back to the incoming float dtype.
+The wrapper forward path quantizes inputs to integer codes held in float32 tensors, runs its explicit accumulator
+submodule on them, and applies its output map; everything stays in fp32.
 
-### Meaning of "12-bit compiled accumulators"
+### Meaning of the 12-bit setting
 
-The paper uses this phrase as shorthand for the compiled accumulator nodes' input/output precision.
-The implementation places quantization at each selected node's input:
+The paper says: "the fixed affine nodes of the strict graph take 12-bit inputs".
+`compiled_affine_input_bits=12` sets the input grid of those nodes. Quantization sits at each selected node's input:
 
 ```text
-input -> quantize on this node's grid -> accumulator -> affine dequantization
-      -> optional unary/routing nodes -> quantize on the next selected node's grid
+integer input codes -> integer products and sums -> output map (scale, bias)
+      -> optional unary/routing/sum/mean nodes -> quantize to the next selected node's integer codes
 ```
+
+A consumer's input quantizer is also its producer's output quantizer, so the graph between two quantizers is a unit
+with integer inputs and integer outputs. Without an intervening unary node, the output map and the next quantizer
+form the requantization of integer inference (a fixed multiplier and offset).
 
 For the paper's strict settings, selected compiled fixed-affine nodes use 12-bit input codes;
 Linear/Conv and MatMul/Hadamard nodes use their separately configured widths, normally 8 bits.
@@ -133,8 +169,8 @@ Weights keep `weight_bits`, normally 8. A consumer's width is not inherited from
 At a boundary between quantized nodes, the producer's output is the consumer's input. The consumer
 quantizes that boundary once, on its own grid; a second quantizer at the producer's output would
 duplicate the boundary operation. When unary or routing nodes intervene, the next selected node's
-input quantizer follows those operations, as described in the paper's Methods. Integer codes are
-stored in float32 tensors; the storage dtype alone does not change an integer-code mapping.
+input quantizer follows those operations, as described in the paper's Methods. The simulation holds
+integer codes in float32 tensors and evaluates each unit in fp32, where integer sums up to 2^24 are exact.
 See `ptq_activation_bits` for group selection and `CalibratedAffinePTQWrapper.forward`
 for quantizer placement.
 
@@ -147,8 +183,9 @@ out_scale = input_scale * weight_scale
 ```
 
 Only output bias is calibrated as the mean residual between the float teacher output and the
-scaled integer accumulator. The scale is baked into `q_weight` for these nodes, so the forward path
-does not need a separate output multiply.
+scaled integer accumulator. The accumulator keeps the integer weight codes, so it computes an exact integer sum, and
+the output map applies `out_scale` and the bias. Checkpoints written before 2026-10-17 fold `out_scale` into
+`q_weight` (`skip_out_scale=true` in `ptq_wrappers`, `out_scale_baked_into_weight` in the metadata); they still load.
 
 For surgery affine and matmul kinds, PTQ fits:
 
@@ -173,6 +210,8 @@ The checkpoint `extra` keeps the source checkpoint metadata plus:
 
 - `ptq_meta_path`: metadata JSON basename.
 - `ptq_wrappers`: wrapper skeleton configs needed to reload the PTQ checkpoint.
+- `ptq_output_identity`: whether the run added the output identity (`quantize_output`).
+- `ptq_simulation_dtype`: `float32`.
 
 The metadata JSON records:
 
@@ -180,19 +219,46 @@ The metadata JSON records:
 - selection flags and selected node names.
 - quantization bit widths and per-output-channel setting.
 - calibration settings (train loader, seed, Brent scaling and its folded `lam` per site).
-- float and PTQ validation accuracy/loss plus deltas.
-- per-node quant/dequant parameters (input and weight scales, output scale and bias).
+- float reference validation accuracy/loss (`fp_*`, surgery dtype), PTQ accuracy/loss (with `quantize_output`, also
+  with the output identity bypassed), and deltas against the reference.
+- per-node quant/dequant parameters (input and weight scales, output scale and bias) and `integer_sum_bound`.
 
 ## Reload
 
-`load_ptq_checkpoint` rebuilds the surgery template through the recorded adapter,
-installs skeleton `CalibratedAffinePTQWrapper` modules from `ptq_wrappers`, and then loads the
-checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
+`load_ptq_checkpoint` rebuilds the surgery template through the recorded adapter in its surgery dtype,
+adds the output identity when `ptq_output_identity` is set, installs skeleton `CalibratedAffinePTQWrapper` modules from
+`ptq_wrappers`, moves the model to fp32, and then loads the checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
 are checked through the same path downstream code uses.
 
-## Results (Pet, 2026-10-10)
+## Results (Pet, 2026-10-17: fp32 simulation, bf16 reference, 8-bit logits)
 
-Weights W8; activations A8, except `compiled_accumulator_bits=12` on the compiled accumulators of the strict graph
+All 24 paper configs set `quantize_output: true` (8-bit logits, `output_bits` default). The float reference is the bf16
+model (calibration under autocast); the PTQ model runs in fp32 with the checks above. Largest integer sum bound over all
+runs: 4.41e6 (extended k=16, `patch_embed.proj`), against 2^24 = 1.68e7. Log `artifacts/logs/ptq_fp32_2026-10-17/run.log`
+(the batch with the wrong fp32 reference is kept as `run_fp32_reference_INVALID.log`); the previous artifacts are in
+`artifacts/backup_ptq_fp32_2026-10-17/`. "out f" is the PTQ model with the output identity bypassed (logits not quantized);
+quantizing the logits moves accuracy by -0.22 to +0.19 points. The extended k=197 rows were rerun after the k=197 surgery and distill
+reruns of the same day (`artifacts/logs/sync_fullsupport_2026-10-17/`), which use the dense full-support value mix. Strict with exact GELU matches no NPU
+configuration and is a side comparison only.
+
+| k | graph | nodes | bf16 | PTQ per-channel | Δ | out f | PTQ per-tensor | Δ | out f |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | strict, sigmoid GELU | 380 | 83.97 | 82.91 | -1.06 | 83.13 | 83.54 | -0.44 | 83.40 |
+| 32 | strict, sigmoid GELU | 380 | 87.60 | 86.86 | -0.74 | 86.89 | 87.03 | -0.57 | 87.00 |
+| 64 | strict, sigmoid GELU | 380 | 89.62 | 89.59 | -0.03 | 89.56 | 89.72 | +0.11 | 89.67 |
+| 197 | strict, sigmoid GELU | 368 | 90.54 | 90.08 | -0.46 | 90.13 | 90.16 | -0.38 | 90.22 |
+| 16 | extended | 247 | 88.58 | 85.25 | -3.33 | 85.28 | 84.96 | -3.62 | 84.96 |
+| 32 | extended | 247 | 90.19 | 87.44 | -2.75 | 87.44 | 86.78 | -3.41 | 86.81 |
+| 64 | extended | 247 | 91.17 | 87.35 | -3.82 | 87.52 | 87.87 | -3.30 | 87.82 |
+| 197 | extended | 235 | 91.66 | 88.25 | -3.41 | 88.44 | 88.66 | -3.00 | 88.69 |
+| 16 | strict, GELU (no NPU configuration) | 344 | 85.96 | 84.82 | -1.14 | 84.79 | 85.36 | -0.60 | 85.31 |
+| 32 | strict, GELU (no NPU configuration) | 344 | 89.13 | 88.58 | -0.55 | 88.74 | 88.25 | -0.87 | 88.20 |
+| 64 | strict, GELU (no NPU configuration) | 344 | 90.68 | 90.02 | -0.65 | 89.83 | 90.08 | -0.60 | 90.02 |
+| 197 | strict, GELU (no NPU configuration) | 332 | 91.25 | 91.25 | +0.00 | 91.22 | 90.65 | -0.60 | 90.54 |
+
+## Results (Pet, 2026-10-10, bf16 simulation; superseded by the fp32 rerun of 2026-10-17)
+
+Weights W8; input codes A8, except `compiled_affine_input_bits=12` on the compiled fixed affine nodes of the strict graph
 (`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (no exp and no
 log, norm expansion `strict_product="norm"`; final run 2026-10-11, `artifacts/logs/norm_construction_2026-10-10/run_final.log`)
 before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
@@ -267,5 +333,5 @@ exact `AffineCombine` coefficients, power-of-two lam from max-abs ranges; one ru
 
 Folding lam changes the bf16 float model before PTQ: Mix + LayerNorm 83.18 / 89.45 / 90.30, Mix only 83.81 / 89.62 /
 90.46. The bf16 `AffineCombine` rounds each partial sum to bf16, and the LayerNorm lam (0.25 to 0.5) leaves a large
-a^2/lam^2 term in the partial sum. With 10-bit compiled accumulators lam on both sites cuts the PTQ loss from 3.9-8.1
+a^2/lam^2 term in the partial sum. With 10-bit input codes on the compiled affine nodes lam on both sites cuts the PTQ loss from 3.9-8.1
 to 1.2-2.2 points; with 12 bits the means are -0.68 (no lam), -0.47 (both), -0.44 (Mix only).

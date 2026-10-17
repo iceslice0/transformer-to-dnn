@@ -553,11 +553,99 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(ptq_activation_group("conv2d"), "linear")
         self.assertEqual(ptq_activation_group("affine_scale"), "affine")
         self.assertEqual(ptq_activation_group("matmul"), "matmul")
-        # Linear/Conv keep activation_bits even when the compiled-accumulator width is set.
-        widths = PTQSurgeryConfig(activation_bits=8, compiled_accumulator_bits=12, matmul_activation_bits=8)
+        # Linear/Conv keep activation_bits even when the compiled fixed-affine input width is set.
+        widths = PTQSurgeryConfig(activation_bits=8, compiled_affine_input_bits=12, matmul_activation_bits=8)
         for kind, bits in (("linear", 8), ("conv2d", 8), ("affine_scale", 12), ("matmul", 8)):
             self.assertEqual(ptq_activation_bits(kind, widths), bits, kind)
         self.assertEqual(ptq_activation_bits("affine_scale", PTQSurgeryConfig(activation_bits=8)), 8)
+        # The model output takes activation_bits, not the fixed-affine width.
+        self.assertEqual(ptq_activation_group("output_identity"), "output")
+        self.assertEqual(ptq_activation_bits("output_identity", widths), 8)
+        self.assertEqual(ptq_activation_bits("output_identity", PTQSurgeryConfig(output_bits=12)), 12)
+
+    def test_ptq_simulation_is_fp32_with_integer_sums(self) -> None:
+        import torch
+        import torch.nn as nn
+
+        from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
+        from transformer_surgery.internal.calibration import (
+            build_ptq_node_setup,
+            build_ptq_wrapper,
+            check_ptq_integer_sums,
+            gather_ptq_dequant_moments,
+            gather_ptq_range_moments,
+        )
+
+        torch.manual_seed(0)
+        layer = nn.Linear(16, 4, bias=True)
+        model = nn.Sequential(layer)
+        loader = [(torch.randn(8, 16), torch.zeros(8, dtype=torch.long)) for _ in range(3)]
+        selected, batches = {"0": "linear"}, [0, 1, 2]
+        stats = gather_ptq_range_moments(model, loader, selected, batches)
+        setup = build_ptq_node_setup("0", layer, stats["0"], PTQSurgeryConfig())
+        gather_ptq_dequant_moments(model, loader, selected, stats, {"0": setup}, batches)
+        bound = stats["0"].integer_sum_bound
+        self.assertGreater(bound, 0.0)
+        self.assertLessEqual(bound, 16 * 127 * 127)
+        built = build_ptq_wrapper(layer, setup, stats["0"], dequant_var_eps=1e-8)
+        wrapper = built.module
+        # Integer weight codes in the accumulator, so it sums integers; the output map applies s_in * s_w.
+        weight = wrapper.accumulator.weight
+        self.assertTrue(torch.equal(weight, weight.round()))
+        self.assertFalse(wrapper.skip_out_scale)
+        self.assertEqual(built.metadata.integer_sum_bound, bound)
+        x = loader[0][0]
+        acc = wrapper.accumulator(*wrapper.quantizer(x))
+        self.assertTrue(torch.equal(acc, acc.round()))
+        # Narrow floats and autocast are rejected.
+        with self.assertRaises(RuntimeError):
+            wrapper(x.bfloat16())
+        with self.assertRaises(RuntimeError), torch.autocast("cpu", dtype=torch.bfloat16):
+            wrapper(x)
+        stats["0"].integer_sum_bound = float(2**24 + 1)
+        with self.assertRaises(RuntimeError):
+            check_ptq_integer_sums(stats)
+
+    def test_ptq_output_identity_quantizes_model_output(self) -> None:
+        import torch
+        import torch.nn as nn
+
+        from transformer_surgery.cli.ptq_config import PTQSurgeryConfig
+        from transformer_surgery.internal.calibration import (
+            build_ptq_node_setup,
+            build_ptq_wrapper,
+            gather_ptq_dequant_moments,
+            gather_ptq_range_moments,
+            ptq_module_kind,
+        )
+        from transformer_surgery.ptq import _build_node_selection, attach_output_identity
+
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 37))
+        x = torch.randn(64, 8)
+        with torch.no_grad():
+            ref = model(x)
+        attach_output_identity(model)
+        with torch.no_grad():
+            self.assertTrue(torch.equal(model(x), ref))  # the identity does not change the float model
+        self.assertEqual(ptq_module_kind(model.ptq_output), "output_identity")
+        cfg = PTQSurgeryConfig(wrap_linear_conv=False, wrap_affine=False, wrap_matmul=False, quantize_output=True)
+        selected = _build_node_selection(model, cfg)
+        self.assertEqual(selected, {"ptq_output": "output_identity"})
+        loader = [(x, torch.zeros(64, dtype=torch.long))]
+        stats = gather_ptq_range_moments(model, loader, selected, [0])
+        setup = build_ptq_node_setup("ptq_output", model.ptq_output, stats["ptq_output"], cfg)
+        self.assertEqual(setup.activation_bits, 8)
+        gather_ptq_dequant_moments(model, loader, selected, stats, {"ptq_output": setup}, [0])
+        built = build_ptq_wrapper(model.ptq_output, setup, stats["ptq_output"], dequant_var_eps=1e-8)
+        model.set_submodule("ptq_output", built.module)
+        self.assertEqual(built.module.out_scale.numel(), 1)  # one scale for the whole output
+        with torch.no_grad():
+            out = model(x)
+        # The output is a fixed affine map of 8-bit codes: at most 256 values, within half a step of the float output.
+        self.assertLessEqual(out.unique().numel(), 256)
+        step = (built.module.out_scale * 127).item()  # output step per code: the identity's weight code is 127
+        self.assertLess((out - ref).abs().max().item(), 0.51 * step + 1e-6)
 
     def test_traceable_artifact_names(self) -> None:
         from transformer_surgery.internal.reporting import (

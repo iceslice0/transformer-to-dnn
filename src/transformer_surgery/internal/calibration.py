@@ -31,9 +31,12 @@ from transformer_surgery.ops import (
     AffineMatMul,
     AffineScale,
     AffineScaleBias,
+    PTQ_FP32_EXACT_INT,
     CalibratedAffinePTQWrapper,
     GibbsTopKSoftmax,
+    OutputIdentity,
     RewrittenLayerNorm,
+    ptq_check_fp32,
     ptq_quantize_proxy,
     ptq_signed_qrange,
 )
@@ -391,10 +394,11 @@ PTQKind = Literal[
     "affine_contract",
     "matmul",
     "matmul_hadamard",
+    "output_identity",
 ]
 # Input-code width group of a node kind (``ptq_activation_bits``).
-ActivationGroup = Literal["linear", "affine", "matmul"]
-# Output dequant of a wrapper: Linear/Conv2d scale ``s_in * s_w`` folded into the weight, or the OLS fit.
+ActivationGroup = Literal["linear", "affine", "matmul", "output"]
+# Output map of a wrapper: Linear/Conv2d scale ``s_in * s_w`` with a fitted bias, or the OLS affine fit.
 OutScaleMode = Literal["analytical_s_in_times_s_w", "ols_affine"]
 
 PTQ_LINEAR_KINDS: FrozenSet[PTQKind] = frozenset({"linear", "conv2d"})
@@ -403,6 +407,7 @@ PTQ_MATMUL_KINDS: FrozenSet[PTQKind] = frozenset({"matmul", "matmul_hadamard"})
 _PTQ_KIND_BY_TYPE: Tuple[Tuple[type, PTQKind], ...] = (
     (nn.Linear, "linear"),
     (nn.Conv2d, "conv2d"),
+    (OutputIdentity, "output_identity"),  # before its base class AffineScale
     (AffineScale, "affine_scale"),
     (AffineScaleBias, "affine_scale_bias"),
     (AffineFixedMix, "affine_fixed_mix"),
@@ -419,6 +424,7 @@ _WEIGHT_ATTR: Dict[PTQKind, str] = {
     "affine_scale_bias": "weight",
     "affine_fixed_mix": "weight",
     "affine_contract": "coeff",
+    "output_identity": "scale",
 }
 
 
@@ -434,14 +440,21 @@ def ptq_activation_group(kind: PTQKind) -> ActivationGroup:
         return "linear"
     if kind in PTQ_MATMUL_KINDS:
         return "matmul"
+    if kind == "output_identity":
+        return "output"
     return "affine"
 
 
 def ptq_activation_bits(kind: PTQKind, cfg: "PTQSurgeryConfig") -> int:
-    """Input-code width of a node kind: ``activation_bits`` for Linear/Conv2d; the matmul and the compiled fixed-affine
-    groups use ``matmul_activation_bits`` and ``compiled_accumulator_bits`` when set, else ``activation_bits``."""
+    """Input-code width of a node kind: ``activation_bits`` for Linear/Conv2d; the matmul group, the compiled
+    fixed-affine group and the model output use ``matmul_activation_bits``, ``compiled_affine_input_bits`` and
+    ``output_bits`` when set, else ``activation_bits``."""
     group = ptq_activation_group(kind)
-    bits = {"matmul": cfg.matmul_activation_bits, "affine": cfg.compiled_accumulator_bits}.get(group)
+    bits = {
+        "matmul": cfg.matmul_activation_bits,
+        "affine": cfg.compiled_affine_input_bits,
+        "output": cfg.output_bits,
+    }.get(group)
     return int(cfg.activation_bits if bits is None else bits)
 
 
@@ -538,6 +551,9 @@ class PTQNodeStats:
     examples_total: int = 0
     affine_fit: PTQAffineFitStats = field(default_factory=PTQAffineFitStats)
     bias_fit: PTQBiasFitStats = field(default_factory=PTQBiasFitStats)
+    # Largest sum_i |q_i| |w_i| over the calibration data, a bound on every partial sum of the integer accumulation;
+    # None for nodes whose inputs are rescaled codes (AffineCombine).
+    integer_sum_bound: Optional[float] = None
 
     def observe_range(self, inputs: Sequence[torch.Tensor], output: torch.Tensor) -> None:
         if self.input_arity == 0:
@@ -594,6 +610,7 @@ class PTQNodeMeta:
     out_scale: List[float]
     out_scale_baked_into_weight: bool
     out_bias: List[float]
+    integer_sum_bound: Optional[float]
     stride: Optional[List[int]]
     padding: Optional[List[int]]
     dilation: Optional[List[int]]
@@ -671,12 +688,38 @@ def _observe_ptq_dequant(
     inputs: Sequence[torch.Tensor],
     output: torch.Tensor,
 ) -> None:
+    with _autocast_off():
+        _observe_ptq_dequant_fp32(module, stats, setup, [inp.float() for inp in inputs], output)
+
+
+@contextmanager
+def _autocast_off() -> Iterator[None]:
+    with torch.autocast("cuda", enabled=False), torch.autocast("cpu", enabled=False):
+        yield
+
+
+def _observe_ptq_dequant_fp32(
+    module: nn.Module,
+    stats: PTQNodeStats,
+    setup: PTQNodeSetup,
+    inputs: Sequence[torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    """Quantized accumulation of one node in fp32 (autocast off) on the inputs of the float reference, fitted against
+    the reference output; the reference itself runs in its surgery dtype."""
+    ptq_check_fp32(f"{stats.name} calibration input", *inputs)
     q_inputs = [ptq_quantize_proxy(inp, setup.input_scale[i], setup.activation_bits) for i, inp in enumerate(inputs)]
+    q_weight = None if setup.q_weight is None else setup.q_weight.to(device=output.device)
     if getattr(module, "ptq_dequantized_inputs", False):
         # Several inputs on different grids (AffineCombine): rescale each code by its own input scale before the sum.
         q_inputs = [q * setup.input_scale[i].to(device=q.device) for i, q in enumerate(q_inputs)]
-    q_weight = None if setup.q_weight is None else setup.q_weight.to(device=output.device)
-    acc = _accumulator_forward(module, setup.kind, q_weight, q_inputs).float()
+    else:
+        # Integer codes times integer weight codes: the sum of absolute products bounds every partial sum.
+        abs_weight = None if q_weight is None else q_weight.abs()
+        bound = float(_accumulator_forward(module, setup.kind, abs_weight, [q.abs() for q in q_inputs]).max())
+        stats.integer_sum_bound = max(bound, stats.integer_sum_bound or 0.0)
+    acc = _accumulator_forward(module, setup.kind, q_weight, q_inputs)
+    ptq_check_fp32(f"{stats.name} calibration accumulation", acc)
     if setup.kind in PTQ_LINEAR_KINDS:
         out_scale = _linear_conv_out_scale(setup.input_scale, setup.weight_scale)
         stats.bias_fit.update(acc, output, out_scale, channel_axis=setup.output_channel_axis)
@@ -717,27 +760,32 @@ def build_ptq_node_setup(name: str, module: nn.Module, stats: PTQNodeStats, cfg:
     )
 
 
+def check_ptq_integer_sums(stats: Dict[str, PTQNodeStats]) -> None:
+    """Every integer accumulation of the calibration data stays within the integers that fp32 holds exactly."""
+    over = {n: s.integer_sum_bound for n, s in stats.items() if (s.integer_sum_bound or 0.0) > PTQ_FP32_EXACT_INT}
+    if over:
+        raise RuntimeError(f"PTQ integer sums exceed 2^24, the exact fp32 integer range: {over}")
+
+
 def build_ptq_wrapper(
     module: nn.Module, setup: PTQNodeSetup, stats: PTQNodeStats, *, dequant_var_eps: float
 ) -> PTQBuiltWrapper:
     q_weight = None if setup.q_weight is None else setup.q_weight.clone()
     if setup.kind in PTQ_LINEAR_KINDS and q_weight is not None:
+        # The accumulator keeps the integer weight codes, so it computes an exact integer sum; the output map applies
+        # s_in * s_w and the fitted per-channel bias.
         out_scale = _linear_conv_out_scale(setup.input_scale, setup.weight_scale)
         out_bias = stats.bias_fit.bias()
         out_scale_mode: OutScaleMode = "analytical_s_in_times_s_w"
-        q_weight = _bake_output_scale_into_weight(q_weight, out_scale)
-        out_scale_buf = torch.ones(())
-        skip_out_scale = True
     else:
         out_scale, out_bias = stats.affine_fit.fit(float(dequant_var_eps))
         out_scale_mode = "ols_affine"
-        out_scale_buf = out_scale
-        skip_out_scale = False
+    skip_out_scale = False
 
     # Linear/Conv: the per-channel bias needs its channel axis even when out_scale is a scalar
     # (per-tensor weights). With per-channel weights both vectors give the same shape.
-    out_bcast_shape = _out_bcast_shape(setup, out_bias if skip_out_scale else out_scale)
-    metadata = _wrapper_metadata(module, setup, out_scale_mode, out_scale, out_bias, skip_out_scale)
+    out_bcast_shape = _out_bcast_shape(setup, out_bias)
+    metadata = _wrapper_metadata(module, setup, stats, out_scale_mode, out_scale, out_bias, skip_out_scale)
     device = _module_device(module)
     if q_weight is not None:
         _swap_accumulator_weight(module, setup.kind, q_weight)
@@ -745,7 +793,7 @@ def build_ptq_wrapper(
         activation_bits=setup.activation_bits,
         input_scale=setup.input_scale,
         accumulator=module,
-        out_scale=out_scale_buf,
+        out_scale=out_scale,
         out_bias=out_bias,
         skip_out_scale=skip_out_scale,
         out_bcast_shape=out_bcast_shape,
@@ -769,6 +817,7 @@ def _values(t: torch.Tensor) -> List[float]:
 def _wrapper_metadata(
     module: nn.Module,
     setup: PTQNodeSetup,
+    stats: PTQNodeStats,
     out_scale_mode: OutScaleMode,
     out_scale: torch.Tensor,
     out_bias: torch.Tensor,
@@ -793,6 +842,7 @@ def _wrapper_metadata(
         out_scale=_values(out_scale),
         out_scale_baked_into_weight=skip_out_scale,
         out_bias=_values(out_bias),
+        integer_sum_bound=stats.integer_sum_bound,
         stride=None if conv is None else list(conv.stride),
         padding=None if conv is None else list(conv.padding),
         dilation=None if conv is None else list(conv.dilation),
@@ -876,6 +926,8 @@ def _default_output_channel_axis(kind: PTQKind, out: torch.Tensor) -> Optional[i
         return 1 if out.ndim > 1 else 0
     if kind == "affine_fixed_mix":
         return -2 if out.ndim >= 2 else None
+    if kind == "output_identity":
+        return None  # one scale for the whole model output
     return -1
 
 
@@ -904,8 +956,3 @@ def _module_device(module: nn.Module) -> torch.device:
     tensor = next(itertools.chain(module.parameters(), module.buffers()), None)
     return torch.device("cpu") if tensor is None else tensor.device
 
-
-def _bake_output_scale_into_weight(q_weight: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
-    if out_scale.ndim == 0:
-        return q_weight * out_scale.float()
-    return q_weight * out_scale.view(-1, *([1] * (q_weight.ndim - 1))).float()
