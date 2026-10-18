@@ -1,5 +1,9 @@
 # Query-Centroid Support Routing (Pet DeiT-Tiny, Pythia-70M)
 
+> Numbers in this file predate the 2026-10-17 leak-fix rerun (new Pet reference, 91.36% instead of 91.52%; checkpoint
+> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/` and
+> the paper tables (`scripts/check_paper_numbers.py`).
+
 Exact top-k needs all \(N^2\) scores before it selects \(k\) keys per query, so a strict graph pays
 squares on the full score matrix even when it mixes only \(k\) values. Query-centroid routing
 selects the support before any score is formed:

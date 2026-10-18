@@ -60,8 +60,21 @@ training copy and copies its full state dict back into the surgery student after
 dtypes train the student directly.
 
 When ``num_trainings`` is greater than one, each run reloads the same ``pre_checkpoint`` and trains
-independently. All run metrics are kept in metadata, validation accuracy mean/std are computed
-across runs, and only the best-validation-accuracy checkpoint is written to disk.
+independently. All run metrics are kept in metadata, held-out accuracy mean/std are computed across runs, and only the run with the highest training-split primary metric (the
+first on ties) is written to disk.
+
+## Checkpoint selection (since 2026-10-17)
+
+Selection uses the training split only. ``adapter.build_selection_loader`` gives the training split without
+augmentation and in a fixed order: Pet ``trainval`` with the eval transforms, and one centered training-size patch of
+every DIV2K training pair for MambaIR. The selection metric is the primary metric (accuracy for
+Pet, PSNR for MambaIR) on that split in eval mode (``distill.training_split_selection``, which also records the
+training objective ``(1 - w) * hard + w * match``). With ``keep_best`` each run keeps the epoch, or the student before
+training (``selected_epoch = 0``), with the highest metric, the earlier one on ties; across ``num_trainings`` runs the
+saved checkpoint is the run with the highest metric, the first on ties. A first version (2026-10-17) selected by the
+lowest training objective; its artifacts are in ``artifacts/backup_leakfix_lossselect_2026-10-18/``. The held-out loader (Pet ``test`` split, Set5) is evaluated once per run, on the kept
+state, and never selected on. Before 2026-10-17 both choices used the held-out accuracy (backups in
+``artifacts/backup_leakfix_2026-10-17/``).
 
 ## Outputs
 
@@ -72,8 +85,8 @@ The CLI writes:
 
 Checkpoint metadata records the adapter key, teacher checkpoint, source surgery checkpoint,
 temperature, distillation weight, base seed, number of trainings, every run's metrics, validation
-accuracy mean/std, best run, config JSON path, and surgery dtype. The saved model state is from the
-best run only. The metadata JSON adds post-distillation metrics under the ``calibration`` block so
+accuracy mean/std, the saved run (highest training-split primary metric), config JSON path, and surgery dtype. The saved
+model state is from that run only. The metadata JSON adds post-distillation metrics under the ``calibration`` block so
 the full surgery -> distill result remains traceable by checkpoint basename.
 
 ## Validation expectations
@@ -83,8 +96,8 @@ The distillation stage is is expected to satisfy:
 1. It loads the student through the adapter checkpoint path and does not depend on a concrete model module.
 2. It keeps the teacher frozen.
 3. It reports CE and Jeffreys validation metrics before saving.
-4. It keeps per-run metrics, reports validation accuracy mean/std, and saves only the best run's
-   checkpoint.
+4. It keeps per-run metrics, reports held-out accuracy mean/std, and saves only the checkpoint of the run with the
+   highest training-split primary metric; the held-out set is never selected on.
 5. It saves a real PyTorch checkpoint and matching metadata derived from the output checkpoint name.
 6. It preserves fixed surgery constants (eps buffers, registered coefficient buffers) and only
    trains parameters that have ``requires_grad=True``.

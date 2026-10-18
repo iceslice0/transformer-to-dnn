@@ -44,6 +44,11 @@ class MambaIRLightSRAdapter(SurgeryModelAdapter):
 
         return build_mambair_loaders(cfg)
 
+    def build_selection_loader(self, cfg: Any) -> DataLoader:
+        from transformer_surgery.models.mambair.loaders import build_mambair_selection_loader
+
+        return build_mambair_selection_loader(cfg)
+
     def load_reference_checkpoint(self, path: str) -> nn.Module:
         from transformer_surgery.models.mambair.arch import build_mambair_lightsr
 

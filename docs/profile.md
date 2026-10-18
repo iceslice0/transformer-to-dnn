@@ -36,3 +36,13 @@ Command: `artifacts/logs/profile_2026-10-10/command.txt`; raw output: `artifacts
 | 64 | LayerNorm | 32.7 | 30.7 | 22.5 | 20.4 | 39 | 39 | 19 | 19 |
 | 64 | Linear (qkv, proj) | 4.3 | 3.8 | 5.0 | 4.6 | 7 | 7 | 9 | 9 |
 | 64 | MLP | 3.9 | 3.7 | 5.7 | 4.9 | 18 | 18 | 18 | 18 |
+
+## Reference columns (2026-10-18)
+
+`make profile-gs` now also profiles the Pet reference (`scripts/profile_modules.py --reference`; log
+`artifacts/logs/profile_gs_ref_2026-10-18/`). Its attention runs unfused, with `q k^T`, softmax and `attn @ v` routed
+through hookable modules (`install_reference_attention`, checked bit-identical to timm's own unfused path), so it fills
+the Score, Softmax and Mix rows of paper Table S4; a second pass times the fused kernel
+(`F.scaled_dot_product_attention`, the path of the latency tables): 4.1 ms and 2 MiB per batch at k=16, against 9.0 ms for
+the unfused score, softmax and mix. Reference module total: 25.9 ms per batch, against 52.2 ms for the extended and
+117.0 ms for the strict graph in the same session.

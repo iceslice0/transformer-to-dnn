@@ -712,9 +712,12 @@ class PackageSmokeTests(unittest.TestCase):
         from transformer_surgery.distill import DistillRun, DistillSummary, distill_metadata
         from transformer_surgery.models.adapters import get_model_adapter
 
+        # The saved run is the one with the highest training-split accuracy, not the best held-out accuracy.
         runs = [
-            DistillRun(42, 0.5, 1.2, 0.4, val_acc=0.60, val_ce_mean=1.0, val_jeffreys_mean=0.3, best_val_epoch=1),
-            DistillRun(43, 0.5, 1.2, 0.4, val_acc=0.80, val_ce_mean=0.8, val_jeffreys_mean=0.2, best_val_epoch=2, run_index=1),
+            DistillRun(42, 0.5, 1.2, 0.4, val_acc=0.80, val_ce_mean=0.8, val_jeffreys_mean=0.2, selected_epoch=1,
+                       selection_primary=0.95),
+            DistillRun(43, 0.5, 1.2, 0.4, val_acc=0.60, val_ce_mean=1.0, val_jeffreys_mean=0.3, selected_epoch=2,
+                       selection_primary=0.97, run_index=1),
         ]
         meta = distill_metadata(get_model_adapter("deit_tiny_pet"), DistillSummary.of(runs))
         cal = meta["calibration"]
@@ -722,9 +725,34 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(cal["student_post_distill_runs"], [asdict(r) for r in runs])
         self.assertEqual(cal["student_post_distill_best_run_index"], 1)
         self.assertEqual(cal["student_post_distill_best_seed"], 43)
-        self.assertEqual(cal["student_post_distill_val_acc"], 0.80)
+        self.assertEqual(cal["student_post_distill_val_acc"], 0.60)
         self.assertAlmostEqual(cal["student_post_distill_val_acc_mean"], 0.70)
         self.assertAlmostEqual(cal["student_post_distill_val_acc_std"], math.sqrt(0.02))
+
+    def test_distill_objective_and_selection_loaders(self) -> None:
+        import torch
+        import torch.nn as nn
+
+        from transformer_surgery.cli.distill_config import JeffreysDistillConfig
+        from transformer_surgery.distill import distill_objective
+        from transformer_surgery.models.adapters import get_model_adapter
+
+        class Fake:
+            def eval_student_vs_teacher(self, teacher, student, loader, *, temperature=1.0):
+                return 0.9, 2.0, 0.5
+
+        cfg = JeffreysDistillConfig(distill_weight=0.25)
+        self.assertAlmostEqual(distill_objective(Fake(), nn.Identity(), nn.Identity(), [], cfg), 0.75 * 2.0 + 0.25 * 0.5)
+        with self.assertRaises(NotImplementedError):
+            get_model_adapter("deit_tiny_imagenet").build_selection_loader(cfg)
+        from transformer_surgery.models.mambair.loaders import PairedSRDataset
+
+        ds = PairedSRDataset.__new__(PairedSRDataset)
+        ds.patch_size_lq, ds.scale = 4, 2
+        hr, lr = ds._paired_center_crop(torch.arange(3 * 20 * 20).reshape(3, 20, 20), torch.arange(3 * 10 * 10).reshape(3, 10, 10))
+        self.assertEqual(tuple(lr.shape), (3, 4, 4))
+        self.assertEqual(tuple(hr.shape), (3, 8, 8))
+        self.assertEqual(int(lr[0, 0, 0]), 3 * 10 + 3)  # top-left of the centered 4x4 window in a 10x10 image
 
     def test_cli_help(self) -> None:
         env = dict(os.environ)

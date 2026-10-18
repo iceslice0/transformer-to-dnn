@@ -412,30 +412,31 @@ Supplementary S9). bf16: the saved checkpoints, weights in bf16, CUDA autocast. 
 fp32 arithmetic (cuDNN convolutions without TF32, PyTorch's default for fp32 convolutions), each compiled graph rebuilt
 in fp32 from its checkpoint record so that its fixed coefficients are fp32. cuDNN runs deterministic, without
 autotuning. The script also rebuilds each graph in bf16 with the bf16 reference weights as a check of the rebuild.
-Results: `artifacts/logs/dtype_check_2026-10-17/dtype_check.json`; the first run with TF32 convolutions and autotuning
+Results: `artifacts/logs/dtype_check_2026-10-18/dtype_check.json` (leak-fix rerun, new Pet reference; earlier runs in
+`artifacts/logs/dtype_check_2026-10-17/`); the first run with TF32 convolutions and autotuning
 is kept as `dtype_check_tf32conv_benchmark.json` (DeiT-Tiny and Pythia identical, MambaIR within 0.004 dB).
 
 | Network | Model | bf16 | fp32 |
 |---|---|---:|---:|
-| DeiT-Tiny, Pet (top-1 %) | reference | 91.52 | 91.55 |
-|  | extended | 91.66 | 91.55 |
-|  | strict, GELU | 91.25 | 91.55 |
-|  | strict, sigmoid GELU | 90.54 | 90.19 |
-|  | Hadamard, GELU | 91.58 | 91.55 |
-|  | Hadamard, sigmoid GELU | 90.24 | 90.19 |
+| DeiT-Tiny, Pet (top-1 %) | reference | 91.36 | 91.33 |
+|  | extended | 91.36 | 91.33 |
+|  | strict, GELU | 91.06 | 91.33 |
+|  | strict, sigmoid GELU | 90.73 | 90.27 |
+|  | Hadamard, GELU | 91.28 | 91.33 |
+|  | Hadamard, sigmoid GELU | 90.35 | 90.27 |
 | DeiT-Tiny, ImageNet-1k (top-1 %) | reference | 72.02 | 72.02 |
 |  | extended | 72.01 | 72.02 |
-| MambaIRv2-Light x2, Set5 (PSNR dB) | reference | 38.237 | 38.271 |
-|  | extended | 38.235 | 38.266 |
-| MambaIRv2-Light x4, Set5 (PSNR dB) | reference | 32.502 | 32.505 |
-|  | extended | 32.502 | 32.513 |
+| MambaIRv2-Light x2, Set5 (PSNR dB) | reference | 38.234 | 38.272 |
+|  | extended | 38.231 | 38.270 |
+| MambaIRv2-Light x4, Set5 (PSNR dB) | reference | 32.511 | 32.512 |
+|  | extended | 32.502 | 32.507 |
 | Pythia-70M, WikiText-2 (NLL) | reference | 6.681 | 4.550 |
 |  | extended | 6.680 | 4.550 |
 
 Rerun 2026-10-17 evening after the full-support sync reruns (new extended k=197 Pet/ImageNet checkpoints); the previous
 JSON is kept as `dtype_check_pre_sync.json`. DeiT-Tiny and Pythia numbers repeat exactly between runs; MambaIR varies by
 up to 0.0064 dB between two identical runs (its kernels are not deterministic). In fp32 every exact-GELU graph reproduces
-its reference (DeiT-Tiny/Pet: 91.55%, loss 0.3160 for all; ImageNet 72.02; Pythia 4.5496), MambaIR within that
-variation. bf16 moves DeiT-Tiny by at most 0.35 points and MambaIR by at most 0.04 dB; Pythia-70M needs fp32 (its
+its reference (DeiT-Tiny/Pet: 91.33%, loss 0.3180 for all; ImageNet 72.02; Pythia 4.5496), MambaIR within that
+variation. bf16 moves DeiT-Tiny by at most 0.46 points and MambaIR by at most 0.04 dB; Pythia-70M needs fp32 (its
 configs set `surgery_dtype=float32`). The old 91.74% (2026-10-09) of the extended Pet graph came from the gathered
 full-support mix used before 2026-10-10 (`artifacts/logs/sync_fullsupport_2026-10-17/NOTES.md`).

@@ -35,7 +35,14 @@ FIELD_HELP_JEFFREYS: Dict[str, str] = {
     "warmup_epochs": "Linear warmup epochs; JSON null uses min(5, epochs).",
     "distill_weight": "Mixing weight for teacher matching vs hard-label CE.",
     "base_seed": "Base random seed; run i uses base_seed + i.",
-    "num_trainings": "Number of independent distillation trainings to run; only the best checkpoint is saved.",
+    "num_trainings": (
+        "Number of independent distillation trainings to run; the one with the highest training-split primary metric "
+        "(accuracy, PSNR) is saved. The held-out set is evaluated on every run's kept state and never selected on."
+    ),
+    "keep_best": (
+        "Keep the epoch, or the student before training, with the highest primary metric on the training split "
+        "(eval transforms, adapter.build_selection_loader; earlier on ties); false keeps the last epoch."
+    ),
     "top_k": "Override of the checkpoint's top_k.",
     "eps": "Override of the checkpoint's LayerNorm epsilon.",
 }

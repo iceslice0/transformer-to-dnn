@@ -11,7 +11,12 @@ from torch.utils.data import DataLoader
 from transformer_surgery.cli.surgery_config import SurgeryConfig
 from transformer_surgery.internal.util import DEFAULT_MODEL_KEY
 from transformer_surgery.models.adapters import SurgeryModelAdapter
-from transformer_surgery.models.pet import PET_NUM_CLASSES, build_pet_loaders, load_timm_deit_checkpoint
+from transformer_surgery.models.pet import (
+    PET_NUM_CLASSES,
+    build_pet_loaders,
+    build_pet_selection_loader,
+    load_timm_deit_checkpoint,
+)
 
 
 class DeiTTinyPetAdapter(SurgeryModelAdapter):
@@ -23,6 +28,9 @@ class DeiTTinyPetAdapter(SurgeryModelAdapter):
 
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         return build_pet_loaders(cfg)
+
+    def build_selection_loader(self, cfg: Any) -> DataLoader:
+        return build_pet_selection_loader(cfg)
 
     def load_reference_checkpoint(self, path: str) -> nn.Module:
         return load_timm_deit_checkpoint(path, self.num_classes)
@@ -46,3 +54,6 @@ class DeiTTinyImageNetAdapter(DeiTTinyPetAdapter):
         from transformer_surgery.models.imagenet import build_imagenet_loaders
 
         return build_imagenet_loaders(cfg)
+
+    def build_selection_loader(self, cfg: Any) -> DataLoader:
+        raise NotImplementedError("ImageNet-1k runs use the released weights and are not trained here")

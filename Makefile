@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check pretrain pet-surgery pet-distill ptq-paper mambair-distill latency-compiled help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -137,20 +137,20 @@ hadamard-sr: $(HADAMARD_SR_TARGETS)
 # Per-module CUDA-event profile of the Hadamard graph with GELU ~ x*sigmoid(1.702x) (k=16,32,64), with the
 # strict and extended k=16 checkpoints as same-session controls. The exact-GELU Hadamard profile of the same
 # day is kept in artifacts/logs/profile_hadamard_2026-10-10/.
-PROFILE_HADAMARD_LOG := artifacts/logs/profile_hadamard_gs_2026-10-10
+PROFILE_HADAMARD_LOG := artifacts/logs/profile_hadamard_gs_2026-10-18
 PROFILE_HADAMARD_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_hadamard_sr_gs.pt) \
 	artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk16_fast.pt
 # Paper Table S4 in one profiling session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), top-k and
 # routed, and the extended graph with exact GELU (k=16,32,64 for the strict and extended shares).
-PROFILE_GS_LOG := artifacts/logs/profile_gs_2026-10-10
+PROFILE_GS_LOG := artifacts/logs/profile_gs_ref_2026-10-18
 PROFILE_GS_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs.pt) \
 	artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs_qc32.pt artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs.pt \
 	artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs_qc32.pt \
 	$(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_fast.pt)
-profile-gs: $(PROFILE_GS_CKPTS)
+profile-gs: $(PROFILE_GS_CKPTS) $(PET_REFERENCE)
 	mkdir -p $(PROFILE_GS_LOG)
-	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json" > $(PROFILE_GS_LOG)/command.txt
-	$(PYTHON) scripts/profile_modules.py --checkpoints $^ --out $(PROFILE_GS_LOG)/profile.json | tee $(PROFILE_GS_LOG)/profile.log
+	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $(PROFILE_GS_CKPTS) --reference $(PET_REFERENCE) --out $(PROFILE_GS_LOG)/profile.json" > $(PROFILE_GS_LOG)/command.txt
+	$(PYTHON) scripts/profile_modules.py --checkpoints $(PROFILE_GS_CKPTS) --reference $(PET_REFERENCE) --out $(PROFILE_GS_LOG)/profile.json | tee $(PROFILE_GS_LOG)/profile.log
 
 # Polarization baseline of Table 2: the strict graph with polarization for every product (strict_product=polarization,
 # per-term mix), GELU ~ x*sigmoid(1.702x), top-k and routed support.
@@ -160,17 +160,25 @@ strict-pol: $(STRICT_POL_TARGETS)
 
 # bf16 error of the strict value mix on real inputs: polarization, norm expansion with partial sums, the default
 # per-term construction, and the per-term construction with a balanced operand scale (paper Supplementary).
-MIX_PRECISION_LOG := artifacts/logs/mix_precision_2026-10-10
+MIX_PRECISION_LOG := artifacts/logs/mix_precision_2026-10-18
 mix-precision: artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
 	mkdir -p $(MIX_PRECISION_LOG)
 	$(PYTHON) scripts/mix_precision.py 16 197 | tee $(MIX_PRECISION_LOG)/mix_precision.log
 
 # bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph (paper
 # Supplementary). Reads the existing k = N surgery checkpoints; no prerequisites, so it never rebuilds them.
-DTYPE_CHECK_LOG := artifacts/logs/dtype_check_2026-10-17
+DTYPE_CHECK_LOG := artifacts/logs/dtype_check_2026-10-18
 dtype-check:
 	mkdir -p $(DTYPE_CHECK_LOG)
 	$(PYTHON) scripts/dtype_check.py $(DTYPE_CHECK_LOG)/dtype_check.json | tee $(DTYPE_CHECK_LOG)/dtype_check.log
+
+# Model-only GPU latency with torch.compile (paper Tables 2 and 4, Supplementary S6): Pet batches preloaded on the GPU,
+# bf16, the fastest of three compile modes per model. A whole validation pass is bound by data loading on Pet.
+LATENCY_LOG := artifacts/logs/latency_compiled_2026-10-18
+latency-compiled:
+	mkdir -p $(LATENCY_LOG)
+	$(PYTHON) scripts/latency_compiled.py $(LATENCY_LOG)/latency.json --modes default reduce-overhead max-autotune \
+		| tee $(LATENCY_LOG)/latency.log
 
 # Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit input codes of the
 # compiled affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).
@@ -189,13 +197,13 @@ routing-strict-bench: $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_
 	$(PYTHON) scripts/bench_strict_routing.py fast $(STRICT_KS)
 
 # Float64 end-to-end check of exact compilation (all keys, extended and strict graphs vs the reference).
-EXACT_FP64_LOG := artifacts/logs/exact_fp64_2026-10-10
+EXACT_FP64_LOG := artifacts/logs/exact_fp64_2026-10-18
 exact-fp64: artifacts/checkpoints/ts_surgery_topk197_fast.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
 	mkdir -p $(EXACT_FP64_LOG)
 	$(PYTHON) scripts/check_exact_fp64.py --checkpoints $^ --batches 2 | tee $(EXACT_FP64_LOG)/check.log
 
 # Same float64 check for the Hadamard graph (own log, so the exact-fp64 log is kept).
-EXACT_FP64_HADAMARD_LOG := artifacts/logs/exact_fp64_hadamard_2026-10-10
+EXACT_FP64_HADAMARD_LOG := artifacts/logs/exact_fp64_hadamard_2026-10-18
 exact-fp64-hadamard: artifacts/checkpoints/ts_surgery_topk197_hadamard_sr.pt
 	mkdir -p $(EXACT_FP64_HADAMARD_LOG)
 	$(PYTHON) scripts/check_exact_fp64.py --checkpoints $^ --batches 2 | tee $(EXACT_FP64_HADAMARD_LOG)/check.log
@@ -224,7 +232,9 @@ help:
 	@echo "  make exact-fp64   # float64 end-to-end check of exact compilation (k=197)"
 	@echo "  make strict-sr    # strict graph without exp/log (+GELU approx) and routed strict"
 	@echo "  make ptq-strict-sr # 8-bit PTQ of the new strict graphs"
+	@echo "  make pretrain      # Pet reference (classifier head; epoch with the highest training-split accuracy)"
 	@echo "  make dtype-check   # bf16 vs fp32 at k = N, all networks (reference and compiled graphs)"
+	@echo "  make latency-compiled # model-only GPU latency with torch.compile (fastest mode per model)"
 	@echo "  make hadamard-sr  # Hadamard graph: elementwise products instead of polarization (sigmoid, rsqrt)"
 	@echo "  make exact-fp64-hadamard # float64 check of the Hadamard graph (k=197)"
 	@echo "  make profile-hadamard # per-module GPU profile of the Hadamard graph (k=16,32,64)"
@@ -232,6 +242,28 @@ help:
 	@echo "  make mix-precision # bf16 error of the strict value mix: polarization vs squares (paper Supplementary)"
 	@echo "  make strict-pol   # Table 2 polarization baseline (strict_product=polarization), top-k and routed"
 	@echo "  make all    # Run all sections"
+
+# Pet reference: DeiT-Tiny classifier head on the ImageNet backbone, the epoch with the highest training-split accuracy; the
+# Pet test split is evaluated once, on the saved weights. Its log goes to artifacts/logs.
+PET_REFERENCE := artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt
+pretrain: $(PET_REFERENCE)
+$(PET_REFERENCE): configs/pretrain/pet_deit_tiny.json
+	mkdir -p artifacts/logs
+	$(PYTHON) -m transformer_surgery.cli.pretrain_pet --config "$<" > artifacts/logs/ts_pretrain_pet_deit_tiny.log 2>&1 \
+		|| (tail -20 artifacts/logs/ts_pretrain_pet_deit_tiny.log; exit 1)
+	tail -3 artifacts/logs/ts_pretrain_pet_deit_tiny.log
+
+# Every Pet surgery checkpoint is built from the Pet reference, so it rebuilds when the reference changes (and the
+# distill and PTQ checkpoints built on it follow). MambaIR, Pythia and ImageNet use released weights.
+PET_SURGERY_CONFIGS := $(shell grep -l '"model_key": "deit_tiny_pet"' configs/surgery/*.json)
+PET_SURGERY_TARGETS := $(patsubst configs/surgery/%.json,artifacts/checkpoints/ts_surgery_%.pt,$(PET_SURGERY_CONFIGS))
+$(PET_SURGERY_TARGETS): $(PET_REFERENCE)
+
+# Stages of a full rerun after a new Pet reference (2026-10-17: checkpoint selection on the training split only).
+pet-surgery: $(PET_SURGERY_TARGETS)
+pet-distill: $(DISTILL_MAIN_CE_TARGETS) $(DISTILL_MAIN_J_TARGETS)
+ptq-paper: $(PTQ_FAST_CHANNEL_TARGETS) $(PTQ_FAST_TENSOR_TARGETS) $(PTQ_STRICT_SR_TARGETS)
+mambair-distill: $(MAMBAIR_DISTILL_TARGETS) $(MAMBAIR_X4_EXACT_DISTILL_TARGETS) $(MAMBAIR_X4_TAIL0_DISTILL_TARGETS)
 
 # Surgery checkpoints rebuild when surgery JSON changes.
 artifacts/checkpoints/ts_surgery_%.pt: configs/surgery/%.json

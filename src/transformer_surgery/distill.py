@@ -40,7 +40,11 @@ if TYPE_CHECKING:
 
 @dataclass
 class DistillRun:
-    """Validation of one distillation run before training (baseline) and of its kept student."""
+    """One distillation run. ``val_*`` are the held-out evaluation set (Pet test split, Set5) of the student before
+    training (``baseline_*``) and of its kept state; they are evaluated, never selected on. ``selection_objective`` is
+    the training-split primary metric (accuracy, PSNR) of the kept state on ``adapter.build_selection_loader``; the
+    highest one selects the kept epoch (``selected_epoch``, 0 for the student before training) and the saved run, with
+    ties kept by the earlier checkpoint. ``selection_objective`` is the training objective of the kept state."""
 
     seed: int
     baseline_val_acc: float
@@ -49,13 +53,18 @@ class DistillRun:
     val_acc: float
     val_ce_mean: float
     val_jeffreys_mean: float
-    best_val_epoch: Optional[int]
+    selected_epoch: Optional[int]
+    selection_primary: float = float("nan")
+    baseline_selection_primary: float = float("nan")
+    selection_objective: float = float("nan")
+    baseline_selection_objective: float = float("nan")
     run_index: int = 0
 
 
 @dataclass
 class DistillSummary:
-    """The best of several distillation runs and the spread of their accuracy (distill metadata ``calibration``)."""
+    """The saved run of several distillation runs, the one with the highest training-split primary metric (the first
+    on ties), and the spread of their held-out accuracy (distill metadata ``calibration``)."""
 
     student_post_distill_val_acc: float
     student_post_distill_mean_ce: float
@@ -69,7 +78,7 @@ class DistillSummary:
 
     @classmethod
     def of(cls, runs: Sequence[DistillRun]) -> "DistillSummary":
-        best = max(runs, key=lambda r: r.val_acc)
+        best = max(runs, key=lambda r: r.selection_primary)
         accs = [r.val_acc for r in runs]
         return cls(
             student_post_distill_val_acc=best.val_acc,
@@ -94,13 +103,18 @@ def distill_student_from_teacher(
     adapter: "SurgeryModelAdapter",
     seed: int,
     baseline: Tuple[float, float, float],
+    select_loader: DataLoader,
+    baseline_selection: Tuple[float, float],
     log_prefix: str = "distill",
 ) -> DistillRun:
     """Train a student with a task-defined hard loss mixed with teacher matching.
 
     ``adapter`` supplies ``(hard_loss, match_loss)`` per step and ``(primary, loss, match)`` for
     evaluation, so this loop serves classification (CE + Jeffreys) and SR (L1 + teacher L1) alike.
-    ``baseline`` is the student's ``(primary, loss, match)`` before training.
+    ``baseline`` is the student's held-out ``(primary, loss, match)`` before training and ``baseline_selection`` its
+    training-split ``(primary, objective)`` on ``select_loader`` (the training split with eval transforms). With
+    ``keep_best`` the kept state is the epoch, or the student before training, with the highest training-split primary
+    metric, the earlier one on ties; ``val_loader`` is evaluated once, on the kept state.
     """
     set_seed(seed)
     device = get_device()
@@ -126,7 +140,7 @@ def distill_student_from_teacher(
         eta_min=max(0.0, float(cfg.cosine_eta_min)),
     )
     teacher.eval()
-    best_acc, best_ce, best_j = baseline
+    best_primary, best_obj = baseline_selection
     best_ep = 0
     best_state = copy.deepcopy(master.state_dict()) if cfg.keep_best else None
     global_step = 0
@@ -170,16 +184,18 @@ def distill_student_from_teacher(
                 break
         if master is not student:
             student.load_state_dict(master.state_dict())
-        acc, ce_v, j_v = adapter.eval_student_vs_teacher(teacher, student, val_loader, temperature=cfg.temperature)
-        if not cfg.keep_best or acc > best_acc:
-            best_acc, best_ce, best_j, best_ep = acc, ce_v, j_v, ep + 1
+        primary, obj = training_split_selection(adapter, teacher, student, select_loader, cfg)
+        log_line(f"  {log_prefix} epoch {ep + 1}/{cfg.epochs} training-split primary={primary:.6f} objective={obj:.6f}")
+        if not cfg.keep_best or primary > best_primary:
+            best_primary, best_obj, best_ep = primary, obj, ep + 1
             if cfg.keep_best:
                 best_state = copy.deepcopy(master.state_dict())
     if best_state is not None:
         master.load_state_dict(best_state)
         if master is not student:
             student.load_state_dict(master.state_dict())
-        log_line(f"  {log_prefix} kept best val acc={best_acc:.4f} (epoch {best_ep}/{cfg.epochs})")
+        log_line(f"  {log_prefix} kept epoch {best_ep}/{cfg.epochs}: highest training-split primary={best_primary:.6f}")
+    best_acc, best_ce, best_j = adapter.eval_student_vs_teacher(teacher, student, val_loader, temperature=cfg.temperature)
     baseline_acc, baseline_ce, baseline_j = baseline
     return DistillRun(
         seed=seed,
@@ -189,8 +205,29 @@ def distill_student_from_teacher(
         val_acc=float(best_acc),
         val_ce_mean=float(best_ce),
         val_jeffreys_mean=float(best_j),
-        best_val_epoch=best_ep if cfg.keep_best else None,
+        selected_epoch=best_ep if cfg.keep_best else None,
+        selection_primary=float(best_primary),
+        baseline_selection_primary=float(baseline_selection[0]),
+        selection_objective=float(best_obj),
+        baseline_selection_objective=float(baseline_selection[1]),
     )
+
+
+def training_split_selection(
+    adapter: "SurgeryModelAdapter", teacher: nn.Module, student: nn.Module, loader: DataLoader, cfg: "JeffreysDistillConfig"
+) -> Tuple[float, float]:
+    """``(primary, objective)`` of ``student`` on the training-split ``loader`` in evaluation mode: the primary metric
+    (accuracy, PSNR) selects; the objective is recorded."""
+    primary, hard, match = adapter.eval_student_vs_teacher(teacher, student, loader, temperature=cfg.temperature)
+    return float(primary), (1.0 - cfg.distill_weight) * hard + cfg.distill_weight * match
+
+
+def distill_objective(
+    adapter: "SurgeryModelAdapter", teacher: nn.Module, student: nn.Module, loader: DataLoader, cfg: "JeffreysDistillConfig"
+) -> float:
+    """The distillation objective ``(1 - w) * hard + w * match`` of ``student`` on ``loader``, in evaluation mode."""
+    _, hard, match = adapter.eval_student_vs_teacher(teacher, student, loader, temperature=cfg.temperature)
+    return (1.0 - cfg.distill_weight) * hard + cfg.distill_weight * match
 
 
 def distill_metadata(adapter: "SurgeryModelAdapter", summary: DistillSummary) -> Dict[str, Any]:
@@ -227,8 +264,13 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
     )
 
     _, baseline_val_loader = adapter.build_loaders(cfg)
+    select_loader = adapter.build_selection_loader(cfg)
     baseline = adapter.eval_student_vs_teacher(teacher, probe_student, baseline_val_loader, temperature=cfg.temperature)
-    log_line(f"baseline val primary={baseline[0]:.4f} loss={baseline[1]:.4f} match={baseline[2]:.4f}")
+    baseline_selection = training_split_selection(adapter, teacher, probe_student, select_loader, cfg)
+    log_line(
+        f"baseline held-out primary={baseline[0]:.4f} loss={baseline[1]:.4f} match={baseline[2]:.4f}; "
+        f"training-split primary={baseline_selection[0]:.6f} objective={baseline_selection[1]:.6f}"
+    )
     del probe_student, baseline_val_loader
 
     runs: List[DistillRun] = []
@@ -250,25 +292,29 @@ def run_distill(cfg: "JeffreysDistillConfig") -> None:
             adapter=adapter,
             seed=seed,
             baseline=baseline,
+            select_loader=select_loader,
+            baseline_selection=baseline_selection,
             log_prefix=f"distill[{run_number}/{cfg.num_trainings}]",
         )
         run = replace(run, run_index=run_index)
         runs.append(run)
         log_line(
-            f"run {run_number}/{cfg.num_trainings} seed={seed} final val acc={run.val_acc:.4f} "
-            f"ce={run.val_ce_mean:.4f} jeffreys={run.val_jeffreys_mean:.4f}"
-            + (f" best_epoch={run.best_val_epoch}" if run.best_val_epoch is not None else "")
+            f"run {run_number}/{cfg.num_trainings} seed={seed} held-out acc={run.val_acc:.4f} "
+            f"ce={run.val_ce_mean:.4f} jeffreys={run.val_jeffreys_mean:.4f} "
+            f"training-split primary={run.selection_primary:.6f} objective={run.selection_objective:.6f}"
+            + (f" selected_epoch={run.selected_epoch}" if run.selected_epoch is not None else "")
         )
-        if best_run is None or run.val_acc > best_run.val_acc:
+        if best_run is None or run.selection_primary > best_run.selection_primary:
             best_run = run
             best_state = {name: t.detach().cpu().clone() for name, t in student.state_dict().items()}
     if best_run is None or best_state is None:
         raise ValueError("num_trainings must be at least 1")
     summary = DistillSummary.of(runs)
     log_line(
-        f"validation accuracy over {cfg.num_trainings} training run(s): "
+        f"held-out accuracy over {cfg.num_trainings} training run(s): "
         f"mean={summary.student_post_distill_val_acc_mean:.4f} std={summary.student_post_distill_val_acc_std:.4f}; "
-        f"best run={best_run.run_index + 1} seed={best_run.seed} acc={best_run.val_acc:.4f}"
+        f"saved run={best_run.run_index + 1} seed={best_run.seed} (highest training-split primary "
+        f"{best_run.selection_primary:.6f}) acc={best_run.val_acc:.4f}"
     )
 
     best_student, _ = load_surgery_student_checkpoint(pre_path, cfg)

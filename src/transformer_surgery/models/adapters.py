@@ -55,6 +55,11 @@ class SurgeryModelAdapter:
     def build_loaders(self, cfg: Any) -> Tuple[DataLoader, DataLoader]:
         raise NotImplementedError
 
+    def build_selection_loader(self, cfg: Any) -> DataLoader:
+        """The training split in evaluation form (no augmentation, fixed order) for checkpoint selection; the
+        held-out loader of ``build_loaders`` is evaluated only."""
+        raise NotImplementedError(f"No selection loader for model adapter {self.key!r}")
+
     def load_reference_checkpoint(self, path: str) -> nn.Module:
         raise NotImplementedError
 

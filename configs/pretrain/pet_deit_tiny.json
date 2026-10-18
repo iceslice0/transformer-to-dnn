@@ -11,6 +11,5 @@
   "label_smoothing": 0.05,
   "seed": 42,
   "device": "cuda",
-  "cosine_eta_min": 1e-6,
-  "gap_th": 1e-3
+  "cosine_eta_min": 1e-06
 }

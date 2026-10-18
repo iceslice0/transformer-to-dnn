@@ -22,7 +22,6 @@ class PretrainPetConfig(RunConfig):
     seed: int = 42
     max_train_batches: Optional[int] = None
     cosine_eta_min: float = 1e-6
-    gap_th: Optional[float] = None
 
 
 CLI_PRETRAIN_CONFIG_DEFAULT = "configs/pretrain/pet_deit_tiny.json"
@@ -34,10 +33,7 @@ def parse_pretrain_pet_config(argv: Optional[Sequence[str]] = None) -> PretrainP
         description="Pet head training on timm DeiT-Tiny",
         config_default=CLI_PRETRAIN_CONFIG_DEFAULT,
         field_help={
-            "gap_th": (
-                "During training: after each epoch, if val acc is more than this far below the best-so-far "
-                "val acc, restore model weights to that best checkpoint only (optimizer state unchanged)."
-            ),
+            "epochs": "Training epochs; the saved epoch has the highest training-split accuracy (eval transforms).",
         },
         argv=argv,
     )

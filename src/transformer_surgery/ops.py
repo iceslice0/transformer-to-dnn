@@ -311,10 +311,18 @@ class AffineCombine(AffineContract):
         self.reduce_out = reduce_out
         self.inplace = bool(inplace)
         self._coeff_key: Optional[Tuple[int, int]] = None
-        self._coeff_vals: list = []
+        self._coeff_vals: list = [float(v) for v in self.coeff.tolist()]
+        self.register_load_state_dict_post_hook(lambda m, _keys: m._refresh_coefficients())
+
+    def _refresh_coefficients(self) -> None:
+        self._coeff_vals = [float(v) for v in self.coeff.detach().float().cpu().tolist()]
+        self._coeff_key = None
 
     def _coefficients(self) -> list:
-        # Python copies of ``coeff``, refreshed when PTQ swaps in quantized coefficients or the buffer moves.
+        # Python copies of ``coeff``, refreshed when PTQ swaps in quantized coefficients or the buffer moves. Under
+        # torch.compile the copies of the loaded state are constants of the compiled graph (no host sync per call).
+        if torch.compiler.is_compiling():
+            return self._coeff_vals
         c = self.coeff
         key = (c.data_ptr(), c._version)
         if key != self._coeff_key:
@@ -388,7 +396,8 @@ class SquareIdentityOperandChain(nn.Module):
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         stacked = RoutingStack((a, b), dim=-2)
         pm = self.operand_mix(stacked)
-        pm = pm.to(torch.result_type(a, b))
+        dtype = torch.promote_types(a.dtype, b.dtype) if torch.compiler.is_compiling() else torch.result_type(a, b)
+        pm = pm.to(dtype)
         sq = self.square(pm)
         return self.out_contract(sq)
 

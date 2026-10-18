@@ -79,10 +79,12 @@ class PairedSRDataset(Dataset):
         patch_size_lq: int = 64,
         repeat: int = 1,
         max_items: Optional[int] = None,
+        center_crop: bool = False,
     ) -> None:
         super().__init__()
         self.scale = scale
         self.train = train
+        self.center_crop = bool(center_crop)
         self.patch_size_lq = patch_size_lq
         self.repeat = max(1, repeat)
         pairs = match_paired_images(Path(hr_dir), Path(lr_dir), scale)
@@ -129,7 +131,15 @@ class PairedSRDataset(Dataset):
         if self.train:
             hr, lr = self._paired_random_crop(hr, lr)
             hr, lr = self._augment(hr, lr)
+        elif self.center_crop:
+            hr, lr = self._paired_center_crop(hr, lr)
         return lr, hr
+
+    def _paired_center_crop(self, hr: torch.Tensor, lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        _, h_lr, w_lr = lr.shape
+        ps, s = self.patch_size_lq, self.scale
+        top, left = (h_lr - ps) // 2, (w_lr - ps) // 2
+        return hr[:, top * s:(top + ps) * s, left * s:(left + ps) * s], lr[:, top:top + ps, left:left + ps]
 
 
 def build_mambair_loaders(cfg: Any) -> Tuple[DataLoader, DataLoader]:
@@ -163,3 +173,22 @@ def build_mambair_loaders(cfg: Any) -> Tuple[DataLoader, DataLoader]:
         paths["val_hr"], paths["val_lr"], scale=cfg.scale, train=False, max_items=cfg.max_val_items
     )
     return make_loaders(train_ds, val_ds, cfg, val_batch_size=1)
+
+
+def build_mambair_selection_loader(cfg: Any) -> DataLoader:
+    """The DIV2K training pairs as one centered training-size patch each, without augmentation and in a fixed order:
+    the data for checkpoint selection. Set5 is evaluated only."""
+    from transformer_surgery.models.mambair.download import default_sr_paths
+
+    defaults = default_sr_paths(cfg.data_dir, cfg.scale)
+    paths = {key: getattr(cfg, key) or default for key, default in defaults.items()}
+    select_ds = PairedSRDataset(
+        paths["train_hr"],
+        paths["train_lr"],
+        scale=cfg.scale,
+        train=False,
+        patch_size_lq=cfg.patch_size,
+        max_items=cfg.max_train_items,
+        center_crop=True,
+    )
+    return DataLoader(select_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.workers)

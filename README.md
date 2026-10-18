@@ -112,7 +112,7 @@ Evaluation reports token NLL and perplexity (primary metric is `-NLL`). Scalar p
 
 Default configs under `configs/`:
 
-- `configs/pretrain/pet_deit_tiny.json` - Pet classifier-head training for the timm reference.
+- `configs/pretrain/pet_deit_tiny.json` - Pet classifier-head training for the timm reference (`make pretrain`; the saved epoch has the highest training-split accuracy, and the Pet test split is evaluated once, never selected on).
 - `configs/surgery/topk64_strict_sr.json` - **strict** compile (DNN ops only), top-k 64; `topk64_strict.json` uses polarization for every product.
 - `configs/surgery/topk64_fast.json` - **fast** compile (DNN ops + matmul), top-k 64.
 - `configs/distill/64_fast_jeffreys.json` - CE + Jeffreys distillation.

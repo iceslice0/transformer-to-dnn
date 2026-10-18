@@ -1,5 +1,9 @@
 # Exact Tail-Mass vs Calibrated (Pet Fast)
 
+> Numbers in this file predate the 2026-10-17 leak-fix rerun (new Pet reference, 91.36% instead of 91.52%; checkpoint
+> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/` and
+> the paper tables (`scripts/check_paper_numbers.py`).
+
 Pre-finetune val accuracy and omitted-tail mass after surgery (`make a` calibrated fast vs `make e` exact), reference
 LayerNorm eps 1e-6 (rerun 2026-10-09, logs in `artifacts/logs/eps_rerun_2026-10-09/`).
 Accuracies are `student_pre_ft_val_acc`. Calibrated mean \(q\) is `gibbs_tail_prob_eps_calibrated_mean`.

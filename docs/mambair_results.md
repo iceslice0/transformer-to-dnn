@@ -1,7 +1,13 @@
 # MambaIRv2-Light Results (Set5, DIV2K fine-tuning)
 
+> Numbers in this file predate the 2026-10-17/18 leak-fix reruns (fine-tunes now keep the epoch with the highest
+> training PSNR; `artifacts/logs/leakfix_accsel_2026-10-18/`). Current values: `artifacts/metadata/mambair_*_set5_by_k.json`
+> and the paper tables (`scripts/check_paper_numbers.py`).
+
 Reference LayerNorm eps 1e-5 (rerun 2026-10-09/10, logs in `artifacts/logs/eps_rerun_2026-10-09/`).
-Y-channel PSNR (dB) on Set5 before (pre = surgery) and after (post = 3 epochs of L1 fine-tuning on DIV2K, best epoch).
+Y-channel PSNR (dB) on Set5 before (pre = surgery) and after (post = 3 epochs of L1 fine-tuning on DIV2K; since
+2026-10-18 the kept epoch has the highest training PSNR on one centered patch per DIV2K training pair, before that the
+best Set5 epoch).
 Generated from per-run metadata by `scripts/summarize_mambair.py` (summaries in `artifacts/metadata/mambair_x*_set5_by_k.json`;
 pre-2026-10-03 summaries, which predate the 2026-07-27 reruns, are kept in `artifacts/metadata/mambair_by_k_2026-07-27/`).
 Tail drop (q=0) sweep: `make mambair-x4-tailmass0`, logs in `artifacts/logs/mambair_x4_tailmass0_2026-10-03/`.

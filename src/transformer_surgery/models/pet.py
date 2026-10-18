@@ -82,22 +82,33 @@ def build_pet_loaders(cfg: Any) -> Tuple[DataLoader, DataLoader]:
     return make_loaders(train_set, val_set, cfg)
 
 
-def _fmt_best_epoch(best_ep: Optional[int]) -> str:
-    """Training epoch (1-based), ``resume`` when baseline was seeded from a checkpoint (0), else ``—``."""
-    if best_ep is None:
-        return "—"
-    return "resume" if best_ep == 0 else str(best_ep)
+def build_pet_selection_loader(cfg: Any) -> DataLoader:
+    """The Pet training split (``trainval``) with the eval transforms, in a fixed order: the data for checkpoint
+    selection. Pet has no official validation split, and its ``test`` split is only evaluated, never selected on."""
+    _, eval_tf = build_vit_transforms(cfg)
+    select_set = OxfordIIITPet(root=cfg.data_dir, split="trainval", transform=eval_tf, download=False)
+    return DataLoader(
+        select_set,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.workers,
+        pin_memory=get_device().type == "cuda",
+    )
 
 
 def train_timm_deit_on_pet(
     model: nn.Module,
     train_loader: DataLoader,
-    val_loader: DataLoader,
+    select_loader: DataLoader,
+    test_loader: DataLoader,
     cfg: Any,
-    *,
-    resume_val_acc: Optional[float] = None,
-) -> Tuple[float, float, Optional[int], int]:
-    """Pet timm DeiT-Tiny classifier-head training; returns final val acc/loss, best epoch and gap-revert count."""
+) -> Tuple[float, float, int, float, float]:
+    """Pet timm DeiT-Tiny classifier-head training.
+
+    Keeps the epoch with the highest training accuracy on ``select_loader`` (the training split with eval transforms),
+    the earlier one on ties, and evaluates ``test_loader`` once, on the kept weights. Returns test accuracy and loss,
+    the selected epoch, and the training-split loss and accuracy of the selected epoch.
+    """
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     for n, p in model.named_parameters():
         p.requires_grad = n.startswith("head")
@@ -119,15 +130,10 @@ def train_timm_deit_on_pet(
     device = get_device()
     use_cuda = device.type == "cuda"
     pf = "pet ref "
+    best_loss = float("nan")
     best_acc = float("-inf")
     best_state: Optional[dict] = None
-    best_ep: Optional[int] = None
-    gap_revert_count = 0
-    if resume_val_acc is not None:
-        best_acc = float(resume_val_acc)
-        best_state = copy.deepcopy(model.state_dict())
-        best_ep = 0
-        print(f"  {pf}seed best from resume: val_acc={best_acc:.4f} (checkpoint baseline weights)", flush=True)
+    best_ep = 0
     for ep in range(cfg.epochs):
         model.train()
         for n_batches, (x, y) in enumerate(train_loader, start=1):
@@ -142,25 +148,14 @@ def train_timm_deit_on_pet(
             scheduler.step()
             if cfg.max_train_batches is not None and n_batches >= cfg.max_train_batches:
                 break
-        acc, loss_v = accuracy_and_loss(model, val_loader, criterion)
-        print(f"  {pf}epoch {ep + 1}/{cfg.epochs} | val acc={acc:.4f} loss={loss_v:.4f}", flush=True)
-        if acc > best_acc:
-            best_acc = acc
-            best_ep = ep + 1
+        train_acc, train_loss = accuracy_and_loss(model, select_loader, criterion)
+        print(f"  {pf}epoch {ep + 1}/{cfg.epochs} | train-split acc={train_acc:.4f} loss={train_loss:.4f}", flush=True)
+        if train_acc > best_acc:
+            best_loss, best_acc, best_ep = train_loss, train_acc, ep + 1
             best_state = copy.deepcopy(model.state_dict())
-
-        if cfg.gap_th is not None and best_state is not None and acc < best_acc - cfg.gap_th:
-            model.load_state_dict(best_state)
-            acc, loss_v = accuracy_and_loss(model, val_loader, criterion)
-            gap_revert_count += 1
-            print(
-                f"  {pf}gap revert #{gap_revert_count}: val acc below best by > {cfg.gap_th} "
-                f"(best={best_acc:.4f} @ {_fmt_best_epoch(best_ep)}) — restored best weights "
-                f"(val acc={acc:.4f} loss={loss_v:.4f})",
-                flush=True,
-            )
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"  {pf}kept best val acc={best_acc:.4f} (epoch {_fmt_best_epoch(best_ep)}/{cfg.epochs})", flush=True)
-    acc_f, loss_f = accuracy_and_loss(model, val_loader, criterion)
-    return acc_f, loss_f, best_ep, gap_revert_count
+    if best_state is None:
+        raise ValueError("Pet reference training needs at least one epoch")
+    model.load_state_dict(best_state)
+    print(f"  {pf}kept epoch {best_ep}/{cfg.epochs}: highest train-split acc={best_acc:.4f}", flush=True)
+    acc_f, loss_f = accuracy_and_loss(model, test_loader, criterion)
+    return acc_f, loss_f, best_ep, best_loss, best_acc

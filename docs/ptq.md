@@ -230,31 +230,35 @@ adds the output identity when `ptq_output_identity` is set, installs skeleton `C
 `ptq_wrappers`, moves the model to fp32, and then loads the checkpoint state dict strictly. The PTQ run validates this reloaded checkpoint, so saved artifacts
 are checked through the same path downstream code uses.
 
-## Results (Pet, 2026-10-17: fp32 simulation, bf16 reference, 8-bit logits)
+## Results (Pet, 2026-10-18: fp32 simulation, bf16 reference, 8-bit logits, new Pet reference)
+
+Rerun 2026-10-18 in the leak-fix batch (`artifacts/logs/leakfix_2026-10-17/`): the Pet reference and the distilled
+checkpoints are selected on the training split only (`docs/distill.md`, Checkpoint selection). The extended rows were
+rerun on 2026-10-18 after the switch to training-accuracy selection (`artifacts/logs/leakfix_accsel_2026-10-18/`).
 
 All 24 paper configs set `quantize_output: true` (8-bit logits, `output_bits` default). The float reference is the bf16
 model (calibration under autocast); the PTQ model runs in fp32 with the checks above. Largest integer sum bound over all
-runs: 4.41e6 (extended k=16, `patch_embed.proj`), against 2^24 = 1.68e7. Log `artifacts/logs/ptq_fp32_2026-10-17/run.log`
+runs: 4.39e6, against 2^24 = 1.68e7.
 (the batch with the wrong fp32 reference is kept as `run_fp32_reference_INVALID.log`); the previous artifacts are in
 `artifacts/backup_ptq_fp32_2026-10-17/`. "out f" is the PTQ model with the output identity bypassed (logits not quantized);
-quantizing the logits moves accuracy by -0.22 to +0.19 points. The extended k=197 rows were rerun after the k=197 surgery and distill
+quantizing the logits moves accuracy by -0.16 to +0.30 points. The extended k=197 rows were rerun after the k=197 surgery and distill
 reruns of the same day (`artifacts/logs/sync_fullsupport_2026-10-17/`), which use the dense full-support value mix. Strict with exact GELU matches no NPU
 configuration and is a side comparison only.
 
 | k | graph | nodes | bf16 | PTQ per-channel | Δ | out f | PTQ per-tensor | Δ | out f |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | strict, sigmoid GELU | 380 | 83.97 | 82.91 | -1.06 | 83.13 | 83.54 | -0.44 | 83.40 |
-| 32 | strict, sigmoid GELU | 380 | 87.60 | 86.86 | -0.74 | 86.89 | 87.03 | -0.57 | 87.00 |
-| 64 | strict, sigmoid GELU | 380 | 89.62 | 89.59 | -0.03 | 89.56 | 89.72 | +0.11 | 89.67 |
-| 197 | strict, sigmoid GELU | 368 | 90.54 | 90.08 | -0.46 | 90.13 | 90.16 | -0.38 | 90.22 |
-| 16 | extended | 247 | 88.58 | 85.25 | -3.33 | 85.28 | 84.96 | -3.62 | 84.96 |
-| 32 | extended | 247 | 90.19 | 87.44 | -2.75 | 87.44 | 86.78 | -3.41 | 86.81 |
-| 64 | extended | 247 | 91.17 | 87.35 | -3.82 | 87.52 | 87.87 | -3.30 | 87.82 |
-| 197 | extended | 235 | 91.66 | 88.25 | -3.41 | 88.44 | 88.66 | -3.00 | 88.69 |
-| 16 | strict, GELU (no NPU configuration) | 344 | 85.96 | 84.82 | -1.14 | 84.79 | 85.36 | -0.60 | 85.31 |
-| 32 | strict, GELU (no NPU configuration) | 344 | 89.13 | 88.58 | -0.55 | 88.74 | 88.25 | -0.87 | 88.20 |
-| 64 | strict, GELU (no NPU configuration) | 344 | 90.68 | 90.02 | -0.65 | 89.83 | 90.08 | -0.60 | 90.02 |
-| 197 | strict, GELU (no NPU configuration) | 332 | 91.25 | 91.25 | +0.00 | 91.22 | 90.65 | -0.60 | 90.54 |
+| 16 | strict, sigmoid GELU | 380 | 84.08 | 82.61 | -1.47 | 82.72 | 83.02 | -1.06 | 83.10 |
+| 32 | strict, sigmoid GELU | 380 | 87.98 | 87.30 | -0.68 | 87.08 | 87.27 | -0.71 | 87.11 |
+| 64 | strict, sigmoid GELU | 380 | 89.78 | 89.72 | -0.05 | 89.78 | 89.64 | -0.14 | 89.62 |
+| 197 | strict, sigmoid GELU | 368 | 90.73 | 90.27 | -0.46 | 90.35 | 89.75 | -0.98 | 89.89 |
+| 16 | extended | 247 | 88.58 | 86.13 | -2.45 | 86.05 | 84.90 | -3.68 | 85.06 |
+| 32 | extended | 247 | 90.19 | 86.26 | -3.92 | 86.32 | 86.54 | -3.65 | 86.62 |
+| 64 | extended | 247 | 90.76 | 87.44 | -3.33 | 87.44 | 87.16 | -3.60 | 87.11 |
+| 197 | extended | 235 | 91.36 | 88.74 | -2.62 | 88.69 | 88.50 | -2.86 | 88.53 |
+| 16 | strict, GELU (no NPU configuration) | 344 | 86.37 | 84.93 | -1.44 | 84.63 | 85.47 | -0.90 | 85.42 |
+| 32 | strict, GELU (no NPU configuration) | 344 | 89.07 | 88.31 | -0.76 | 88.25 | 88.39 | -0.68 | 88.36 |
+| 64 | strict, GELU (no NPU configuration) | 344 | 90.35 | 89.86 | -0.49 | 89.89 | 90.41 | +0.05 | 90.24 |
+| 197 | strict, GELU (no NPU configuration) | 332 | 91.06 | 90.98 | -0.08 | 91.06 | 91.25 | +0.19 | 91.28 |
 
 ## Results (Pet, 2026-10-10, bf16 simulation; superseded by the fp32 rerun of 2026-10-17)
 

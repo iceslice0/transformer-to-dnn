@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Train only the Pet classifier head on timm DeiT-Tiny (ImageNet backbone frozen). Saves weights for surgery."""
+"""Train only the Pet classifier head on timm DeiT-Tiny (ImageNet backbone frozen). Saves weights for surgery.
+
+The saved epoch has the highest training-split accuracy; the Pet test split is evaluated once, on the saved weights.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from transformer_surgery.internal.util import accuracy_and_loss, set_seed
 from transformer_surgery.models.pet import (
     PET_NUM_CLASSES,
     build_pet_loaders,
+    build_pet_selection_loader,
     create_timm_deit_tiny,
     load_timm_deit_checkpoint,
     train_timm_deit_on_pet,
@@ -28,30 +32,27 @@ def main() -> None:
     device = apply_device_from_config(cfg)
     out_abs = traceable_artifact_path(cfg.output, cfg, "ts-pretrain-pet", extension=".pt")
     cfg.output = out_abs
-    train_loader, val_loader = build_pet_loaders(cfg)
+    train_loader, test_loader = build_pet_loaders(cfg)
+    select_loader = build_pet_selection_loader(cfg)
 
-    # Resume from an earlier run's output when present, else start from the ImageNet-pretrained backbone.
-    resume_acc = None
-    if os.path.isfile(out_abs):
-        resume_acc = float(torch.load(out_abs, map_location="cpu", weights_only=False)["val_acc"])
-        print(f"init checkpoint={out_abs}\nresume best_acc (val_acc in checkpoint)={resume_acc:.4f}", flush=True)
-        model = load_timm_deit_checkpoint(out_abs, PET_NUM_CLASSES)
-        model.train()
-    else:
-        print("init=imagenet_pretrained", flush=True)
-        model = create_timm_deit_tiny(PET_NUM_CLASSES, pretrained=True).to(device)
+    # Always from the ImageNet-pretrained backbone: the checkpoint is selected on the training split only, and the
+    # test split is evaluated once, on the selected weights.
+    print("init=imagenet_pretrained", flush=True)
+    model = create_timm_deit_tiny(PET_NUM_CLASSES, pretrained=True).to(device)
 
     print(f"device={describe_device(device)} config={asdict(cfg)}", flush=True)
-    acc, loss_v, best_ep, gap_reverts = train_timm_deit_on_pet(
-        model, train_loader, val_loader, cfg, resume_val_acc=resume_acc
+    acc, loss_v, selected_ep, select_loss, select_acc = train_timm_deit_on_pet(
+        model, train_loader, select_loader, test_loader, cfg
     )
 
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
     train_config = {
         **asdict(cfg),
-        "best_val_epoch": best_ep,
-        "best_acc_reference": resume_acc,
-        "gap_revert_count": gap_reverts,
+        "init": "imagenet_pretrained",
+        "selection": "highest accuracy on the trainval split with eval transforms (earlier epoch on ties)",
+        "selected_epoch": selected_ep,
+        "selection_train_loss": select_loss,
+        "selection_train_acc": select_acc,
     }
     torch.save(
         {
@@ -64,13 +65,13 @@ def main() -> None:
         },
         out_abs,
     )
-    print(f"saved {out_abs} val_acc={acc:.4f} val_loss={loss_v:.4f}", flush=True)
+    print(f"saved {out_abs} test acc={acc:.4f} loss={loss_v:.4f} (selected epoch {selected_ep})", flush=True)
 
-    acc2, _ = accuracy_and_loss(load_timm_deit_checkpoint(out_abs, PET_NUM_CLASSES), val_loader, nn.CrossEntropyLoss())
+    acc2, _ = accuracy_and_loss(load_timm_deit_checkpoint(out_abs, PET_NUM_CLASSES), test_loader, nn.CrossEntropyLoss())
     if abs(acc2 - acc) > 1e-4:
         print(f"WARNING reload acc mismatch {acc:.6f} vs {acc2:.6f}", flush=True)
     else:
-        print(f"reload_ok val_acc={acc2:.4f}", flush=True)
+        print(f"reload_ok test acc={acc2:.4f}", flush=True)
 
 
 if __name__ == "__main__":
