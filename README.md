@@ -130,7 +130,7 @@ Generated outputs are git-ignored:
 
 Tracked exceptions, so the reported numbers can be checked without rerunning: the Pet reference checkpoint, every run
 metadata JSON in `artifacts/metadata/` except the PTQ runs outside `make ptq-paper`, and the logs
-`artifacts/logs/{latency_compiled,dtype_check,profile_gs_ref}_2026-10-18/*.json` and `artifacts/logs/tail_heldout_2026-10-19/tail_heldout.json`. They were added with `git add -f`;
+`artifacts/logs/{latency_compiled,dtype_check,profile_gs_ref}_2026-10-18/*.json` , `artifacts/logs/tail_heldout_2026-10-19/tail_heldout.json` and `artifacts/logs/memory_eager_2026-10-19/memory.json`. They were added with `git add -f`;
 a rerun that rewrites them shows up in `git status`. `scripts/check_paper_numbers.py` reads only these files.
 
 Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64_fast.pt`, `ts_distill_64_fast_jeffreys.pt`, `ts_ptq_64_fast_jeffreys_8bit.pt`, plus matching metadata where the stage writes it and surgery/PTQ logs.

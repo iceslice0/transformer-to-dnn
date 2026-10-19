@@ -1,0 +1,266 @@
+{
+  "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "rows": [
+    {
+      "name": "reference",
+      "peak_bytes": 62151168,
+      "resident_bytes": 11078144,
+      "model_bytes": 11063114,
+      "acc": 0.913600436086127,
+      "loss": 0.3182350755485146,
+      "peak_vs_ref": 1.0
+    },
+    {
+      "name": "topk16_fast",
+      "peak_bytes": 100536832,
+      "resident_bytes": 11147264,
+      "model_bytes": 11063532,
+      "acc": 0.8623603161624421,
+      "loss": 0.5204798650858544,
+      "peak_vs_ref": 1.617617741310992
+    },
+    {
+      "name": "topk16_hadamard_sr_gs",
+      "peak_bytes": 541922816,
+      "resident_bytes": 11165696,
+      "model_bytes": 11063604,
+      "acc": 0.8351049332243118,
+      "loss": 0.543328073896157,
+      "peak_vs_ref": 8.719430920429364
+    },
+    {
+      "name": "topk16_strict_sr_gs",
+      "peak_bytes": 537319936,
+      "resident_bytes": 11252736,
+      "model_bytes": 11064526,
+      "acc": 0.8408285636413192,
+      "loss": 0.538292216032979,
+      "peak_vs_ref": 8.645371491650808
+    },
+    {
+      "name": "topk16_strict_sr_gs_pol",
+      "peak_bytes": 2930341376,
+      "resident_bytes": 11246592,
+      "model_bytes": 11064600,
+      "acc": 0.8394657944944126,
+      "loss": 0.5374053514240937,
+      "peak_vs_ref": 47.14861313628088
+    },
+    {
+      "name": "topk32_fast",
+      "peak_bytes": 144040960,
+      "resident_bytes": 11147264,
+      "model_bytes": 11063532,
+      "acc": 0.8923412373943854,
+      "loss": 0.4050357513968384,
+      "peak_vs_ref": 2.3175905559811842
+    },
+    {
+      "name": "topk32_hadamard_sr_gs",
+      "peak_bytes": 541922816,
+      "resident_bytes": 11165696,
+      "model_bytes": 11063604,
+      "acc": 0.8746252384846007,
+      "loss": 0.4137375114983647,
+      "peak_vs_ref": 8.719430920429364
+    },
+    {
+      "name": "topk32_strict_sr_gs",
+      "peak_bytes": 537319936,
+      "resident_bytes": 11252736,
+      "model_bytes": 11064526,
+      "acc": 0.8798037612428454,
+      "loss": 0.41255839678727174,
+      "peak_vs_ref": 8.645371491650808
+    },
+    {
+      "name": "topk32_strict_sr_gs_pol",
+      "peak_bytes": 2930341376,
+      "resident_bytes": 11246592,
+      "model_bytes": 11064600,
+      "acc": 0.8770782229490325,
+      "loss": 0.41159567491142,
+      "peak_vs_ref": 47.14861313628088
+    },
+    {
+      "name": "topk64_fast",
+      "peak_bytes": 229703168,
+      "resident_bytes": 11147264,
+      "model_bytes": 11063532,
+      "acc": 0.9035159443990188,
+      "loss": 0.34872889837149085,
+      "peak_vs_ref": 3.695878539241612
+    },
+    {
+      "name": "topk64_hadamard_sr_gs",
+      "peak_bytes": 541922816,
+      "resident_bytes": 11165696,
+      "model_bytes": 11063604,
+      "acc": 0.8958844371763424,
+      "loss": 0.3517276559093077,
+      "peak_vs_ref": 8.719430920429364
+    },
+    {
+      "name": "topk64_strict_sr_gs",
+      "peak_bytes": 537319936,
+      "resident_bytes": 11252736,
+      "model_bytes": 11064526,
+      "acc": 0.8977923139820114,
+      "loss": 0.3522614515194876,
+      "peak_vs_ref": 8.645371491650808
+    },
+    {
+      "name": "topk64_strict_sr_gs_pol",
+      "peak_bytes": 2930341376,
+      "resident_bytes": 11246592,
+      "model_bytes": 11064600,
+      "acc": 0.8969746524938675,
+      "loss": 0.350817102539861,
+      "peak_vs_ref": 47.14861313628088
+    },
+    {
+      "name": "topk197_fast",
+      "peak_bytes": 152054784,
+      "resident_bytes": 11147264,
+      "model_bytes": 11063532,
+      "acc": 0.913600436086127,
+      "loss": 0.3178588501209458,
+      "peak_vs_ref": 2.4465313990559276
+    },
+    {
+      "name": "topk197_hadamard_sr_gs",
+      "peak_bytes": 1073426432,
+      "resident_bytes": 11165696,
+      "model_bytes": 11063604,
+      "acc": 0.9035159443990188,
+      "loss": 0.3210995524155083,
+      "peak_vs_ref": 17.27121897371261
+    },
+    {
+      "name": "topk197_strict_sr_gs",
+      "peak_bytes": 1066062336,
+      "resident_bytes": 11252736,
+      "model_bytes": 11064526,
+      "acc": 0.9073316980103571,
+      "loss": 0.32283309059007903,
+      "peak_vs_ref": 17.152732125645652
+    },
+    {
+      "name": "topk197_strict_sr_gs_pol",
+      "peak_bytes": 3919230976,
+      "resident_bytes": 11246592,
+      "model_bytes": 11064600,
+      "acc": 0.9056963750340692,
+      "loss": 0.3201280470666394,
+      "peak_vs_ref": 63.05965120398059
+    },
+    {
+      "name": "topk16_fast_qc32",
+      "peak_bytes": 95901184,
+      "resident_bytes": 11147264,
+      "model_bytes": 11657964,
+      "acc": 0.8013082583810303,
+      "loss": 0.6988205658898883,
+      "peak_vs_ref": 1.5430310818937465
+    },
+    {
+      "name": "topk16_hadamard_sr_gs_qc32",
+      "peak_bytes": 137072128,
+      "resident_bytes": 11165696,
+      "model_bytes": 11658036,
+      "acc": 0.7860452439356773,
+      "loss": 0.7261749625238485,
+      "peak_vs_ref": 2.2054634274934304
+    },
+    {
+      "name": "topk16_strict_sr_gs_qc32",
+      "peak_bytes": 136158720,
+      "resident_bytes": 11252736,
+      "model_bytes": 11658958,
+      "acc": 0.7822294903243391,
+      "loss": 0.7490205096756609,
+      "peak_vs_ref": 2.190766873439933
+    },
+    {
+      "name": "topk16_strict_sr_gs_pol_qc32",
+      "peak_bytes": 366515712,
+      "resident_bytes": 11246592,
+      "model_bytes": 11659032,
+      "acc": 0.7844099209593894,
+      "loss": 0.7390685685813573,
+      "peak_vs_ref": 5.897165311519165
+    },
+    {
+      "name": "topk32_fast_qc32",
+      "peak_bytes": 141430784,
+      "resident_bytes": 11147264,
+      "model_bytes": 11657964,
+      "acc": 0.8713545925320251,
+      "loss": 0.4600137714210275,
+      "peak_vs_ref": 2.275593340417995
+    },
+    {
+      "name": "topk32_hadamard_sr_gs_qc32",
+      "peak_bytes": 221464576,
+      "resident_bytes": 11165696,
+      "model_bytes": 11658036,
+      "acc": 0.8566366857454347,
+      "loss": 0.4702711378270646,
+      "peak_vs_ref": 3.563321223504601
+    },
+    {
+      "name": "topk32_strict_sr_gs_qc32",
+      "peak_bytes": 220331520,
+      "resident_bytes": 11252736,
+      "model_bytes": 11658958,
+      "acc": 0.8596347778686291,
+      "loss": 0.4760227156582175,
+      "peak_vs_ref": 3.5450905765761314
+    },
+    {
+      "name": "topk32_strict_sr_gs_pol_qc32",
+      "peak_bytes": 683867648,
+      "resident_bytes": 11246592,
+      "model_bytes": 11659032,
+      "acc": 0.8555464704279095,
+      "loss": 0.469468381626465,
+      "peak_vs_ref": 11.003295191491816
+    },
+    {
+      "name": "topk64_fast_qc32",
+      "peak_bytes": 231934464,
+      "resident_bytes": 11147264,
+      "model_bytes": 11657964,
+      "acc": 0.8980648678113927,
+      "loss": 0.3606653720359771,
+      "peak_vs_ref": 3.7317796505449423
+    },
+    {
+      "name": "topk64_hadamard_sr_gs_qc32",
+      "peak_bytes": 389562880,
+      "resident_bytes": 11165696,
+      "model_bytes": 11658036,
+      "acc": 0.8863450531479967,
+      "loss": 0.3690486646991687,
+      "peak_vs_ref": 6.267989686050631
+    },
+    {
+      "name": "topk64_strict_sr_gs_qc32",
+      "peak_bytes": 387229184,
+      "resident_bytes": 11252736,
+      "model_bytes": 11658958,
+      "acc": 0.8887980376124285,
+      "loss": 0.36905066094303624,
+      "peak_vs_ref": 6.230440979001393
+    },
+    {
+      "name": "topk64_strict_sr_gs_pol_qc32",
+      "peak_bytes": 1315937792,
+      "resident_bytes": 11246592,
+      "model_bytes": 11659032,
+      "acc": 0.8898882529299537,
+      "loss": 0.36413138372172255,
+      "peak_vs_ref": 21.17317878885237
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check pretrain pet-surgery pet-distill ptq-paper mambair-distill latency-compiled tail-heldout help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check pretrain pet-surgery pet-distill ptq-paper mambair-distill latency-compiled tail-heldout memory-eager help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -179,6 +179,13 @@ latency-compiled:
 	mkdir -p $(LATENCY_LOG)
 	$(PYTHON) scripts/latency_compiled.py $(LATENCY_LOG)/latency.json --modes default reduce-overhead max-autotune \
 		| tee $(LATENCY_LOG)/latency.log
+
+# Peak GPU memory of an eager evaluation pass with only the measured model resident (paper Table 2): surgery measures
+# compiled models while the reference stays on the GPU.
+MEMORY_LOG := artifacts/logs/memory_eager_2026-10-19
+memory-eager:
+	mkdir -p $(MEMORY_LOG)
+	$(PYTHON) scripts/memory_eager.py $(MEMORY_LOG)/memory.json | tee $(MEMORY_LOG)/memory.log
 
 # Calibrated tail mass (Pet training split) against the exact tail mass on the held-out validation split;
 # repeats each surgery calibration and checks it against the saved calibrated mean.

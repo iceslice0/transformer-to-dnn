@@ -56,3 +56,14 @@ fastest mode counts, as the median of five timed runs over the ten batches. The 
 takes 2.20 ms per batch; at k=16 the extended, Hadamard and strict graphs take 7.21, 9.18 and 11.08 ms. The per-module
 profile above runs eagerly and synchronizes around every module, so its totals are not forward latencies. Peak memory
 stays the eager whole-pass peak from the surgery metadata. `scripts/check_paper_numbers.py` reads `latency.json`.
+
+## Eager peak memory with one model resident (2026-10-19)
+
+`student_pre_ft_val_peak_gpu_mem_bytes` in the surgery metadata is the absolute peak of the evaluation pass while the
+reference model is still on the GPU, so it includes the reference weights (about 11 MB), while
+`ref_val_peak_gpu_mem_bytes` does not. `make memory-eager` (`scripts/memory_eager.py`; log
+`artifacts/logs/memory_eager_2026-10-19/`) measures every model of paper Table 2 and the reference the same way: nothing
+allocated before the model is loaded (the cuBLAS workspace is cleared, since PyTorch counts it as allocated), then one
+eager bf16 evaluation pass over the held-out Pet test split with the surgery evaluation function. Reference peak 62.2 MB;
+every accuracy matches the surgery metadata. The memory column of Table 2 and the memory claims of the paper read
+`memory.json`.

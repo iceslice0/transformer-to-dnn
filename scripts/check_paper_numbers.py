@@ -20,6 +20,12 @@ import sys
 
 LATENCY_JSON = "artifacts/logs/latency_compiled_2026-10-18/latency.json"  # make latency-compiled
 TAIL_HELDOUT_JSON = "artifacts/logs/tail_heldout_2026-10-19/tail_heldout.json"  # make tail-heldout
+MEMORY_JSON = "artifacts/logs/memory_eager_2026-10-19/memory.json"  # make memory-eager
+
+
+def eager_memory(repo: str) -> dict:
+    """Peak bytes of an eager evaluation pass with only that model on the GPU, by model name ("reference" included)."""
+    return {r["name"]: r for r in json.load(open(f"{repo}/{MEMORY_JSON}"))["rows"]}
 
 
 def compiled_latency(repo: str) -> dict:
@@ -97,6 +103,7 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
                 cells, i, t = at; f, raw = origin[id(cells)]; FIXES.append((f, raw, i, t, exp))
     r2 = lambda x: round(x, 2)
     LAT = {n: r["latency_vs_ref"] for n, r in compiled_latency(REPO).items()}
+    MEM = eager_memory(REPO)
     sel = lambda d: 100 * d["student_post_distill_val_acc"]  # the saved run: highest training-split primary metric
     # Table 2
     support = "topk"
@@ -116,8 +123,9 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
             s = S(n)
             cmp(f"T2 k={k} {n} acc", num(cells[off])[0], 100*s["student_pre_ft_val_acc"], 0.005, (cells, off, 0))
             cmp(f"T2 k={k} {n} lat", num(cells[off+1])[0], LAT[n], half_ulp(cells[off+1]), (cells, off+1, 0))
-            mr = s["student_pre_ft_val_peak_gpu_mem_bytes"] / s["ref_val_peak_gpu_mem_bytes"]
-            cmp(f"T2 k={k} {n} mem", num(cells[off+2])[0], mr, 0.005 if mr < 10 else 0.05, (cells, off+2, 0))
+            cmp(f"T2 k={k} {n} acc = memory-run acc", 100*MEM[n]["acc"], 100*s["student_pre_ft_val_acc"], 0.005)
+            mr = MEM[n]["peak_bytes"] / MEM["reference"]["peak_bytes"]
+            cmp(f"T2 k={k} {n} mem", num(cells[off+2])[0], mr, half_ulp(cells[off+2]), (cells, off+2, 0))
     # Table 3
     for cells in table_rows("tab:ptq"):
         k = int(cells[0]); g = cells[2]
@@ -266,7 +274,7 @@ def check_text(P: str, M: str, repo: str) -> int:
     def D(k, l): return json.load(open(f"{M}/ts_distill_{k}_fast_{l}.json"))["calibration"]
     acc = lambda n: 100*S(n)["student_pre_ft_val_acc"]
     LR = compiled_latency(repo); L = {n: r["latency_vs_ref"] for n, r in LR.items()}
-    mem = lambda n: S(n)["student_pre_ft_val_peak_gpu_mem_bytes"]/1e6
+    MEM = eager_memory(repo); mem = lambda n: MEM[n]["peak_bytes"]/1e6
     KS = [1, 2, 4, 8, 16, 32, 64, 96, 128, 197]
     bad = 0
     def claim(desc, ok, detail=""):
@@ -295,7 +303,10 @@ def check_text(P: str, M: str, repo: str) -> int:
     claim("top-k k<=64: Hadamard 1.2..1.3, strict 1.4..1.5 x extended", rng(ht) == ("1.2", "1.3") and rng(st) == ("1.4", "1.5") and has("runs at $1.2$ to $1.3$ times the latency of the extended graph, against $1.4$ to $1.5$ for the strict graph"), "%s..%s / %s..%s" % (rng(ht, 3) + rng(st, 3)))
     po = [L[f"topk{k}_strict_sr_gs_pol"] / L[f"topk{k}_strict_sr_gs"] for k in (16, 32, 64)]
     claim("polarization 13..14x slower than strict, top-k k<=64", rng(po, 0) == ("13", "14") and has("runs $13$ to $14$ times slower"), "%s..%s" % rng(po, 2))
-    claim("compiled reference 2.20 ms per batch", f"{LR['reference']['ms_per_batch']:.2f}" == "2.20" and has("The compiled reference takes $2.20$\\,ms per batch") and has("which takes $2.20$\\,ms per batch of 32"))
+    claim("reference eager peak 62 MB", f"{mem('reference'):.0f}" == "62" and has("per batch of 32 and $62$\\,MB"))
+    pm = [mem(f"topk{k}_strict_sr_gs_pol")/mem(f"topk{k}_strict_sr_gs") for k in (16, 32, 64)]
+    claim("polarization 5.5x the memory of strict, top-k k<=64", {f"{x:.1f}" for x in pm} == {"5.5"} and has("times slower with $5.5$ times the memory"), ", ".join(f"{x:.3f}" for x in pm))
+    claim("compiled reference 2.20 ms per batch", f"{LR['reference']['ms_per_batch']:.2f}" == "2.20" and has("the compiled reference takes $2.20$\\,ms per batch") and has("which takes $2.20$\\,ms per batch of 32"))
     ms = [LR[f"topk16_{g}"]["ms_per_batch"] for g in ("fast", "hadamard_sr_gs", "strict_sr_gs")]
     claim("S4 compiled k=16: 7.21, 9.18, 11.08 ms; strict/extended 1.54", has("take $%.2f$, $%.2f$ and $%.2f$\\,ms" % tuple(ms)) and has("takes $%.2f$ times the time of the extended graph" % (ms[2] / ms[0])), ", ".join(f"{x:.2f}" for x in ms))
     rt = [L[f"topk{k}_strict_sr_qc32"] for k in (16, 32, 64)]; tt = [L[f"topk{k}_strict_sr"] for k in (16, 32, 64)]
@@ -332,6 +343,13 @@ def check_text(P: str, M: str, repo: str) -> int:
     dj = lambda k: D(k, "jeffreys")["student_post_distill_runs"][0]["baseline_val_jeffreys_mean"]
     claim("DJ 0.98 k=8, 0.043 k=64, 2e-4 k=197", f"{dj(8):.2f}" == "0.98" and f"{dj(64):.3f}" == "0.043" and f"{dj(197):.0e}" == "2e-04" and has("falls from $0.98$ at $k=8$ to $0.043$ at $k=64$"), f"{dj(8):.4f} {dj(64):.5f} {dj(197):.2e}")
     d64 = D(64, "jeffreys"); claim("top-64 distilled 90.43±0.18", f"{100*d64['student_post_distill_val_acc_mean']:.2f}±{100*d64['student_post_distill_val_acc_std']:.2f}" == "90.43±0.18" and has("$90.43\\pm0.18\\%$"))
+    rec = lambda k, l: (100*D(k, l)["student_post_distill_val_acc_mean"] - acc(f"topk{k}_fast")) / (100*S("topk197_fast")["ref_val_acc"] - acc(f"topk{k}_fast"))
+    rj = [100*rec(k, "jeffreys") for k in (2, 4, 8, 16, 32)]; rc = [100*rec(k, "ce") for k in (2, 4, 8, 16, 32)]
+    gj = [100*(D(k, "jeffreys")["student_post_distill_val_acc_mean"] - D(k, "ce")["student_post_distill_val_acc_mean"]) for k in (1, 2, 4, 8, 16, 32, 64)]
+    claim("S7: Jeffreys recovers 45..46%, CE 36..43% of the gap for 2<=k<=32; Jeffreys gains most, 1.2..1.5, at k=2,4",
+          (f"{min(rj):.0f}", f"{max(rj):.0f}", f"{min(rc):.0f}", f"{max(rc):.0f}") == ("45", "46", "36", "43") and sorted(range(7), key=lambda i: -gj[i])[:2] == [1, 2]
+          and (f"{min(gj[1:3]):.1f}", f"{max(gj[1:3]):.1f}") == ("1.2", "1.5") and has("recovers $45\\%$ to $46\\%$ of the accuracy gap") and has("and cross-entropy $36\\%$ to $43\\%$") and has("Jeffreys gains most, $1.2$ to $1.5$ points, at $k=2$ and $4$"),
+          ", ".join(f"{x:.1f}" for x in rj + rc))
     claim("ImageNet top-64 within 1.19", f"{100*S('topk64_fast_imagenet')['ref_val_acc'] - acc('topk64_fast_imagenet'):.2f}" == "1.19")
     # MambaIR
     claim("MambaIR exact pre highest for every 0<k<256", all(mbe[k]["pre_psnr"] >= max(mb4[k]["pre_psnr"], (mbd.get(k) or {}).get("pre_psnr") or -1) for k in (0, 1, 2, 4, 16, 64)))
@@ -356,18 +374,18 @@ def check_text(P: str, M: str, repo: str) -> int:
     claim("Pythia k=16,32 exact within 0.002 of drop at 2k", all(abs(pn(k, "tailmass_exact") - pn(2*k, "tailmass0")) <= 0.002 for k in (16, 32)), ", ".join(f"{pn(k,'tailmass_exact') - pn(2*k,'tailmass0'):+.4f}" for k in (16, 32)))
     # clustered
     pw = lambda n: S(n)["student_pointwise_per_input"]
-    rm = lambda n: S(n)["student_pre_ft_val_peak_gpu_mem_bytes"]/S(n)["ref_val_peak_gpu_mem_bytes"]
-    claim("routed k=16: 2.1x vs 7.9x reference memory, 78.22 vs 84.08, latency 5.0 -> 4.7x", f"{L['topk16_strict_sr_gs']:.1f}" == "5.0" and f"{L['topk16_strict_sr_gs_qc32']:.1f}" == "4.7" and has("its latency falls from $5.0$ to $4.7$ times the reference") and f"{rm('topk16_strict_sr_gs_qc32'):.1f}" == "2.1" and f"{rm('topk16_strict_sr_gs'):.1f}" == "7.9" and has("uses $2.1\\times$ instead of $7.9\\times$ the reference memory") and f"{acc('topk16_strict_sr_gs_qc32'):.2f}" == "78.22" and f"{acc('topk16_strict_sr_gs'):.2f}" == "84.08" and has("at $78.22\\%$ against $84.08\\%$ accuracy"))
+    rm = lambda n: MEM[n]["peak_bytes"]/MEM["reference"]["peak_bytes"]
+    claim("routed k=16: 2.2x vs 8.6x reference memory, 78.22 vs 84.08, latency 5.0 -> 4.7x", f"{L['topk16_strict_sr_gs']:.1f}" == "5.0" and f"{L['topk16_strict_sr_gs_qc32']:.1f}" == "4.7" and has("its latency falls from $5.0$ to $4.7$ times the reference") and f"{rm('topk16_strict_sr_gs_qc32'):.1f}" == "2.2" and f"{rm('topk16_strict_sr_gs'):.1f}" == "8.6" and has("uses $2.2\\times$ instead of $8.6\\times$ the reference memory") and f"{acc('topk16_strict_sr_gs_qc32'):.2f}" == "78.22" and f"{acc('topk16_strict_sr_gs'):.2f}" == "84.08" and has("at $78.22\\%$ against $84.08\\%$ accuracy"))
     claim("unary 2.4e7 vs 1.1e8", f"{pw('topk16_strict_sr_gs_qc32'):.1e}" == "2.4e+07" and f"{pw('topk16_strict_sr_gs'):.1e}" == "1.1e+08")
-    claim("k=32 routed 85.96 >= exact top-16 84.08; 37% unary; 42% memory", acc("topk32_strict_sr_gs_qc32") >= acc("topk16_strict_sr_gs") and round(pw("topk32_strict_sr_gs_qc32")/pw("topk16_strict_sr_gs"), 2) == 0.37 and round(mem("topk32_strict_sr_gs_qc32")/mem("topk16_strict_sr_gs"), 2) == 0.42, f"unary ratio {pw('topk32_strict_sr_gs_qc32')/pw('topk16_strict_sr_gs'):.3f} mem ratio {mem('topk32_strict_sr_gs_qc32')/mem('topk16_strict_sr_gs'):.3f}")
-    cut = 1 - mem("topk16_hadamard_sr_gs_qc32")/mem("topk16_hadamard_sr_gs"); claim("routing cuts Hadamard memory by 73% at k=16", f"{100*cut:.0f}" == "73" and has("memory by $73\\%$ at $k=16$"), f"{100*cut:.1f}%")
+    claim("k=32 routed 85.96 >= exact top-16 84.08; 37% unary; 41% memory", acc("topk32_strict_sr_gs_qc32") >= acc("topk16_strict_sr_gs") and round(pw("topk32_strict_sr_gs_qc32")/pw("topk16_strict_sr_gs"), 2) == 0.37 and round(mem("topk32_strict_sr_gs_qc32")/mem("topk16_strict_sr_gs"), 2) == 0.41 and has("$41\\%$ of the memory of exact top-$16$"), f"unary ratio {pw('topk32_strict_sr_gs_qc32')/pw('topk16_strict_sr_gs'):.3f} mem ratio {mem('topk32_strict_sr_gs_qc32')/mem('topk16_strict_sr_gs'):.3f}")
+    cut = 1 - mem("topk16_hadamard_sr_gs_qc32")/mem("topk16_hadamard_sr_gs"); claim("routing cuts Hadamard memory by 75% at k=16", f"{100*cut:.0f}" == "75" and has("memory by $75\\%$ at $k=16$"), f"{100*cut:.1f}%")
     # sampling provenance of the tail statistics and the MambaIR selected epochs
     held = {r["k"]: r for r in json.load(open(f"{repo}/{TAIL_HELDOUT_JSON}"))["rows"]}
     cal_b = {(S(f"topk{k}_fast").get("gibbs_tail_calibration_batches_requested"), S(f"topk{k}_fast")["gibbs_tail_calibration_batches"]) for k in (1, 2, 4, 8, 16, 32, 64, 96, 128)}
     vb = {held[k]["val"]["gibbs_tail_calibration_batches"] for k in held}
     dq = max(abs(held[k]["val"]["gibbs_tail_prob_eps_exact_mean"] - S(f"topk{k}_fast")["gibbs_tail_prob_eps_calibrated_mean"]) for k in (1, 2, 4, 8, 16, 32, 64, 96, 128))
     d16 = max(abs(held[k]["val"]["gibbs_tail_prob_eps_exact_mean"] - S(f"topk{k}_fast")["gibbs_tail_prob_eps_calibrated_mean"]) for k in (16, 32, 64, 96, 128))
-    claim("tab:s-q: calibrated on the training split, exact on the held-out validation split; means within 0.012, 0.001 for k>=16", cal_b == {(None, 115)} and vb == {115} and f"{dq:.3f}" == "0.012" and d16 <= 0.001 and has("on the training split, with the exact per-query tail mass on the held-out validation split") and has("agree within $0.012$, and within $0.001$ for $k\\ge16$"), f"{dq:.4f} / {d16:.4f}")
+    claim("tab:s-q: calibrated on the training split, exact on the held-out validation split; means within 0.012, 0.001 for k>=16", cal_b == {(None, 115)} and vb == {115} and f"{dq:.3f}" == "0.012" and d16 <= 0.001 and has("on the training split, with the exact per-query tail mass on the held-out Pet test split") and has("agree within $0.012$, and within $0.001$ for $k\\ge16$"), f"{dq:.4f} / {d16:.4f}")
     pb = {S(f"pythia_70m_topk{k}_fast_tailmass_exact")["gibbs_tail_calibration_batches"] for k in (1, 2, 4, 8, 16, 32, 64, 128)}
     claim("Pythia tail statistics on 4 random training minibatches", pb == {4} and has("dense scores of 4 random training minibatches of 4 sequences") and has("exact tail mass on 4 training minibatches is $0.062\\pm0.115$"), str(pb))
     import collections, glob
