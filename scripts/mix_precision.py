@@ -1,4 +1,4 @@
-"""bf16 error of the strict value mix on real DeiT-Tiny / Pet inputs (paper Supplementary, polarization and squares).
+"""bf16 error of the strict value mix on real DeiT-Tiny / Pet inputs (polarization and squares).
 
 Captures the float64 inputs (probs, idx, v) of every block's mix on 16 Pet validation images, then evaluates in bf16
 under CUDA autocast and reports ||y - y_fp64|| / ||y_fp64||, averaged over the 12 blocks, for

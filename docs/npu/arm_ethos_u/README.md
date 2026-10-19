@@ -28,6 +28,6 @@ an elementwise MUL into an int32 scratch tensor followed by a reduction. U85 map
 **Strict graph: whole.** Square as MUL(x, x), sigmoid, inverse square root; GELU native.
 
 **Extended graph: whole.** BATCH_MATMUL, MUL, EXP, RSQRT, GELU and native SOFTMAX. On U55 the activation
-MatMul takes the Hadamard route of Proposition 1 (product and sum), which writes the products to scratch memory.
+MatMul takes the Hadamard route (elementwise product and sum), which writes the products to scratch memory.
 
 **TopK.** Host on both. U85 runs GATHER, so a support chosen on the host can be gathered on the NPU.

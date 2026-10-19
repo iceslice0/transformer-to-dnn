@@ -1,4 +1,4 @@
-"""Node-level check of Brent's operand scaling under PTQ-style integer quantization (paper Supplementary S8).
+"""Node-level check of Brent's operand scaling under PTQ-style integer quantization.
 
 Captures the float64 inputs of the strict Score (q, k), value mix (probs, idx, v) and block LayerNorms (x) of
 DeiT-Tiny on Pet, and evaluates each product site of the norm-expansion construction the way PTQ treats it:
@@ -10,7 +10,7 @@ exact per-input multipliers, and a least-squares affine map is fitted to the sit
   Mix        sum_k p v = 1/2 [ sum_k ( v^2/lam^2 - (v/lam - lam p)^2 ) + lam^2 sum_k p^2 ]
   LayerNorm  u a = 1/2 [ (lam u + a/lam)^2 - lam^2 u^2 - a^2 / lam^2 ],  a = 1/sqrt(var + eps)
 
-lam = 1 is the strict graph of the paper; with Brent's scaling lam^2 = max|b| / max|a| (b = k, v, a for the three
+lam = 1 is the strict graph; with Brent's scaling lam^2 = max|b| / max|a| (b = k, v, a for the three
 sites) from the same calibration ranges, one scalar per site and block; brent_pow2 rounds lam to a power of two, as
 the PTQ option brent_scaling does. Reports ||y_hat - y|| / ||y|| on the 16
 evaluation images, averaged over blocks, for b in {8, 10, 12}.

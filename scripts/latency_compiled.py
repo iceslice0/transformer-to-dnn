@@ -1,4 +1,4 @@
-"""Model-only GPU latency of compiled models (paper Tables 2 and 4, Supplementary S6).
+"""Model-only GPU latency of compiled models.
 
 A whole validation pass is bound by data loading on DeiT-Tiny/Pet (about 85 ms per batch of 32 for JPEG decoding,
 against 15 to 76 ms for the eager forward), so pass time does not measure the model. This script times the forward pass
@@ -28,7 +28,7 @@ from transformer_surgery.models.adapters import get_model_adapter, load_surgery_
 REFERENCE = "artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt"
 TOPK = (16, 32, 64, 197)
 ROUTED = (16, 32, 64)
-# Table 2 (top-k and routed, four graphs), Table 4 (extended, every k), the routing benchmark (strict with GELU).
+# Four graphs with top-k and routed support, the extended graph at every k, the routing benchmark (strict with GELU).
 NAMES: List[str] = (
     [f"topk{k}_{g}" for k in TOPK for g in ("fast", "hadamard_sr_gs", "strict_sr_gs", "strict_sr_gs_pol")]
     + [f"topk{k}_{g}_qc32" for k in ROUTED for g in ("fast", "hadamard_sr_gs", "strict_sr_gs", "strict_sr_gs_pol")]

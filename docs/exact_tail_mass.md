@@ -1,14 +1,13 @@
 # Exact Tail-Mass vs Calibrated (Pet Fast)
 
 > Numbers in this file predate the 2026-10-17 leak-fix rerun (new Pet reference, 91.36% instead of 91.52%; checkpoint
-> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/` and
-> the paper tables (`scripts/check_paper_numbers.py`).
+> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/`.
 
 Pre-finetune val accuracy and omitted-tail mass after surgery (`make a` calibrated fast vs `make e` exact), reference
 LayerNorm eps 1e-6 (rerun 2026-10-09, logs in `artifacts/logs/eps_rerun_2026-10-09/`).
 Accuracies are `student_pre_ft_val_acc`. Calibrated mean \(q\) is `gibbs_tail_prob_eps_calibrated_mean`.
 Exact \(q\) stats come from the exact runs: the mean, the within-block std averaged over blocks
-(`gibbs_tail_prob_eps_exact_std_by_block`, the paper's Table S2), min and max. The last column is the std pooled
+(`gibbs_tail_prob_eps_exact_std_by_block`), min and max. The last column is the std pooled
 over all blocks (`gibbs_tail_prob_eps_exact_std`; since commit 1c48bf1 this field is pooled, earlier runs stored
 the within-block average under the same name).
 
@@ -30,6 +29,6 @@ the within-block average under the same name).
 `make tail-heldout` (`scripts/tail_heldout.py`; log `artifacts/logs/tail_heldout_2026-10-19/`) repeats the surgery
 calibration of each `topk{k}_fast` config (seed 0, full Pet training split; recomputed calibrated means match the saved
 ones within 3e-5) and gathers the same exact-tail statistics on the Pet validation split, which no calibration or
-selection reads. Paper Supplementary Table S2 compares the calibrated q (training) with the validation tau: the means
+selection reads. The means of the calibrated q (training) and the validation tau
 differ by at most 0.012 (k=1) and by at most 0.001 for k>=16; validation per-query s.d. within a block is 0.15 to 0.19
 for k<=16.

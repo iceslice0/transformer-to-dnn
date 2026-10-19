@@ -1,6 +1,6 @@
 """Check every measured number in the paper against run metadata.
 
-Parses the result tables (Tables 2-6, S1-S4, S9, S10) and the Figure 2 coordinates of the paper sources, recomputes
+Parses the result tables (Tables 2-6 and the supplementary tables, found by label) and the Figure 2 coordinates of the paper sources, recomputes
 each value from ``artifacts/metadata``, the profile JSON and the compiled-latency JSON, and checks the numeric claims of the prose (ranges,
 ratios, comparisons). Exit status 1 if anything differs.
 
@@ -133,17 +133,17 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
         cmp(f"T3 k={k} {g} ptq-t", float(cells[7]), bt, 0.005, (cells, 7, 0)); cmp(f"T3 k={k} {g} d-t", num(cells[8])[0], r2(bt_raw-a_raw), 0.005, (cells, 8, 0))
         if g == "strict": cmp(f"T3 k={k} bf16 = surgery gs acc", a, r2(100*S(f"topk{k}_strict_sr_gs")["student_pre_ft_val_acc"]), 0.005)
         else: cmp(f"T3 k={k} bf16 = saved Jeffreys run", a, r2(sel(D(k, "jeffreys"))), 0.005)
-    # Table S10: PTQ of the strict graph with exact GELU against x*sigmoid(1.702x), both before distillation
+    # tab:s-ptq-gelu: PTQ of the strict graph with exact GELU against x*sigmoid(1.702x), both before distillation
     for cells in table_rows("tab:s-ptq-gelu"):
         k = int(cells[0])
         for off, g in ((1, "strict_sr"), (4, "strict_sr_gs")):
             c = J(f"ts_ptq_{k}_{g}_8bit"); t = J(f"ts_ptq_{k}_{g}_pertensor_8bit")
-            a_raw = 100*c["metrics"]["fp_val_acc"]; cmp(f"S10 k={k} {g} bf16", float(cells[off]), r2(a_raw), 0.005, (cells, off, 0))
-            cmp(f"S10 k={k} {g} bf16 = surgery acc", r2(a_raw), r2(100*S(f"topk{k}_{g}")["student_pre_ft_val_acc"]), 0.005)
-            cmp(f"S10 k={k} {g} bf16 = pertensor bf16", r2(100*t["metrics"]["fp_val_acc"]), r2(a_raw), 0.005)
-            cmp(f"S10 k={k} {g} d", num(cells[off+1])[0], r2(100*c["metrics"]["ptq_val_acc"]-a_raw), 0.005, (cells, off+1, 0))
-            cmp(f"S10 k={k} {g} d-t", num(cells[off+2])[0], r2(100*t["metrics"]["ptq_val_acc"]-a_raw), 0.005, (cells, off+2, 0))
-            cmp(f"S10 k={k} {g} nodes", len(c["ptq_nodes"]), {("strict_sr", 197): 332, ("strict_sr", 0): 344, ("strict_sr_gs", 197): 368, ("strict_sr_gs", 0): 380}[(g, k if k == 197 else 0)], 0)
+            a_raw = 100*c["metrics"]["fp_val_acc"]; cmp(f"S9 k={k} {g} bf16", float(cells[off]), r2(a_raw), 0.005, (cells, off, 0))
+            cmp(f"S9 k={k} {g} bf16 = surgery acc", r2(a_raw), r2(100*S(f"topk{k}_{g}")["student_pre_ft_val_acc"]), 0.005)
+            cmp(f"S9 k={k} {g} bf16 = pertensor bf16", r2(100*t["metrics"]["fp_val_acc"]), r2(a_raw), 0.005)
+            cmp(f"S9 k={k} {g} d", num(cells[off+1])[0], r2(100*c["metrics"]["ptq_val_acc"]-a_raw), 0.005, (cells, off+1, 0))
+            cmp(f"S9 k={k} {g} d-t", num(cells[off+2])[0], r2(100*t["metrics"]["ptq_val_acc"]-a_raw), 0.005, (cells, off+2, 0))
+            cmp(f"S9 k={k} {g} nodes", len(c["ptq_nodes"]), {("strict_sr", 197): 332, ("strict_sr", 0): 344, ("strict_sr_gs", 197): 368, ("strict_sr_gs", 0): 380}[(g, k if k == 197 else 0)], 0)
     # Table 4
     for cells in table_rows("tab:deit"):
         k = int(cells[0]); s = S(f"topk{k}_fast"); d = D(k, "jeffreys"); r = d["student_post_distill_runs"][0]
@@ -173,13 +173,13 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
             import math; cmp(f"T6 k={k} {n} ppl", float(cells[off+2]), math.exp(nll), 0.005, (cells, off+2, 0))
         tau = S(f"pythia_70m_topk{k}_fast_tailmass_exact").get("gibbs_tail_prob_eps_exact_mean")
         cmp(f"T6 k={k} tau", float(cells[7]), tau, 0.0005, (cells, 7, 0))
-    # S1
+    # tab:s-tail
     for cells in table_rows("tab:s-tail"):
         k = int(cells[0])
         for i, n in enumerate((f"topk{k}_fast_tailmass0", f"topk{k}_fast_tailmass1e3", f"topk{k}_fast", f"topk{k}_fast_tailmass_exact"), 1):
             cmp(f"S1 k={k} {n}", float(cells[i]), 100*S(n)["student_pre_ft_val_acc"], 0.005, (cells, i, 0))
         cmp(f"S1 k={k} saved J", float(cells[5]), sel(D(k, "jeffreys")), 0.005, (cells, 5, 0))
-    # S2
+    # tab:s-q (exact tau on the held-out validation split)
     held = {r["k"]: r for r in json.load(open(f"{REPO}/{TAIL_HELDOUT_JSON}"))["rows"]}
     for cells in table_rows("tab:s-q"):
         k = int(cells[0]); a = S(f"topk{k}_fast"); e = held[k]["val"]  # exact tau on the held-out validation split
@@ -190,13 +190,13 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
         sb = e["gibbs_tail_prob_eps_exact_std_by_block"]
         cmp(f"S2 k={k} mean", v[0], e["gibbs_tail_prob_eps_exact_mean"], 0.00005, (cells, 2, 0)); cmp(f"S2 k={k} sd", v[1], sum(sb)/len(sb), 0.00005, (cells, 2, 1))
         cmp(f"S2 k={k} min", v[2], e["gibbs_tail_prob_eps_exact_min"], 0.00005, (cells, 2, 2)); cmp(f"S2 k={k} max", v[3], e["gibbs_tail_prob_eps_exact_max"], 0.00005, (cells, 2, 3))
-    # S3
+    # tab:s-distill
     for cells in table_rows("tab:s-distill"):
         k = int(cells[0]); cmp(f"S3 k={k} compiled", float(cells[1]), 100*S(f"topk{k}_fast")["student_pre_ft_val_acc"], 0.005, (cells, 1, 0))
         for off, l in ((2, "ce"), (4, "jeffreys")):
             d = D(k, l); cmp(f"S3 k={k} {l} saved", float(cells[off]), sel(d), 0.005, (cells, off, 0))
             mean, sd = num(cells[off+1]); cmp(f"S3 k={k} {l} mean", mean, 100*d["student_post_distill_val_acc_mean"], 0.005, (cells, off+1, 0)); cmp(f"S3 k={k} {l} sd", sd, 100*d["student_post_distill_val_acc_std"], 0.005, (cells, off+1, 1))
-    # S4 profile
+    # tab:s-profile
     R = json.load(open(f"{REPO}/artifacts/logs/profile_gs_ref_2026-10-18/profile.json"))
     by = {os.path.basename(r["checkpoint"]).replace("ts_surgery_", "").replace(".pt", ""): r["groups"] for r in R}
     ref_rec = next(r for r in R if os.path.basename(r["checkpoint"]).startswith("ts_pretrain_pet"))
@@ -209,7 +209,7 @@ def check_tables(PAPER: str, REPO: str, M: str, fix: bool = False) -> int:
             v = by[m].get(g)
             cmp(f"S4 {g} {m} ms", None if cells[1+i] == "--" else float(cells[1+i]), v["ms_per_batch"] if v else None, 0.05, (cells, 1+i, 0))
             cmp(f"S4 {g} {m} MiB", None if cells[7+i] == "--" else float(cells[7+i]), v["peak_extra_mib"] if v else None, 0.5, (cells, 7+i, 0))
-    # Table S9: bf16 against fp32 with all keys (make dtype-check)
+    # tab:s-dtype: bf16 against fp32 with all keys (make dtype-check)
     dt = {(r["network"], r["model"], r["variant"]): r for r in json.load(open(f"{REPO}/artifacts/logs/dtype_check_2026-10-18/dtype_check.json"))}
     net_of = {"DeiT-Tiny, Pet": ("DeiT-Tiny / Pet", 100, 2), "DeiT-Tiny, ImageNet-1k": ("DeiT-Tiny / ImageNet-1k", 100, 2),
               "MambaIRv2-Light $\\times2$, Set5": ("MambaIRv2-Light x2 / Set5", 1, 3),
@@ -297,7 +297,7 @@ def check_text(P: str, M: str, repo: str) -> int:
     claim("polarization 13..14x slower than strict, top-k k<=64", rng(po, 0) == ("13", "14") and has("runs $13$ to $14$ times slower"), "%s..%s" % rng(po, 2))
     claim("compiled reference 2.20 ms per batch", f"{LR['reference']['ms_per_batch']:.2f}" == "2.20" and has("The compiled reference takes $2.20$\\,ms per batch") and has("which takes $2.20$\\,ms per batch of 32"))
     ms = [LR[f"topk16_{g}"]["ms_per_batch"] for g in ("fast", "hadamard_sr_gs", "strict_sr_gs")]
-    claim("S6 compiled k=16: 7.21, 9.18, 11.08 ms; strict/extended 1.54", has("take $%.2f$, $%.2f$ and $%.2f$\\,ms" % tuple(ms)) and has("takes $%.2f$ times the time of the extended graph" % (ms[2] / ms[0])), ", ".join(f"{x:.2f}" for x in ms))
+    claim("S4 compiled k=16: 7.21, 9.18, 11.08 ms; strict/extended 1.54", has("take $%.2f$, $%.2f$ and $%.2f$\\,ms" % tuple(ms)) and has("takes $%.2f$ times the time of the extended graph" % (ms[2] / ms[0])), ", ".join(f"{x:.2f}" for x in ms))
     rt = [L[f"topk{k}_strict_sr_qc32"] for k in (16, 32, 64)]; tt = [L[f"topk{k}_strict_sr"] for k in (16, 32, 64)]
     re_ = [L[f"topk{k}_fast_qc32"] for k in (16, 32, 64)]; te = [L[f"topk{k}_fast"] for k in (16, 32, 64)]
     claim("Methods routing benchmark: strict with GELU and extended, routed vs top-k", has("gives $%.2f$, $%.2f$ and $%.2f$ times the reference latency with the routed support against $%.2f$, $%.2f$ and $%.2f$ with exact top-$k$" % tuple(rt + tt)) and has("gives $%s$ to $%s$ against $%s$ to $%s$" % (rng(re_, 2) + rng(te, 2))) and max(abs(mem(f"topk{k}_fast_qc32")/mem(f"topk{k}_fast") - 1) for k in (16, 32, 64)) < 0.05)
@@ -324,9 +324,9 @@ def check_text(P: str, M: str, repo: str) -> int:
     bound = max(n["integer_sum_bound"] or 0 for r in ptq_runs for n in r["ptq_nodes"])
     claim("integer sums below 4.5e6, a factor 3.7 below 2^24", bound < 4.5e6 and f"{2**24/4.5e6:.1f}" == "3.7" and has("stays below $4.5\\times10^{6}$, a factor $3.7$ below this limit"), f"{bound:.4g}")
     gm = max(abs(pt(k, m)) for k in (16, 32, 64, 197) for m in ("strict_sr", "strict_sr_pertensor", "strict_sr_gs", "strict_sr_gs_pertensor"))
-    claim("S10: either GELU, PTQ costs strict at most 1.5 points, extended 2.5..3.9", gm <= 1.5 and has("PTQ costs the strict graph at most $1.5$ points, against $2.5$ to $3.9$ points for the extended graph"), f"{gm:.2f}")
-    claim("S10 caption: 344/380 nodes, 332/368 at k=197", has("344 nodes with GELU and 380 with its approximation, 332 and 368 at $k=197$"))
-    claim("S10: approximation ranges", has("with the approximation, by $-1.47$ to $-0.05$ and by $-1.06$ to $-0.14$ points"))
+    claim("S9: either GELU, PTQ costs strict at most 1.5 points, extended 2.5..3.9", gm <= 1.5 and has("PTQ costs the strict graph at most $1.5$ points, against $2.5$ to $3.9$ points for the extended graph"), f"{gm:.2f}")
+    claim("S9 caption: 344/380 nodes, 332/368 at k=197", has("344 nodes with GELU and 380 with its approximation, 332 and 368 at $k=197$"))
+    claim("S9: approximation ranges", has("with the approximation, by $-1.47$ to $-0.05$ and by $-1.06$ to $-0.14$ points"))
     claim("all PTQ runs fp32, 8-bit logits", all(r["quantization"]["simulation_dtype"] == "float32" and r["quantization"]["quantize_output"] and r["quantization"]["output_bits"] == 8 for r in ptq_runs))
     # tail mass text
     dj = lambda k: D(k, "jeffreys")["student_post_distill_runs"][0]["baseline_val_jeffreys_mean"]
@@ -367,7 +367,7 @@ def check_text(P: str, M: str, repo: str) -> int:
     vb = {held[k]["val"]["gibbs_tail_calibration_batches"] for k in held}
     dq = max(abs(held[k]["val"]["gibbs_tail_prob_eps_exact_mean"] - S(f"topk{k}_fast")["gibbs_tail_prob_eps_calibrated_mean"]) for k in (1, 2, 4, 8, 16, 32, 64, 96, 128))
     d16 = max(abs(held[k]["val"]["gibbs_tail_prob_eps_exact_mean"] - S(f"topk{k}_fast")["gibbs_tail_prob_eps_calibrated_mean"]) for k in (16, 32, 64, 96, 128))
-    claim("Table S2: calibrated on the training split, exact on the held-out validation split; means within 0.012, 0.001 for k>=16", cal_b == {(None, 115)} and vb == {115} and f"{dq:.3f}" == "0.012" and d16 <= 0.001 and has("on the training split, with the exact per-query tail mass on the held-out validation split") and has("agree within $0.012$, and within $0.001$ for $k\\ge16$"), f"{dq:.4f} / {d16:.4f}")
+    claim("tab:s-q: calibrated on the training split, exact on the held-out validation split; means within 0.012, 0.001 for k>=16", cal_b == {(None, 115)} and vb == {115} and f"{dq:.3f}" == "0.012" and d16 <= 0.001 and has("on the training split, with the exact per-query tail mass on the held-out validation split") and has("agree within $0.012$, and within $0.001$ for $k\\ge16$"), f"{dq:.4f} / {d16:.4f}")
     pb = {S(f"pythia_70m_topk{k}_fast_tailmass_exact")["gibbs_tail_calibration_batches"] for k in (1, 2, 4, 8, 16, 32, 64, 128)}
     claim("Pythia tail statistics on 4 random training minibatches", pb == {4} and has("dense scores of 4 random training minibatches of 4 sequences") and has("exact tail mass on 4 training minibatches is $0.062\\pm0.115$"), str(pb))
     import collections, glob

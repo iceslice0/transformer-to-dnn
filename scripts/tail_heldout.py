@@ -1,4 +1,4 @@
-"""Calibrated tail mass against the exact tail mass on held-out data (paper Supplementary Table S2).
+"""Calibrated tail mass against the exact tail mass on held-out data.
 
 The calibrated ``q`` of a block is the mean omitted tail mass of the reference DeiT-Tiny over the Pet training split
 (``calibrate_reference`` in surgery). For each ``k`` this script repeats that calibration with the surgery config and

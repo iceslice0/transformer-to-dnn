@@ -1,7 +1,7 @@
-"""bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph (paper Supplementary).
+"""bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph.
 
-bf16 is the paper's setting for DeiT-Tiny and MambaIRv2-Light: weights stored in bf16 and arithmetic under CUDA autocast
-(Pythia-70M runs in float32 in the paper). fp32 means fp32 weights and fp32 arithmetic with autocast off. Per graph:
+bf16 is the surgery dtype for DeiT-Tiny and MambaIRv2-Light: weights stored in bf16 and arithmetic under CUDA autocast
+(Pythia-70M runs in float32). fp32 means fp32 weights and fp32 arithmetic with autocast off. Per graph:
   checkpoint bf16 : the saved compiled checkpoint, evaluated in bf16;
   rebuild bf16    : the graph rebuilt from the checkpoint record in bf16 with the bf16 reference weights (checks the
                     rebuild against the checkpoint);

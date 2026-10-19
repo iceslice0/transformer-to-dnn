@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download the third-party sources behind the NPU survey (paper Table S5) at the pinned versions.
+# Download the third-party sources behind the NPU survey at the pinned versions.
 # Files land in docs/npu/<ip>/sources/ and are git-ignored (mixed third-party licenses); the summaries
 # in docs/npu/<ip>/README.md cite the same URLs and commits.
 set -euo pipefail

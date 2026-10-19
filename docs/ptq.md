@@ -47,7 +47,7 @@ fields are:
   compilation adds when it splits LayerNorm, softmax and attention, and the residual and position-embedding
   additions; and `matmul_activation_bits` for `AffineMatMul`/`AffineHadamard`.
   The last two fall back to `activation_bits` when unset. Every width is an input-code width; no field sets the
-  width of an accumulator. The paper's strict configs use `compiled_affine_input_bits=12`, since the inputs of these
+  width of an accumulator. The strict configs use `compiled_affine_input_bits=12`, since the inputs of these
   nodes include squares and sums of squares; bit-width sweep configs also test other widths. This override affects only selected compiled
   fixed-affine nodes. It does not change weight precision or the Linear/Conv and MatMul/Hadamard input widths.
   Quantization is applied once per boundary, at the consuming node's input. `AffineCombine` nodes keep their coefficients exact (since 2026-10-11): each input is rescaled by
@@ -151,7 +151,7 @@ submodule on them, and applies its output map; everything stays in fp32.
 
 ### Meaning of the 12-bit setting
 
-The paper says: "the fixed affine nodes of the strict graph take 12-bit inputs".
+The fixed affine nodes of the strict graph take 12-bit inputs:
 `compiled_affine_input_bits=12` sets the input grid of those nodes. Quantization sits at each selected node's input:
 
 ```text
@@ -163,13 +163,13 @@ A consumer's input quantizer is also its producer's output quantizer, so the gra
 with integer inputs and integer outputs. Without an intervening unary node, the output map and the next quantizer
 form the requantization of integer inference (a fixed multiplier and offset).
 
-For the paper's strict settings, selected compiled fixed-affine nodes use 12-bit input codes;
+In the strict configs, selected compiled fixed-affine nodes use 12-bit input codes;
 Linear/Conv and MatMul/Hadamard nodes use their separately configured widths, normally 8 bits.
 Weights keep `weight_bits`, normally 8. A consumer's width is not inherited from its producer.
 At a boundary between quantized nodes, the producer's output is the consumer's input. The consumer
 quantizes that boundary once, on its own grid; a second quantizer at the producer's output would
 duplicate the boundary operation. When unary or routing nodes intervene, the next selected node's
-input quantizer follows those operations, as described in the paper's Methods. The simulation holds
+input quantizer follows those operations. The simulation holds
 integer codes in float32 tensors and evaluates each unit in fp32, where integer sums up to 2^24 are exact.
 See `ptq_activation_bits` for group selection and `CalibratedAffinePTQWrapper.forward`
 for quantizer placement.
@@ -236,7 +236,7 @@ Rerun 2026-10-18 in the leak-fix batch (`artifacts/logs/leakfix_2026-10-17/`): t
 checkpoints are selected on the training split only (`docs/distill.md`, Checkpoint selection). The extended rows were
 rerun on 2026-10-18 after the switch to training-accuracy selection (`artifacts/logs/leakfix_accsel_2026-10-18/`).
 
-All 24 paper configs set `quantize_output: true` (8-bit logits, `output_bits` default). The float reference is the bf16
+All 24 configs of this batch (`make ptq-paper`) set `quantize_output: true` (8-bit logits, `output_bits` default). The float reference is the bf16
 model (calibration under autocast); the PTQ model runs in fp32 with the checks above. Largest integer sum bound over all
 runs: 4.39e6, against 2^24 = 1.68e7.
 (the batch with the wrong fp32 reference is kept as `run_fp32_reference_INVALID.log`); the previous artifacts are in
@@ -266,7 +266,7 @@ Weights W8; input codes A8, except `compiled_affine_input_bits=12` on the compil
 (`configs/ptq/*_strict_sr*.json`). Strict rows quantize the surgery graph (no exp and no
 log, norm expansion `strict_product="norm"`; final run 2026-10-11, `artifacts/logs/norm_construction_2026-10-10/run_final.log`)
 before distillation; "sigmoid GELU" rows use `gelu=sigmoid` (x*sigmoid(1.702x)), the graph with only squares,
-sigmoid and rsqrt that a CNN-class NPU runs (paper Table 3). Extended (fast) rows quantize the Jeffreys-distilled graph.
+sigmoid and rsqrt that a CNN-class NPU runs. Extended (fast) rows quantize the Jeffreys-distilled graph.
 Per-tensor rows keep the output bias per channel when the weight scale is a scalar, as in standard per-tensor PTQ.
 Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_2026-10-09/`.
 
@@ -287,8 +287,8 @@ Reference LayerNorm eps (rerun 2026-10-09); logs in `artifacts/logs/eps_rerun_20
 
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
 forward hooks on the `NL*` nodes. At full support the
-strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (paper Table 1
-block total) + 76,042 (final LayerNorm). Surgery calibration (tail mass, centroids) uses unseeded augmented train batches,
+strict DeiT-Tiny count with the norm expansion is 196,498,438 per image = 12 x 16,368,533 (per
+block) + 76,042 (final LayerNorm). Surgery calibration (tail mass, centroids) uses unseeded augmented train batches,
 so two surgery runs of one config differ by up to 0.5 points (top-k) and 1.5 points (routed).
 
 ## Brent scaling, node-level check (2026-10-11)

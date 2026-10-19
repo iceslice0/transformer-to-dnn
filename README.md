@@ -7,14 +7,14 @@ A transformer is just a DNN. This repo demonstrates that operationally: it compi
 There is no architectural magic in attention, LayerNorm, or softmax. Each is a particular composition of three op classes:
 
 - **affine** - `nn.Linear`, `nn.Conv2d`, fixed-coefficient contractions, scale/bias, mean/sum reductions.
-- **nonlinear unary** - pointwise scalar maps: `square`, `sigmoid`, `1/sqrt(x+eps)` and GELU (the paper's strict set), plus `exp`, `1/(x+eps)` (fast path).
+- **nonlinear unary** - pointwise scalar maps: `square`, `sigmoid`, `1/sqrt(x+eps)` and GELU (the strict set), plus `exp`, `1/(x+eps)` (fast path).
 - **routing** - pure tensor wiring and discrete selection: `reshape`, `transpose`, `cat`, `stack`, `expand`, `broadcast_tensors`, `topk`, `gather`, `scatter`.
 
 A transformer block is then a wiring diagram over this vocabulary. The repo produces three compilations:
 
 - **strict** (`allow_matmul=False`): no variable matrix multiplication anywhere. QK^T scores, sparse value mixing, and the LayerNorm scale-and-shift all expand into the three classes above using squares: `a*b = ((a+b)^2 - a^2 - b^2)/2` where the square of a factor is shared (scores, value mixing, LayerNorm; `strict_product="norm"`, the default) and `a*b = ((a+b)^2 - (a-b)^2)/4` for isolated products (`strict_product="polarization"` uses it everywhere). The only unary maps besides GELU are the square, the sigmoid and the inverse square root: `exp(t) = sigmoid(t)/sigmoid(-t)` and `1/x = (x^{-1/2})^2`; `gelu="sigmoid"` replaces GELU by `x*sigmoid(1.702x)`. The compiled model contains only fixed-coefficient affine ops plus the listed nonlinearities and routing. This mode is inherently inefficient: replacing each variable product with complex computation path creates more intermediate tensors, memory traffic, and elementwise work than native matmul/Hadamard kernels. It is the proof-oriented compile target, not the practical runtime path.
 - **fast** (`allow_matmul=True`): the same vocabulary plus variable `matmul` / Hadamard. This mode exists because the strict expansion is expensive; it keeps the surgery structure and Gibbs top-k behavior while using efficient tensor kernels for variable bilinear work. It is the practical baseline for calibration, distillation, and PTQ runs.
-- **hadamard** (`allow_matmul=False`, `hadamard=True`, DeiT-Tiny): the strict graph with every product of two activations, squares included, as one elementwise product (`AffineHadamard`, `AffineSelfHadamard`) instead of polarization; QK^T and PV are elementwise products plus fixed sums, with no `matmul`. The only unary maps are the sigmoid, the inverse square root and GELU (none besides the first two with `gelu="sigmoid"`): `exp(t) = sigmoid(t) * rsqrt(sigmoid(-t))^2` and `1/x = rsqrt(x)^2` with the squares as products. With `gelu="sigmoid"` this is the paper's Hadamard graph (Proposition "Sigmoid and inverse square root suffice with the Hadamard product"), whose operations every surveyed NPU has; `gelu="exact"` is its variant for NPUs with GELU. Routed variants: `*_hadamard_sr{,_gs}_qc32.json`. `make hadamard-sr`, `make exact-fp64-hadamard`, `make profile-hadamard`.
+- **hadamard** (`allow_matmul=False`, `hadamard=True`, DeiT-Tiny): the strict graph with every product of two activations, squares included, as one elementwise product (`AffineHadamard`, `AffineSelfHadamard`) instead of polarization; QK^T and PV are elementwise products plus fixed sums, with no `matmul`. The only unary maps are the sigmoid, the inverse square root and GELU (none besides the first two with `gelu="sigmoid"`): `exp(t) = sigmoid(t) * rsqrt(sigmoid(-t))^2` and `1/x = rsqrt(x)^2` with the squares as products. With `gelu="sigmoid"` the sigmoid and the inverse square root suffice with the Hadamard product, and every surveyed NPU has these operations; `gelu="exact"` is its variant for NPUs with GELU. Routed variants: `*_hadamard_sr{,_gs}_qc32.json`. `make hadamard-sr`, `make exact-fp64-hadamard`, `make profile-hadamard`.
 
 Dense softmax is replaced everywhere with a **top-k Gibbs softmax** - sparse normalization over the top-k scores plus a calibrated tail-mass parameter to reduce memory access.
 
@@ -128,8 +128,8 @@ Generated outputs are git-ignored:
 - `artifacts/metadata/` - metadata JSON
 - `artifacts/logs/` - model structure dumps for surgery and PTQ
 
-Tracked exceptions, so the paper numbers can be checked without rerunning: the Pet reference checkpoint, every run
-metadata JSON in `artifacts/metadata/` except the PTQ runs outside the paper, and the paper logs
+Tracked exceptions, so the reported numbers can be checked without rerunning: the Pet reference checkpoint, every run
+metadata JSON in `artifacts/metadata/` except the PTQ runs outside `make ptq-paper`, and the logs
 `artifacts/logs/{latency_compiled,dtype_check,profile_gs_ref}_2026-10-18/*.json` and `artifacts/logs/tail_heldout_2026-10-19/tail_heldout.json`. They were added with `git add -f`;
 a rerun that rewrites them shows up in `git status`. `scripts/check_paper_numbers.py` reads only these files.
 
@@ -142,9 +142,9 @@ Default end-to-end artifacts: `ts_pretrain_pet_deit_tiny.pt`, `ts_surgery_topk64
 - [docs/cluster_routing.md](docs/cluster_routing.md) - query-centroid support routing (fixed k-means centroids select the sparse support before the scores; `make routing`, `make pythia-routing`, `make strict-sr`, `make routing-strict-bench`; PTQ of the strict graph: `make ptq-strict-sr`).
 - [docs/pythia_results.md](docs/pythia_results.md) - Pythia-70M WikiText-2 surgery sweep (exact vs tail0).
 - [docs/profile.md](docs/profile.md) - per-module GPU time and memory, strict vs fast.
-- [docs/npu/README.md](docs/npu/README.md) - NPU survey behind paper Table S5: per-accelerator operator placement, strict and extended verdicts, pinned sources (`docs/npu/fetch_sources.sh`).
+- [docs/npu/README.md](docs/npu/README.md) - NPU survey: per-accelerator operator placement, strict and extended verdicts, pinned sources (`docs/npu/fetch_sources.sh`).
 - [docs/mambair_results.md](docs/mambair_results.md) - MambaIRv2-Light Set5 sweeps (tail drop, calibrated, exact).
 - `make exact-fp64` (`scripts/check_exact_fp64.py`) - float64 end-to-end check that the compiled DeiT-Tiny graphs with all keys reproduce the reference logits (log in `artifacts/logs/exact_fp64_2026-10-10/`).
-- `scripts/check_paper_numbers.py --sections <paper>/sections` - checks every table cell, Figure 2 point and numeric claim of the paper against `artifacts/metadata` (exit 1 on any mismatch).
+- `scripts/check_paper_numbers.py --sections <paper>/sections` - checks every table cell, figure point and numeric claim of the paper against `artifacts/metadata` (exit 1 on any mismatch).
 - [docs/distill.md](docs/distill.md) - CE + Jeffreys distillation loop and metric definitions.
 - [docs/ptq.md](docs/ptq.md) - single-pass calibration-driven post-training quantization.

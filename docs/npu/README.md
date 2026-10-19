@@ -1,6 +1,6 @@
 # NPU survey: can the compiled graph run entirely on the accelerator?
 
-Source material for paper Table S5. For each edge accelerator the toolchain's own operator list (code at a
+For each edge accelerator the toolchain's own operator list (code at a
 pinned commit, or vendor documentation at an access date) decides which operations of the dense compiled
 graphs run on the accelerator. The verdicts below are toolchain placements, not compiler runs on our
 exported graphs.

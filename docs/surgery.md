@@ -113,7 +113,7 @@ Strict path (squares, sigmoid, rsqrt):
 - `strict_product="norm"` (default): `z = ((u+a)^2 - u^2 - a^2)/2` with `a = inv_std` and `u^2` from the variance,
   `2 N d_model + N` squares per LayerNorm.
 - `strict_product="polarization"`: `z = ElementwiseProduct()(u, inv_std)` (two squares per entry); unary count per
-  LayerNorm `3 N d_model + N` (paper Table 1).
+  LayerNorm `3 N d_model + N`.
 
 Fast path (`allow_matmul=True`):
 
@@ -226,7 +226,7 @@ Normalization:
 - Strict: `exp_vals = ExpBySigmoid()(vals)` (two sigmoids, one rsqrt, three
   squares per entry), `inv_z = ReciprocalByRsqrt()(sum_exp)` (one rsqrt and one square per row), and
   `top_probs = ElementwiseProduct()(exp_vals, inv_z)` (two squares per entry): 8 unary maps per entry and 2 per
-  row (paper Table 1). No exp, no log, no `/` operator.
+  row. No exp, no log, no `/` operator.
 - Fast: `top_probs = AffineHadamard()(exp(vals), NLReciprocalPlusEps(0)(sum_exp))`, then
   `probs = AffineHadamard(top_probs, 1 - gibbs_tail_prob_eps)`.
 
@@ -254,9 +254,9 @@ exposes four debug flags that selectively bypass the rewrites:
 
 Graph options that change the compiled model (not debug flags):
 
-- `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (paper Corollary 1; a model change).
+- `gelu` - `"exact"` GELU or `"sigmoid"` `x*sigmoid(1.702x)` (a model change).
 - `support_routing` - `"topk"` or `"query_centroids"` (see `docs/cluster_routing.md`).
-- `strict_product` - products of two activations in the DeiT-Tiny strict graph. `"norm"` (default, the paper's
+- `strict_product` - products of two activations in the DeiT-Tiny strict graph. `"norm"` (default, the
   strict construction since 2026-10-10) uses the norm expansion `ab = ((a+b)^2 - a^2 - b^2)/2` wherever a square of a
   factor is shared, and polarization `((a+b)^2-(a-b)^2)/4` where it is cheaper (isolated products: the softmax products
   and the GELU approximation):
@@ -275,7 +275,7 @@ Graph options that change the compiled model (not debug flags):
   forward hooks. `"polarization"` uses polarization for every product. Since 2026-10-10 its value mix subtracts the two squares per term before the sum over keys
   (`AffineContractPerTerm`), the optimal order (bf16 mix error 14.1% at k=197 against 31.3% when the squares are summed
   over keys first; `make mix-precision`). The polarization strict runs with the earlier order are kept in
-  `artifacts/backup_polarization_2026-10-10/` (code at commit 7141fcc); the Table 2 baseline with the per-term order is
+  `artifacts/backup_polarization_2026-10-10/` (code at commit 7141fcc); the polarization baseline with the per-term order is
   `make strict-pol` (`*_strict_sr_gs_pol*.json`). `topk*_strict.json` and `topk*_strict_qc32.json` (`make c`,
   `make routing-strict`) are the polarization strict graph with exact GELU.
   Exploratory variants of the same day (partial-sum mix, first per-term mix) are in
@@ -316,8 +316,8 @@ of the same affine. The reported diagnostics are:
   those omitted-tail estimates. The surgery CLI prints the by-block values.
 - `gibbs_tail_prob_eps_exact_{mean,std,min,max}_by_block` - full exact omitted-mass diagnostics
   (including std) gathered whenever calibration or `use_exact_tail_mass` is enabled. The scalar
-  `gibbs_tail_prob_eps_exact_std` is pooled over all blocks (since commit 1c48bf1); the paper's Table S2
-  reports the within-block std averaged over blocks.
+  `gibbs_tail_prob_eps_exact_std` is pooled over all blocks (since commit 1c48bf1); the mean of
+  `gibbs_tail_prob_eps_exact_std_by_block` is the within-block std averaged over blocks.
 - `use_exact_tail_mass` - when true, runtime `q_tail` uses the centroid partition; calibrated
   scalars are not applied.
 - `gibbs_tail_prob_eps_calibration_rows_by_block` - sampled row count used per block.
@@ -407,8 +407,8 @@ Surgery also supports Hugging Face Pythia-70M on WikiText-2 via
 
 ## bf16 against fp32 at full support (2026-10-17)
 
-`make dtype-check` (`scripts/dtype_check.py`) evaluates every network with all keys in bf16 and in fp32 (paper
-Supplementary S9). bf16: the saved checkpoints, weights in bf16, CUDA autocast. fp32: the fp32 reference weights and IEEE
+`make dtype-check` (`scripts/dtype_check.py`) evaluates every network with all keys in bf16 and in fp32.
+bf16: the saved checkpoints, weights in bf16, CUDA autocast. fp32: the fp32 reference weights and IEEE
 fp32 arithmetic (cuDNN convolutions without TF32, PyTorch's default for fp32 convolutions), each compiled graph rebuilt
 in fp32 from its checkpoint record so that its fixed coefficients are fp32. cuDNN runs deterministic, without
 autotuning. The script also rebuilds each graph in bf16 with the bf16 reference weights as a check of the rebuild.

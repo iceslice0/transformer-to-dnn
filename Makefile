@@ -140,7 +140,7 @@ hadamard-sr: $(HADAMARD_SR_TARGETS)
 PROFILE_HADAMARD_LOG := artifacts/logs/profile_hadamard_gs_2026-10-18
 PROFILE_HADAMARD_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_hadamard_sr_gs.pt) \
 	artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk16_fast.pt
-# Paper Table S4 in one profiling session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), top-k and
+# Per-module profile in one session: strict and Hadamard graphs with GELU ~ x*sigmoid(1.702x), top-k and
 # routed, and the extended graph with exact GELU (k=16,32,64 for the strict and extended shares).
 PROFILE_GS_LOG := artifacts/logs/profile_gs_ref_2026-10-18
 PROFILE_GS_CKPTS := $(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs.pt) \
@@ -152,27 +152,27 @@ profile-gs: $(PROFILE_GS_CKPTS) $(PET_REFERENCE)
 	echo "$(PYTHON) scripts/profile_modules.py --checkpoints $(PROFILE_GS_CKPTS) --reference $(PET_REFERENCE) --out $(PROFILE_GS_LOG)/profile.json" > $(PROFILE_GS_LOG)/command.txt
 	$(PYTHON) scripts/profile_modules.py --checkpoints $(PROFILE_GS_CKPTS) --reference $(PET_REFERENCE) --out $(PROFILE_GS_LOG)/profile.json | tee $(PROFILE_GS_LOG)/profile.log
 
-# Polarization baseline of Table 2: the strict graph with polarization for every product (strict_product=polarization,
+# Polarization baseline: the strict graph with polarization for every product (strict_product=polarization,
 # per-term mix), GELU ~ x*sigmoid(1.702x), top-k and routed support.
 STRICT_POL_TARGETS := $(foreach k,$(SR_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs_pol.pt) \
 	$(foreach k,$(STRICT_KS),artifacts/checkpoints/ts_surgery_topk$(k)_strict_sr_gs_pol_qc32.pt)
 strict-pol: $(STRICT_POL_TARGETS)
 
 # bf16 error of the strict value mix on real inputs: polarization, norm expansion with partial sums, the default
-# per-term construction, and the per-term construction with a balanced operand scale (paper Supplementary).
+# per-term construction, and the per-term construction with a balanced operand scale.
 MIX_PRECISION_LOG := artifacts/logs/mix_precision_2026-10-18
 mix-precision: artifacts/checkpoints/ts_surgery_topk16_strict_sr.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr.pt
 	mkdir -p $(MIX_PRECISION_LOG)
 	$(PYTHON) scripts/mix_precision.py 16 197 | tee $(MIX_PRECISION_LOG)/mix_precision.log
 
-# bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph (paper
-# Supplementary). Reads the existing k = N surgery checkpoints; no prerequisites, so it never rebuilds them.
+# bf16 against fp32 at full support (k = N) for every network: the reference and each compiled graph.
+# Reads the existing k = N surgery checkpoints; no prerequisites, so it never rebuilds them.
 DTYPE_CHECK_LOG := artifacts/logs/dtype_check_2026-10-18
 dtype-check:
 	mkdir -p $(DTYPE_CHECK_LOG)
 	$(PYTHON) scripts/dtype_check.py $(DTYPE_CHECK_LOG)/dtype_check.json | tee $(DTYPE_CHECK_LOG)/dtype_check.log
 
-# Model-only GPU latency with torch.compile (paper Tables 2 and 4, Supplementary S6): Pet batches preloaded on the GPU,
+# Model-only GPU latency with torch.compile: Pet batches preloaded on the GPU,
 # bf16, the fastest of three compile modes per model. A whole validation pass is bound by data loading on Pet.
 LATENCY_LOG := artifacts/logs/latency_compiled_2026-10-18
 latency-compiled:
@@ -180,15 +180,15 @@ latency-compiled:
 	$(PYTHON) scripts/latency_compiled.py $(LATENCY_LOG)/latency.json --modes default reduce-overhead max-autotune \
 		| tee $(LATENCY_LOG)/latency.log
 
-# Calibrated tail mass (Pet training split) against the exact tail mass on the held-out validation split (paper
-# Supplementary Table S2); repeats each surgery calibration and checks it against the saved calibrated mean.
+# Calibrated tail mass (Pet training split) against the exact tail mass on the held-out validation split;
+# repeats each surgery calibration and checks it against the saved calibrated mean.
 TAIL_HELDOUT_LOG := artifacts/logs/tail_heldout_2026-10-19
 tail-heldout:
 	mkdir -p $(TAIL_HELDOUT_LOG)
 	$(PYTHON) scripts/tail_heldout.py $(TAIL_HELDOUT_LOG)/tail_heldout.json | tee $(TAIL_HELDOUT_LOG)/tail_heldout.log
 
 # Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit input codes of the
-# compiled affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).
+# compiled affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph.
 PTQ_BALANCE_LOG := artifacts/logs/ptq_balance_2026-10-11
 ptq-balance-check: artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs.pt artifacts/checkpoints/ts_surgery_topk197_strict_sr_gs.pt
 	mkdir -p $(PTQ_BALANCE_LOG)
@@ -245,9 +245,9 @@ help:
 	@echo "  make hadamard-sr  # Hadamard graph: elementwise products instead of polarization (sigmoid, rsqrt)"
 	@echo "  make exact-fp64-hadamard # float64 check of the Hadamard graph (k=197)"
 	@echo "  make profile-hadamard # per-module GPU profile of the Hadamard graph (k=16,32,64)"
-	@echo "  make profile-gs   # Table S4 profile: strict/Hadamard with GELU approx, routed strict, extended"
-	@echo "  make mix-precision # bf16 error of the strict value mix: polarization vs squares (paper Supplementary)"
-	@echo "  make strict-pol   # Table 2 polarization baseline (strict_product=polarization), top-k and routed"
+	@echo "  make profile-gs   # per-module profile: strict/Hadamard with GELU approx, routed strict, extended"
+	@echo "  make mix-precision # bf16 error of the strict value mix: polarization vs squares"
+	@echo "  make strict-pol   # polarization baseline (strict_product=polarization), top-k and routed"
 	@echo "  make all    # Run all sections"
 
 # Pet reference: DeiT-Tiny classifier head on the ImageNet backbone, the epoch with the highest training-split accuracy; the

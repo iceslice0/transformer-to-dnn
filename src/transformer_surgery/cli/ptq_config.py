@@ -57,7 +57,7 @@ FIELD_HELP_PTQ: Dict[str, str] = {
         "Input-code width of the fixed affine nodes (AffineScale, AffineScaleBias, AffineFixedMix, AffineContract "
         "and its subclasses): the nodes that compilation adds when it splits LayerNorm, softmax and attention, and the "
         "residual and position-embedding additions. In the strict graph their inputs include squares and sums of "
-        "squares, so the paper's strict configs use 12-bit input codes there. Falls back to activation_bits."
+        "squares, so the strict configs use 12-bit input codes there. Falls back to activation_bits."
     ),
     "matmul_activation_bits": "Input-code width of AffineMatMul / AffineHadamard nodes. Falls back to activation_bits.",
     "per_output_channel": (

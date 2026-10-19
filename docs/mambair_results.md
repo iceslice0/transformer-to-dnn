@@ -1,8 +1,7 @@
 # MambaIRv2-Light Results (Set5, DIV2K fine-tuning)
 
 > Numbers in this file predate the 2026-10-17/18 leak-fix reruns (fine-tunes now keep the epoch with the highest
-> training PSNR; `artifacts/logs/leakfix_accsel_2026-10-18/`). Current values: `artifacts/metadata/mambair_*_set5_by_k.json`
-> and the paper tables (`scripts/check_paper_numbers.py`).
+> training PSNR; `artifacts/logs/leakfix_accsel_2026-10-18/`). Current values: `artifacts/metadata/mambair_*_set5_by_k.json`.
 
 Reference LayerNorm eps 1e-5 (rerun 2026-10-09/10, logs in `artifacts/logs/eps_rerun_2026-10-09/`).
 Y-channel PSNR (dB) on Set5 before (pre = surgery) and after (post = 3 epochs of L1 fine-tuning on DIV2K; since

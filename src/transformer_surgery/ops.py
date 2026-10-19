@@ -204,12 +204,12 @@ GELU_MODES = get_args(GeluMode)
 
 
 # Products of two activations in the strict graph.
-# "norm" (default, the paper's strict construction): ab = ((a+b)^2 - a^2 - b^2)/2 wherever a^2 or b^2 is shared, so
+# "norm" (default): ab = ((a+b)^2 - a^2 - b^2)/2 wherever a^2 or b^2 is shared, so
 # it costs one new square per product: the scores ( sum_l (q+k)^2 - |q|^2 - |k|^2 ) / (2 sqrt d), the mix
 # ( sum_k (v^2 - (v-p)^2) + sum_k p^2 ) / 2 with the two close squares subtracted per term before the sum over keys,
 # LayerNorm ((u+a)^2 - u^2 - a^2)/2 with u^2 from the variance, and the exact tail term. Polarization stays where it
 # is cheaper (isolated products: softmax, the GELU approximation).
-# "polarization": every product as ((a+b)^2-(a-b)^2)/4 (the Table 2 baseline, make strict-pol).
+# "polarization": every product as ((a+b)^2-(a-b)^2)/4 (the baseline of make strict-pol).
 STRICT_PRODUCTS = get_args(StrictProduct)
 
 

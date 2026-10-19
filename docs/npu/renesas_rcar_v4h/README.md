@@ -27,7 +27,7 @@ accessed 2026-10-09. Files in `sources/`: `03_supported_devices.adoc` (V4H versi
 (Pow or Sqrt) runs on the DSP. Nothing goes to the host CPU.
 
 **Extended graph: CNN-IP plus DSP.** Activation MatMul, softmax, LayerNorm and GELU run on the DSP. The CNN-IP has
-Mul and ReduceMean, so the Hadamard route of Proposition 1 (product, then mean times N) would also fit it, but
+Mul and ReduceMean, so the Hadamard route (elementwise product, then mean times N) would also fit it, but
 HyCo places MatMul on the DSP.
 
 **TopK.** DSP.

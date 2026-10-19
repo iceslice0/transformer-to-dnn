@@ -1,8 +1,7 @@
 # Query-Centroid Support Routing (Pet DeiT-Tiny, Pythia-70M)
 
 > Numbers in this file predate the 2026-10-17 leak-fix rerun (new Pet reference, 91.36% instead of 91.52%; checkpoint
-> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/` and
-> the paper tables (`scripts/check_paper_numbers.py`).
+> selection on the training split only, `artifacts/logs/leakfix_2026-10-17/`). Current values: `artifacts/metadata/`.
 
 Exact top-k needs all \(N^2\) scores before it selects \(k\) keys per query, so a strict graph pays
 squares on the full score matrix even when it mixes only \(k\) values. Query-centroid routing
@@ -20,7 +19,7 @@ With fixed centroids both contractions are fixed affine maps (`AffineContract`) 
 selection are routing (`RoutingTopK`, `RoutingGather`), so the router adds no unary evaluation and no
 activation-activation product (`QueryCentroidRouter` in `ops.py`). With the norm expansion (default
 `strict_product="norm"`) the strict cost of the score and mixing transforms becomes \(h(2Nkd+Nk+3Nd)\)
-unary evaluations instead of \(h(N^2d+Nkd+Nk+3Nd)\) with exact top-k (paper Proposition `prop:routed`).
+unary evaluations instead of \(h(N^2d+Nkd+Nk+3Nd)\) with exact top-k.
 
 Calibrated mode uses the mean routed tail mass \(1-\sum_{j\in S}\pi_{ij}\) of the dense student on the
 same train batches as the top-k calibration (`gibbs_tail_calibration_batches`). Support statistics are
@@ -46,7 +45,7 @@ buffers (`install_routers_from_state_dict`).
 Every surgery run records `student_pointwise_per_input` (unary evaluations per input, by op type) from
 forward hooks on the `NL*` nodes. At full
 support the strict DeiT-Tiny count with exact GELU is 196,498,438 per image (`topk197_strict_sr`, norm
-expansion) = 12 x 16,368,533 (paper Table 1 block total) + 76,042 (final LayerNorm).
+expansion) = 12 x 16,368,533 (per block) + 76,042 (final LayerNorm).
 
 ## DeiT-Tiny / Pet
 
@@ -99,7 +98,7 @@ are the `topk{k}_strict_sr` runs of the same target. Unary evaluations per image
 | 64 | 90.68 | 89.42 | 1.34x | 1.16x | 523 MiB | 380 MiB | 1.28e+08 | 6.73e+07 |
 
 The routed unary count per image equals `12 (h(2Nkd + 9Nk + 3Nd + 2N) + 8N d_model + 4N) + 2N d_model + 2N`
-exactly at every k (paper Table 1 and Proposition `prop:routed`): 20,638,114 / 36,183,778 / 67,275,106 at
+exactly at every k: 20,638,114 / 36,183,778 / 67,275,106 at
 k = 16 / 32 / 64. With the sigmoid GELU (`*_strict_sr_gs_qc32`) the routed graph reaches 78.47 / 86.18 / 88.96%. Two runs of one config differ by up
 to 0.5 points with top-k and 1.5 points routed: q and the centroids are calibrated on unseeded augmented train batches.
 
