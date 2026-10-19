@@ -1,0 +1,93 @@
+{
+  "model_key": "deit_tiny_pet",
+  "patient": "DeiT-Tiny",
+  "dataset": "Oxford-IIIT Pet",
+  "calibration": {
+    "student_post_distill_val_acc": 0.8470973017170891,
+    "student_post_distill_mean_ce": 0.5200760241716685,
+    "student_post_distill_mean_jeffreys": 0.443902587786654,
+    "student_post_distill_runs": [
+      {
+        "seed": 42,
+        "baseline_val_acc": 0.7950395203052603,
+        "baseline_val_ce_mean": 0.7865351564912128,
+        "baseline_val_jeffreys_mean": 0.9798755739325884,
+        "val_acc": 0.8470973017170891,
+        "val_ce_mean": 0.5200760241716685,
+        "val_jeffreys_mean": 0.443902587786654,
+        "selected_epoch": 1,
+        "selection_primary": 0.9144021739130435,
+        "baseline_selection_primary": 0.8809782608695652,
+        "selection_objective": 0.33937785029411316,
+        "baseline_selection_objective": 0.8400238695351974,
+        "run_index": 0
+      },
+      {
+        "seed": 43,
+        "baseline_val_acc": 0.7950395203052603,
+        "baseline_val_ce_mean": 0.7865351564912128,
+        "baseline_val_jeffreys_mean": 0.9798755739325884,
+        "val_acc": 0.8481875170346144,
+        "val_ce_mean": 0.5304382367886584,
+        "val_jeffreys_mean": 0.4519447595425281,
+        "selected_epoch": 1,
+        "selection_primary": 0.9108695652173913,
+        "baseline_selection_primary": 0.8809782608695652,
+        "selection_objective": 0.35003211958252867,
+        "baseline_selection_objective": 0.8400238695351974,
+        "run_index": 1
+      },
+      {
+        "seed": 44,
+        "baseline_val_acc": 0.7950395203052603,
+        "baseline_val_ce_mean": 0.7865351564912128,
+        "baseline_val_jeffreys_mean": 0.9798755739325884,
+        "val_acc": 0.8490051785227583,
+        "val_ce_mean": 0.5244058907665586,
+        "val_jeffreys_mean": 0.4476303941191754,
+        "selected_epoch": 1,
+        "selection_primary": 0.9116847826086957,
+        "baseline_selection_primary": 0.8809782608695652,
+        "selection_objective": 0.34530288330886677,
+        "baseline_selection_objective": 0.8400238695351974,
+        "run_index": 2
+      },
+      {
+        "seed": 45,
+        "baseline_val_acc": 0.7950395203052603,
+        "baseline_val_ce_mean": 0.7865351564912128,
+        "baseline_val_jeffreys_mean": 0.9798755739325884,
+        "val_acc": 0.850640501499046,
+        "val_ce_mean": 0.5217294037975645,
+        "val_jeffreys_mean": 0.4459125732459305,
+        "selected_epoch": 1,
+        "selection_primary": 0.9133152173913044,
+        "baseline_selection_primary": 0.8809782608695652,
+        "selection_objective": 0.3436410432276518,
+        "baseline_selection_objective": 0.8400238695351974,
+        "run_index": 3
+      },
+      {
+        "seed": 46,
+        "baseline_val_acc": 0.7950395203052603,
+        "baseline_val_ce_mean": 0.7865351564912128,
+        "baseline_val_jeffreys_mean": 0.9798755739325884,
+        "val_acc": 0.8503679476696647,
+        "val_ce_mean": 0.5220956665906181,
+        "val_jeffreys_mean": 0.45115679192198627,
+        "selected_epoch": 1,
+        "selection_primary": 0.9133152173913044,
+        "baseline_selection_primary": 0.8809782608695652,
+        "selection_objective": 0.3479245834376501,
+        "baseline_selection_objective": 0.8400238695351974,
+        "run_index": 4
+      }
+    ],
+    "student_post_distill_val_acc_mean": 0.8490596892886345,
+    "student_post_distill_val_acc_std": 0.0014853558564664636,
+    "student_post_distill_num_trainings": 5,
+    "student_post_distill_best_run_index": 0,
+    "student_post_distill_best_seed": 42
+  },
+  "calibration_legend": "ref_val_acc / ref_val_loss: frozen reference on val (primary metric named by ref_val_primary_name, mean task loss). student_pre_ft_val_acc / student_pre_ft_val_loss: surgery student on val after transform, before distill. student_post_distill_*: after distillation (primary metric, mean task loss, mean teacher match). gibbs_tail_prob_eps_exact_*: observed dense-softmax omitted tail mass of the top-k support (mean/std/min/max on train batches); gibbs_tail_prob_eps_calibrated_*: per-block means copied into GibbsTopKSoftmax when not using exact runtime tail mass; gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters; use_exact_tail_mass: runtime q_tail via N*mean(exp) centroid partition instead of calibrated scalar."
+}

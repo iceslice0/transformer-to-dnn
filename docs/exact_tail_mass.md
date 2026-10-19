@@ -24,3 +24,12 @@ the within-block average under the same name).
 | 96 | 90.95% | 91.66% | 0.0810 | 0.0813 ± 0.0606 (0, 0.4695) | 0.0705 |
 | 128 | 91.41% | 91.66% | 0.0394 | 0.0395 ± 0.0328 (0, 0.3170) | 0.0385 |
 | 197 | 91.74% | 91.74% | 0.0000 | 0.0000 ± 0.0000 (0, 0.0000) | 0.0000 |
+
+## Held-out tail mass (2026-10-19)
+
+`make tail-heldout` (`scripts/tail_heldout.py`; log `artifacts/logs/tail_heldout_2026-10-19/`) repeats the surgery
+calibration of each `topk{k}_fast` config (seed 0, full Pet training split; recomputed calibrated means match the saved
+ones within 3e-5) and gathers the same exact-tail statistics on the Pet validation split, which no calibration or
+selection reads. Paper Supplementary Table S2 compares the calibrated q (training) with the validation tau: the means
+differ by at most 0.012 (k=1) and by at most 0.001 for k>=16; validation per-query s.d. within a block is 0.15 to 0.19
+for k<=16.

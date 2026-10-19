@@ -1,0 +1,84 @@
+{
+  "model_key": "deit_tiny_pet",
+  "patient": "DeiT-Tiny",
+  "dataset": "Oxford-IIIT Pet",
+  "calibration": {
+    "student_post_distill_val_acc": 0.9165985282093213,
+    "student_post_distill_mean_ce": 0.31658002760989296,
+    "student_post_distill_mean_jeffreys": 0.00022003293839788674,
+    "student_post_distill_runs": [
+      {
+        "baseline_val_acc": 0.9165985282093213,
+        "baseline_val_ce_mean": 0.31658002760989296,
+        "baseline_val_jeffreys_mean": 0.00022003293839788674,
+        "val_acc": 0.9165985282093213,
+        "val_ce_mean": 0.31658002760989296,
+        "val_jeffreys_mean": 0.00022003293839788674,
+        "best_val_epoch": 0,
+        "run_index": 0,
+        "run_number": 1,
+        "num_trainings": 5,
+        "seed": 42
+      },
+      {
+        "baseline_val_acc": 0.9165985282093213,
+        "baseline_val_ce_mean": 0.31658002760989296,
+        "baseline_val_jeffreys_mean": 0.00022003293839788674,
+        "val_acc": 0.9165985282093213,
+        "val_ce_mean": 0.31658002760989296,
+        "val_jeffreys_mean": 0.00022003293839788674,
+        "best_val_epoch": 0,
+        "run_index": 1,
+        "run_number": 2,
+        "num_trainings": 5,
+        "seed": 43
+      },
+      {
+        "baseline_val_acc": 0.9165985282093213,
+        "baseline_val_ce_mean": 0.31658002760989296,
+        "baseline_val_jeffreys_mean": 0.00022003293839788674,
+        "val_acc": 0.9165985282093213,
+        "val_ce_mean": 0.31658002760989296,
+        "val_jeffreys_mean": 0.00022003293839788674,
+        "best_val_epoch": 0,
+        "run_index": 2,
+        "run_number": 3,
+        "num_trainings": 5,
+        "seed": 44
+      },
+      {
+        "baseline_val_acc": 0.9165985282093213,
+        "baseline_val_ce_mean": 0.31658002760989296,
+        "baseline_val_jeffreys_mean": 0.00022003293839788674,
+        "val_acc": 0.9165985282093213,
+        "val_ce_mean": 0.31658002760989296,
+        "val_jeffreys_mean": 0.00022003293839788674,
+        "best_val_epoch": 0,
+        "run_index": 3,
+        "run_number": 4,
+        "num_trainings": 5,
+        "seed": 45
+      },
+      {
+        "baseline_val_acc": 0.9165985282093213,
+        "baseline_val_ce_mean": 0.31658002760989296,
+        "baseline_val_jeffreys_mean": 0.00022003293839788674,
+        "val_acc": 0.9165985282093213,
+        "val_ce_mean": 0.31658002760989296,
+        "val_jeffreys_mean": 0.00022003293839788674,
+        "best_val_epoch": 0,
+        "run_index": 4,
+        "run_number": 5,
+        "num_trainings": 5,
+        "seed": 46
+      }
+    ],
+    "student_post_distill_val_acc_mean": 0.9165985282093214,
+    "student_post_distill_val_acc_std": 1.2412670766236366e-16,
+    "student_post_distill_num_trainings": 5,
+    "student_post_distill_best_run_index": 0,
+    "student_post_distill_best_seed": 42
+  },
+  "meta_note": "Stub created before distill (no prior surgery metadata at this path).",
+  "calibration_legend": "ref_val_acc / ref_val_loss: frozen timm teacher on val (mean CE). student_pre_ft_val_acc / student_pre_ft_mean_ce: surgery student on val after transform, before distill. student_post_distill_*: after Jeffreys distillation (acc and mean CE / Jeffreys). gibbs_tail_prob_eps_calibrated_*: observed dense-softmax omitted tail mass for top-k scores (fit on train batches, not val); gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters."
+}

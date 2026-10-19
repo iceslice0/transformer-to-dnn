@@ -1,4 +1,4 @@
-.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check pretrain pet-surgery pet-distill ptq-paper mambair-distill latency-compiled help
+.PHONY: all a b c d e a_imagenet mambair mambair-x2 mambair-x4 mambair-x4-exact mambair-x4-tailmass0 mambair-data pythia-smoke pythia pythia-tailmass0 routing pythia-routing routing-strict routing-strict-bench exact-fp64 strict-sr ptq-strict-sr hadamard-sr exact-fp64-hadamard profile-hadamard profile-gs mix-precision strict-pol ptq-balance-check ptq-brent ptq-brent-mix dtype-check pretrain pet-surgery pet-distill ptq-paper mambair-distill latency-compiled tail-heldout help
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
@@ -179,6 +179,13 @@ latency-compiled:
 	mkdir -p $(LATENCY_LOG)
 	$(PYTHON) scripts/latency_compiled.py $(LATENCY_LOG)/latency.json --modes default reduce-overhead max-autotune \
 		| tee $(LATENCY_LOG)/latency.log
+
+# Calibrated tail mass (Pet training split) against the exact tail mass on the held-out validation split (paper
+# Supplementary Table S2); repeats each surgery calibration and checks it against the saved calibrated mean.
+TAIL_HELDOUT_LOG := artifacts/logs/tail_heldout_2026-10-19
+tail-heldout:
+	mkdir -p $(TAIL_HELDOUT_LOG)
+	$(PYTHON) scripts/tail_heldout.py $(TAIL_HELDOUT_LOG)/tail_heldout.json | tee $(TAIL_HELDOUT_LOG)/tail_heldout.log
 
 # Node-level check of Brent's operand scaling under PTQ-style integer quantization (8/10/12-bit input codes of the
 # compiled affine nodes, max-abs grids, exact accumulation): Score, Mix and LayerNorm of the strict graph (paper Supplementary S8).

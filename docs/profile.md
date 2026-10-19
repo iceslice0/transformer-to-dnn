@@ -46,3 +46,13 @@ the Score, Softmax and Mix rows of paper Table S4; a second pass times the fused
 (`F.scaled_dot_product_attention`, the path of the latency tables): 4.1 ms and 2 MiB per batch at k=16, against 9.0 ms for
 the unfused score, softmax and mix. Reference module total: 25.9 ms per batch, against 52.2 ms for the extended and
 117.0 ms for the strict graph in the same session.
+
+## Compiled model-only latency (2026-10-18)
+
+`make latency-compiled` (`scripts/latency_compiled.py`; log `artifacts/logs/latency_compiled_2026-10-18/`) gives the
+latency columns of paper Tables 2 and 4. Ten Pet validation batches of 32 are stored on the GPU first, so data loading is
+excluded. Each model runs in bf16 under `torch.compile` in the default, reduce-overhead and max-autotune modes; the
+fastest mode counts, as the median of five timed runs over the ten batches. The compiled reference (fused attention)
+takes 2.20 ms per batch; at k=16 the extended, Hadamard and strict graphs take 7.21, 9.18 and 11.08 ms. The per-module
+profile above runs eagerly and synchronizes around every module, so its totals are not forward latencies. Peak memory in
+Table 2 stays the eager whole-pass peak from the surgery metadata. `scripts/check_paper_numbers.py` reads `latency.json`.

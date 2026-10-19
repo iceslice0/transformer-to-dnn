@@ -1,0 +1,415 @@
+[
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs.pt",
+    "top_k": 16,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 187.65879974365234,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 22.994214379787444,
+        "peak_extra_mib": 16.185546875
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.2524208127055316,
+        "peak_extra_mib": 6.92578125
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 49.71397755146027,
+        "peak_extra_mib": 469.14990234375
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 24.86236156821251,
+        "peak_extra_mib": 15.43994140625
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 7.443694403767585,
+        "peak_extra_mib": 80.80078125
+      },
+      "MLP": {
+        "ms_per_batch": 8.732697588205337,
+        "peak_extra_mib": 83.109375
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk32_strict_sr_gs.pt",
+    "top_k": 32,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 185.53698120117187,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 21.883439981937407,
+        "peak_extra_mib": 16.185546875
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.3851568046025933,
+        "peak_extra_mib": 6.92578125
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 49.886412954330446,
+        "peak_extra_mib": 469.14990234375
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 24.961859142780305,
+        "peak_extra_mib": 30.24560546875
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 19.06253762245178,
+        "peak_extra_mib": 154.67578125
+      },
+      "MLP": {
+        "ms_per_batch": 9.04051678776741,
+        "peak_extra_mib": 83.109375
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk64_strict_sr_gs.pt",
+    "top_k": 64,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 204.93257675170898,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 22.103585597872733,
+        "peak_extra_mib": 16.185546875
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.2010352022014557,
+        "peak_extra_mib": 6.92578125
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 50.33329924345016,
+        "peak_extra_mib": 469.14990234375
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 25.68144965171814,
+        "peak_extra_mib": 57.7158203125
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 36.025420904159546,
+        "peak_extra_mib": 302.42578125
+      },
+      "MLP": {
+        "ms_per_batch": 9.01500479876995,
+        "peak_extra_mib": 83.109375
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk16_strict_sr_gs_qc32.pt",
+    "top_k": 16,
+    "support_routing": "query_centroids",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 152.73265228271484,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 22.212753623723984,
+        "peak_extra_mib": 16.5625
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.802955223526806,
+        "peak_extra_mib": 6.92578125
+      },
+      "Routing (centroid select)": {
+        "ms_per_batch": 9.587984010577202,
+        "peak_extra_mib": 3.916015625
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 10.659512004256248,
+        "peak_extra_mib": 77.322265625
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 24.005977600812912,
+        "peak_extra_mib": 17.732421875
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 11.80106399357319,
+        "peak_extra_mib": 80.80078125
+      },
+      "MLP": {
+        "ms_per_batch": 9.435120013356208,
+        "peak_extra_mib": 83.109375
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs.pt",
+    "top_k": 16,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": true,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 138.49138107299805,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 17.920251226425172,
+        "peak_extra_mib": 18.517578125
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 4.206337600294501,
+        "peak_extra_mib": 9.234375
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 31.61969760656357,
+        "peak_extra_mib": 471.31396484375
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 14.049971204996108,
+        "peak_extra_mib": 9.07421875
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 4.946923203766346,
+        "peak_extra_mib": 78.4921875
+      },
+      "MLP": {
+        "ms_per_batch": 5.499398393929004,
+        "peak_extra_mib": 27.703125
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk16_hadamard_sr_gs_qc32.pt",
+    "top_k": 16,
+    "support_routing": "query_centroids",
+    "strict_product": "norm",
+    "allow_matmul": false,
+    "hadamard": true,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 128.7194850921631,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 17.878513626754284,
+        "peak_extra_mib": 18.517578125
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.5672208070755005,
+        "peak_extra_mib": 9.234375
+      },
+      "Routing (centroid select)": {
+        "ms_per_batch": 9.741996809840202,
+        "peak_extra_mib": 2.921875
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 9.16706877052784,
+        "peak_extra_mib": 78.33203125
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 12.725176003575324,
+        "peak_extra_mib": 10.765625
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 7.03747838139534,
+        "peak_extra_mib": 78.4921875
+      },
+      "MLP": {
+        "ms_per_batch": 5.1160304099321365,
+        "peak_extra_mib": 27.703125
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk16_fast.pt",
+    "top_k": 16,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": true,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 129.93476791381835,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 17.861822380125524,
+        "peak_extra_mib": 18.6982421875
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 4.29843360222876,
+        "peak_extra_mib": 9.234375
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 4.036470407247544,
+        "peak_extra_mib": 14.0322265625
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 15.051172822713852,
+        "peak_extra_mib": 7.9931640625
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 5.620777601003647,
+        "peak_extra_mib": 39.24609375
+      },
+      "MLP": {
+        "ms_per_batch": 5.320984016358852,
+        "peak_extra_mib": 18.46875
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk32_fast.pt",
+    "top_k": 32,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": true,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 118.39559173583984,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 18.123556783795358,
+        "peak_extra_mib": 18.6982421875
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 4.178222397528589,
+        "peak_extra_mib": 9.234375
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 3.503465597331524,
+        "peak_extra_mib": 14.0322265625
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 13.783792012929917,
+        "peak_extra_mib": 15.115234375
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 10.641132804751397,
+        "peak_extra_mib": 76.18359375
+      },
+      "MLP": {
+        "ms_per_batch": 4.714337597042322,
+        "peak_extra_mib": 18.46875
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_surgery_topk64_fast.pt",
+    "top_k": 64,
+    "support_routing": "topk",
+    "strict_product": "norm",
+    "allow_matmul": true,
+    "hadamard": false,
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 119.86122245788575,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 18.658220803737642,
+        "peak_extra_mib": 18.517578125
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 3.9344591926783323,
+        "peak_extra_mib": 9.234375
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 3.5488783910870554,
+        "peak_extra_mib": 14.0322265625
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 12.305652797222137,
+        "peak_extra_mib": 27.7763671875
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 16.19088646173477,
+        "peak_extra_mib": 150.05859375
+      },
+      "MLP": {
+        "ms_per_batch": 4.687470386922359,
+        "peak_extra_mib": 18.46875
+      }
+    }
+  },
+  {
+    "checkpoint": "/home/iceslice/nn/transformer_surgery/artifacts/checkpoints/ts_pretrain_pet_deit_tiny.pt",
+    "model": "reference (timm DeiT-Tiny), attention unfused; fused_groups: fused SDPA attention",
+    "surgery_dtype": "bfloat16",
+    "batches": 20,
+    "batch_size": 32,
+    "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "forward_ms_per_batch_with_hooks": 71.0042127609253,
+    "groups": {
+      "LayerNorm": {
+        "ms_per_batch": 5.477585615217686,
+        "peak_extra_mib": 9.28515625
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 5.026686403527856,
+        "peak_extra_mib": 9.234375
+      },
+      "Score (QK^T)": {
+        "ms_per_batch": 4.1140256024897095,
+        "peak_extra_mib": 14.0322265625
+      },
+      "Softmax (top-k Gibbs)": {
+        "ms_per_batch": 2.1203296039253474,
+        "peak_extra_mib": 28.4248046875
+      },
+      "Mix (PV)": {
+        "ms_per_batch": 2.7952816024422646,
+        "peak_extra_mib": 11.7236328125
+      },
+      "MLP": {
+        "ms_per_batch": 6.336704005300999,
+        "peak_extra_mib": 18.46875
+      }
+    },
+    "fused_forward_ms_per_batch_with_hooks": 63.551239013671875,
+    "fused_groups": {
+      "LayerNorm": {
+        "ms_per_batch": 6.34764478802681,
+        "peak_extra_mib": 9.28515625
+      },
+      "Linear (qkv, proj)": {
+        "ms_per_batch": 5.875838398188352,
+        "peak_extra_mib": 9.234375
+      },
+      "Attention (fused SDPA)": {
+        "ms_per_batch": 4.077015995234251,
+        "peak_extra_mib": 2.3818359375
+      },
+      "MLP": {
+        "ms_per_batch": 9.315630441904068,
+        "peak_extra_mib": 18.46875
+      }
+    }
+  }
+]

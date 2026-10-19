@@ -1,0 +1,33 @@
+{
+  "model_key": "mambair_lightsr",
+  "patient": "MambaIRv2-Light",
+  "dataset": "DIV2K/Set5",
+  "calibration": {
+    "student_post_distill_val_acc": 31.548464202880858,
+    "student_post_distill_mean_ce": 0.020500372909009457,
+    "student_post_distill_mean_jeffreys": 0.008663520496338607,
+    "student_post_distill_runs": [
+      {
+        "seed": 42,
+        "baseline_val_acc": 30.626929473876952,
+        "baseline_val_ce_mean": 0.023103289678692816,
+        "baseline_val_jeffreys_mean": 0.01264869123697281,
+        "val_acc": 31.548464202880858,
+        "val_ce_mean": 0.020500372909009457,
+        "val_jeffreys_mean": 0.008663520496338607,
+        "selected_epoch": 3,
+        "selection_primary": 28.65450393676758,
+        "baseline_selection_primary": 28.10491081237793,
+        "selection_objective": 0.0339883722178638,
+        "baseline_selection_objective": 0.035936166848987344,
+        "run_index": 0
+      }
+    ],
+    "student_post_distill_val_acc_mean": 31.548464202880858,
+    "student_post_distill_val_acc_std": 0.0,
+    "student_post_distill_num_trainings": 1,
+    "student_post_distill_best_run_index": 0,
+    "student_post_distill_best_seed": 42
+  },
+  "calibration_legend": "ref_val_acc / ref_val_loss: frozen reference on val (primary metric named by ref_val_primary_name, mean task loss). student_pre_ft_val_acc / student_pre_ft_val_loss: surgery student on val after transform, before distill. student_post_distill_*: after distillation (primary metric, mean task loss, mean teacher match). gibbs_tail_prob_eps_exact_*: observed dense-softmax omitted tail mass of the top-k support (mean/std/min/max on train batches); gibbs_tail_prob_eps_calibrated_*: per-block means copied into GibbsTopKSoftmax when not using exact runtime tail mass; gibbs_tail_prob_eps_applied_*: values copied into GibbsTopKSoftmax parameters; use_exact_tail_mass: runtime q_tail via N*mean(exp) centroid partition instead of calibrated scalar."
+}
